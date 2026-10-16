@@ -1,0 +1,10 @@
+[browser]
+# 跳过首次运行的邮箱引导，否则启动会卡在 "Email:" 这一步
+gatherUsageStats = false
+
+[server]
+headless = true
+port = 8501
+
+[theme]
+base = "light"

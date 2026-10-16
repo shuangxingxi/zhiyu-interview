@@ -1,0 +1,1056 @@
+"""三体 Agent 的实现：面试官 / 评估官 / 教练。
+
+设计说明（对应 DESIGN.md 第四、五节）：
+    不引入 LangChain / AutoGen。本场景的"行动空间"只有 3 种
+    （追问 / 换题 / 结束），自研一个轻量决策循环即可，可控、可解释、零框架依赖。
+
+三个角色的分工：
+    面试官 interviewer_turn  —— 多轮对话，全量 messages 回传。
+        每轮返回结构化决策，代码再做一次兜底约束（见 _apply_fallbacks）。
+    评估官 evaluate_interview —— 面试结束后单次调用，按能力模型打分。
+    教练   coach_review       —— 基于记录 + 评估，给出可执行的改进方案。
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import threading
+from typing import Any
+
+import httpx
+from openai import APITimeoutError, OpenAI
+
+from knowledge import (
+    MAX_PROBES_STRICT,
+    MAX_REFLECTS_IN_A_ROW,
+    deep_dive_block,
+    profile_summary,
+    real_question_block,
+    reference_for,
+    resume_block,
+    resume_evidence_block,
+    rubric_block,
+    rubric_hint_block,
+)
+from mood import describe as describe_mood, effective_max_probes
+import resume_rag
+
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-flash"
+
+# 单次模型调用的超时。刻意用显式 httpx.Timeout 而不是一个裸数字：
+# 裸数字下 SDK 仍会按自己的默认值重试（max_retries=2），一次"服务器没响应"
+# 会被放大成数倍等待（实测挂过 540 多秒）；这里把 read 超时压到 15 秒。
+# 面试是交互场景，宁可快速失败让用户重试，也不要页面长时间毫无反应。
+FIRST_RESPONSE_TIMEOUT = 15.0
+MODEL_TIMEOUT = httpx.Timeout(
+    connect=10.0, read=FIRST_RESPONSE_TIMEOUT, write=10.0, pool=10.0
+)
+
+# 面试官唯一可用的"工具"：主动查阅简历原文。
+# 刻意用结构化 JSON 字段模拟 tool call，而不切换到 DeepSeek 的 function calling：
+# 后者与 response_format=json_object 混用容易出问题，而 chat_json 已有重试与容错。
+# 用 JSON 字段表达动作，能力照旧、风险为零（对应 DESIGN.md 第五节）。
+TOOL_NONE = "none"
+TOOL_RESUME = "resume_lookup"
+
+# 一轮面试官发言里，最多允许几次"主动查阅简历"。
+# 1 次是 v6 的原始行为；放到 2 次是为了让模型能"查了 A 发现还要核对 B"，
+# 但必须有上限——否则模型可能靠反复查阅把单轮成本无限拉高。
+MAX_TOOL_ROUNDS = 2
+
+# 长会话压缩：发给模型的原文只保留最近这么多条消息（约 3 轮问答），
+# 更早的内容用本地启发式压成一段"前情提要"拼进系统提示词里。
+# 轮数一多，全量回传会让成本与延迟线性上涨；而且 DeepSeek 在长历史 +
+# response_format=json_object 下更容易返回空内容（见 chat_json 的注释）。
+HISTORY_WINDOW = 6
+_RECAP_REPLY_CHARS = 40  # 面试官那轮说的话，压缩后保留多少字
+_RECAP_ANSWER_CHARS = 80  # 候选人回答，压缩后保留多少字
+
+
+# ---------------------------------------------------------------------------
+# 基础调用
+# ---------------------------------------------------------------------------
+
+
+def _client(api_key: str) -> OpenAI:
+    # max_retries=0：超时意味着"服务器没响应"，重试只会让用户的干等再加 15 秒，
+    # 不如直接把可读的报错抛给上层。
+    return OpenAI(
+        api_key=api_key,
+        base_url=DEEPSEEK_BASE_URL,
+        timeout=MODEL_TIMEOUT,
+        max_retries=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Token 计量
+#
+# DESIGN 反复强调"省成本"，但此前没有任何计量。这里按进程累计每次调用的
+# usage，供界面显示本场消耗。刻意做成模块级累加器 + 显式 reset：
+# Streamlit 每次 rerun 都在同一进程里重跑脚本，模块级变量天然跨轮存活，
+# 而"本场"的边界由调用方（开局 / 结束时）显式划定。
+# ---------------------------------------------------------------------------
+
+_usage_lock = threading.Lock()
+_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+
+
+def reset_usage() -> None:
+    """把计量清零。开新场时调用。"""
+    with _usage_lock:
+        _usage.update({"prompt_tokens": 0, "completion_tokens": 0, "calls": 0})
+
+
+def usage_snapshot() -> dict[str, int]:
+    """读取当前累计值（拷贝，调用方改不动内部状态）。"""
+    with _usage_lock:
+        return dict(_usage)
+
+
+def _record_usage(response: Any) -> None:
+    """把一次响应的 usage 累加进去；缺字段就跳过，绝不因为计量而报错。"""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    with _usage_lock:
+        _usage["calls"] += 1
+        if isinstance(prompt, int):
+            _usage["prompt_tokens"] += prompt
+        if isinstance(completion, int):
+            _usage["completion_tokens"] += completion
+
+
+def _loads_lenient(text: str | None) -> dict[str, Any]:
+    """模型偶尔会把 JSON 包在 ```json 代码块里，这里做一次容错解析。"""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("模型返回了空内容（content 为空），没东西可解析。")
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        # 解析不了就把原文抛出来，否则只能看到一句没有信息量的 json 报错
+        raise ValueError(
+            f"模型返回的内容不是合法 JSON。原始内容（前 300 字）：{raw[:300]!r}"
+        ) from None
+
+
+def chat_json(
+    messages: list[dict[str, str]],
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+    temperature: float = 0.3,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    """调用 DeepSeek，要求返回 JSON 并解析成字典。
+
+    DeepSeek 偶尔会返回空白内容（finish_reason='stop'，content 全是空格），
+    对话轮数变多后更容易出现。这是服务端偶发行为，重试即可恢复，
+    所以这里做有限次重试；重试时降低温度让它更"守规矩"。
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = _client(api_key).chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.1 if attempt > 1 else temperature,
+            )
+        except APITimeoutError as exc:
+            # 超时不重试：服务器没响应时再等一轮只是把干等翻倍。
+            raise RuntimeError(
+                f"DeepSeek 在 {FIRST_RESPONSE_TIMEOUT:.0f} 秒内没有响应（服务器过载或链路不通）。"
+                "请稍后重试；若持续如此，可先确认 API 服务是否正常。"
+            ) from exc
+        choice = response.choices[0]
+        content = choice.message.content
+        _record_usage(response)
+
+        try:
+            return _loads_lenient(content)
+        except ValueError as exc:
+            last_error = exc
+            print(
+                f"[deepseek 返回异常] 第 {attempt}/{attempts} 次 "
+                f"finish_reason={choice.finish_reason!r} content={content!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    raise ValueError(
+        f"模型连续 {attempts} 次没有返回可用 JSON，最后一次的返回是：{last_error}"
+    ) from None
+
+
+def test_connection(api_key: str, model: str = DEFAULT_MODEL) -> str:
+    """最简连通性测试，用于确认 API Key 是否可用。"""
+    response = _client(api_key).chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": "只回复两个字：你好"}],
+        max_tokens=20,
+    )
+    return response.choices[0].message.content or ""
+
+
+def format_transcript(history: list[dict[str, str]]) -> str:
+    """把对话历史转成「面试官：… / 候选人：…」的纯文本，供评估官和教练阅读。"""
+    lines: list[str] = []
+    for msg in history:
+        speaker = "面试官" if msg.get("role") == "assistant" else "候选人"
+        lines.append(f"{speaker}：{msg.get('content', '')}")
+    return "\n".join(lines)
+
+
+def format_mood_trace(trace: list[dict[str, Any]] | None, mode_label: str = "") -> str:
+    """把情绪状态轨迹整理成评估官能读的逐轮明细。
+
+    归因要落到"第几轮"上才有说服力，所以这里给的是逐轮明细而不是一句概括。
+    """
+    head = f"本场情绪模式：{mode_label}\n" if mode_label else ""
+    if not trace:
+        return head + "（本场未记录状态轨迹）"
+    lines = [
+        f"第 {item.get('round', '?')} 轮：{item.get('mood', '')}"
+        f"（耐心 {item.get('patience', '?')}／精力 {item.get('energy', '?')}／"
+        f"时间压力 {item.get('pressure', '?')}）"
+        for item in trace
+    ]
+    return head + "\n".join(lines)
+
+
+def to_api_messages(history: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """把会话历史转换成发给模型的 messages。
+
+    DeepSeek 在 response_format=json_object 模式下有个坑：如果历史里累计出现
+    两轮以上「纯口语文本」的 assistant 消息，接口会返回一个 content 全是空格的
+    响应（finish_reason=stop），连续重试、调整温度、加大 max_tokens 都无效。
+    把 assistant 轮次包成 JSON 就能恢复正常，而且这和要求模型输出的格式本来就一致。
+    """
+    api_messages: list[dict[str, str]] = []
+    for item in history:
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if role == "assistant":
+            decision = item.get("decision")
+            payload = decision if decision else {"reply": content}
+            content = json.dumps(payload, ensure_ascii=False)
+        api_messages.append({"role": role, "content": content})
+    return api_messages
+
+
+def _clip(text: Any, limit: int) -> str:
+    """把一段文本压成单行、截断到 limit 字，超出补省略号。"""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def summarize_history(
+    history: list[dict[str, Any]], keep: int = HISTORY_WINDOW
+) -> str:
+    """把窗口之外的较早对话压成一段「前情提要」。
+
+    刻意用本地启发式压缩、不额外调用一次模型：省一轮延迟与成本，
+    结果也是确定的（同样的历史永远压出同样的文本），便于排查问题。
+    面试官真正需要记住的是"问过什么方向、候选人答了什么要点"，
+    这些从每轮的 decision（考点/动作）和回答原文里各取一小段就够了。
+    """
+    older = list(history[:-keep]) if len(history) > keep else []
+    if not older:
+        return ""
+
+    lines: list[str] = []
+    for item in older:
+        role = item.get("role")
+        if role == "assistant":
+            decision = item.get("decision") or {}
+            topic = str(decision.get("topic") or "").strip()
+            head = topic or _clip(decision.get("reply") or item.get("content"), 20)
+            lines.append(
+                f"- 面试官问过「{head}」（{_clip(item.get('content'), _RECAP_REPLY_CHARS)}）"
+            )
+        elif role == "user":
+            lines.append(f"  候选人答：{_clip(item.get('content'), _RECAP_ANSWER_CHARS)}")
+
+    if not lines:
+        return ""
+    return (
+        "【前情提要】（较早的对话已压缩成要点，帮助你保持连贯；不要向候选人复述这段）\n"
+        + "\n".join(lines)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 智能体 1 · 面试官（多轮对话 + 决策状态机）
+# ---------------------------------------------------------------------------
+
+INTERVIEWER_SYSTEM = """你叫「知遇」，是一位真实的面试官，正在主持一场{interview_type}，面试对象是「{scene}」场景下的候选人。
+
+【你的身份】
+你在{level_label}做{major}方向的面试。
+提问深度：{depth}
+追问尺度：{probe_style}
+评判标准：{strictness}
+本场考察重心：{focus}
+
+【你此刻的状态】
+{mood_block}
+
+【本场能力维度】（提问要覆盖这些维度，但不要在对话里念出维度名称）
+{dimensions}
+
+【高频考点参考】（只是方向参考，严禁照抄照念）
+{reference}
+
+【候选人自述背景】
+{candidate_bg}
+
+{context_blocks}【当前进度】
+主问题计划 {total_rounds} 道，已经问出 {cur_q} 道；当前这道题已追问 {probes_used} 次（上限 {max_probes} 次）。
+{state_hint}
+
+【最重要的规则：不许念题库】
+你要根据候选人的实际回答决定下一步，而不是按固定顺序念预设问题。
+- 回答空洞（只讲概念、没有具体事例、没有个人贡献、没有数据）→ action = "probe"，针对他刚说的内容追问。
+- 追问必须引用候选人上一句话里的具体信息（原话、技术名词、数字），禁止「能再详细说说吗」「还有吗」这类无效追问。
+- 回答扎实、有细节、有反思 → action = "ask"，换下一道主问题。
+- 只有两种情况可以用 action = "end"：主问题已经问满 {total_rounds} 道，或候选人明确表示要结束面试。
+- action = "probe" 时 question_no 保持不变；action = "ask" 时 question_no 等于当前主问题编号 + 1。
+- 如果上面提供了简历，主问题必须优先围绕简历里的实习经历、毕业设计、获奖情况、项目经历展开，并点名具体条目；不要让简历只是摆设。
+- 如果没有简历但有候选人自述背景，主问题就要围绕他写下的岗位目标、项目经历、技能栈来问，同样要点名具体条目。
+- 无论有没有简历，都要把候选人自己的经历问深（背景与目标、他的具体贡献、技术选型依据、遇到的难点、可量化的结果），不要只考背书。
+
+【考点去重：不许重复出题】
+上面「已经考过的考点」里列出的题目，一律不要再问，哪怕换种问法也不行。
+- 每道主问题都要落在一个明确的考点上，并在 topic 字段里回报这个考点。
+
+{real_rule}{tool_rule}【跨轮记忆：把这场对话串起来】
+如果候选人在前面某一轮提过与当前话题相关的东西（技术名词、数字、经历、当时没说清的点），
+必须显式回引，例如「你前面提到过用 Redis 做缓存，那……」。
+已经听到的信息不要浪费，已经问过的不要重复问。真人面试官是记得住前面说过什么的。
+
+{reflect_block}
+【表达要求】
+1. 全部用中文口语，像一个真人在说话，一次只推进一件事。
+2. 不要用 Markdown、不要用列表、不要写小作文，回复控制在 120 字以内；reflect 回合更要短，一句话就够。
+3. 第一次发言要简短自我介绍：报出你的名字「知遇」，说明流程，然后立刻问第一道题；之后不要再重复自我介绍。
+4. 不要自己给出答案，不要评价自己的问题，不要替候选人回答。
+5. 若 action = "end"，用两三句话自然收尾，并告知结果会以报告形式给出。
+
+只输出 JSON，不要输出任何其他文字，格式如下：
+{{
+  "reply": "你要对候选人说的话（纯口播文本）",
+  "action": "ask 或 probe 或 reflect 或 end",
+  "question_no": 当前主问题编号（整数）,
+  "topic": "这一轮所处的考点：action 为 ask 时填新主问题对应的考点（优先从上面考点参考里选，逐字一致；若是结合候选人经历自拟的题，就用不超过 12 字的短语概括）；probe / reflect 时填当前正在问的那个考点；end 时填空字符串",
+  "focus": "这一题考察的能力点（短语）",
+  "gap": "action 为 probe 时填：还缺什么（缺量化结果 / 缺「我」本人做了什么 / 缺技术原理 / 缺反思），其它情况填空字符串",
+  "tool": "none 或 resume_lookup：需要查看简历原文才能问准时才填 resume_lookup，否则一律填 none",
+  "tool_query": "tool 为 resume_lookup 时填要查的关键词（项目名 / 技术名词 / 岗位 / 奖项）；否则填空字符串",
+  "note": "内部备注：你对上一轮回答的判断，以及为什么这样决策"
+}}"""
+
+# reflect 的开关由 build_profile 编译进配置：严格模式追求节奏一致，真人模式允许停顿与确认
+_REFLECT_BLOCK = """【action = "reflect"：这三种情况用一次"不提问回合"】
+真人面试里并不是每一轮都在抛问题。整场出现 1~2 次即可，不必多。
+- 候选人给的是模糊的量化数据（原话里带「大概」「几百」「差不多」「有时候」）→ 一句话澄清，例如「你说的 QPS 是峰值还是均值？」
+- 候选人的说法前后对不上，或和他自述的背景、简历对不上 → 复述确认，例如「所以你那次优化主要是缓存命中率提升，不是算法层面的，对吧？」
+- 一个话题刚聊透、马上要换题 → 极简反馈，例如「嗯，这块我清楚了。」
+reflect 不推进题目、也不算一次追问；确认完之后下一轮照常往下问，不会耽误进度。
+但别连着用两次，连着用就显得像在拖延。
+
+"""
+
+_REFLECT_BLOCK_OFF = """【本场不启用 reflect】每次发言都必须是一个具体问题（action = ask 或 probe）。
+
+"""
+
+# 真题取材规则：只有本场真的抽到真题时才注入，没抽到就不给模型提这回事，
+# 免得它在没有素材的情况下"凭空回忆"出一道真题来。
+_REAL_RULE = """【真题取材：本场最多 {quota} 道主问题可用真题】
+上面「真实企业面试真题」是本场的取材素材，最多挑其中 {quota} 道作为主问题，其余主问题仍然要从考点参考里选，不要整场都在念真题。
+- 真题是素材不是脚本：用自己的话口语化地问出来，可以结合候选人的经历调整问法，严禁照念原文。
+- 取材真题时，topic 字段填该题的主题短语（题目后面括号里已给出），这样同场与跨场的去重逻辑才能生效。
+- 真题同样受追问、非提问回合、节奏规则约束，没有例外。
+
+"""
+
+# 简历工具规则：只有本场真的带了简历才注入。没有简历就不提"查阅"这回事，
+# 免得模型对着一个空的索引字段发起无意义的检索。
+_TOOL_RULE = """【可选动作：主动查阅简历原文（tool）】
+上面「简历条目索引」每条只有一句话摘要。如果你要问的那条经历必须看到完整原文才问得准
+（核对具体数字、技术选型、时间线、职责边界），可以自己发起一次检索，而不是凭摘要猜着问：
+- 决定查阅：tool 填 "resume_lookup"，tool_query 填你要查的关键词（项目名 / 技术名词 / 岗位 / 奖项，几个词就够）。
+  系统会把检索到的简历原文补给你，你据此再给出这一轮的最终话术。
+- 不需要查阅：tool 一律填 "none"，tool_query 填空字符串。
+是否查阅完全由你判断，不要每轮都查；凭已有信息能问准就别查。
+
+"""
+
+
+def _build_avoid_block(profile: dict[str, Any], asked_topics: list[str] | None) -> str:
+    """拼出「已经考过的考点」段落；没有历史时返回空串。
+
+    两个来源合并：本场已经问过的（asked_topics，由 app 逐轮累积），
+    以及开新场时从最近几场练习记录里带过来的（profile["avoid_topics"]）。
+    """
+    seen: list[str] = []
+    for topic in list(profile.get("avoid_topics") or []) + list(asked_topics or []):
+        text = str(topic).strip()
+        if text and text not in seen:
+            seen.append(text)
+    if not seen:
+        return ""
+    lines = "\n".join(f"- {t}" for t in seen)
+    return (
+        "【已经考过的考点】（本场 + 最近几次练习问过的）\n"
+        "这些题目一律不要再问，换一种问法也不行；请从下面考点参考里另选，"
+        "或结合候选人背景换个角度命题。\n"
+        f"{lines}"
+    )
+
+
+def _current_topic(asked_topics: list[str] | None) -> str:
+    """当前正在问的考点。
+
+    `asked_topics` 由 app 逐轮累积：ask 落一个新考点，probe / reflect 沿用当前考点
+    （见 interview_state.next_asked_topics），所以最后一个就是"这道题"。
+    开场轮列表为空 → 返回空串，此时没有"当前考点"可给参照。
+    """
+    for topic in reversed(asked_topics or []):
+        text = str(topic).strip()
+        if text:
+            return text
+    return ""
+
+
+def _build_interviewer_system(
+    profile: dict[str, Any],
+    cur_q: int,
+    probes_used: int,
+    reflects_in_a_row: int,
+    mood_state: dict[str, Any] | None = None,
+    asked_topics: list[str] | None = None,
+    query: str = "",
+    recap: str = "",
+) -> str:
+    total = int(profile.get("total_rounds", 5))
+    state = mood_state or {}
+    max_probes = effective_max_probes(profile, state)
+    allow_reflect = bool(profile.get("allow_reflect", True))
+
+    if cur_q >= total:
+        state_hint = "主问题已经问满，本轮必须收尾结束（action = end）。"
+    elif probes_used >= max_probes:
+        state_hint = "当前题目的追问次数已达上限，本轮必须换新题（action = ask），不许再追问。"
+    elif not allow_reflect:
+        state_hint = "本场是严格模式，不启用 reflect，按规则判断追问还是换题。"
+    elif reflects_in_a_row >= MAX_REFLECTS_IN_A_ROW:
+        state_hint = "你刚才已经连着做过几次非提问回合，本轮必须提出一个具体问题（action = ask 或 probe）。"
+    else:
+        state_hint = "按决策规则自行判断是追问、换题，还是做一次非提问回合。"
+
+    # 情绪这条轴走两条信息：本场固定的人设风格 + 此刻变化的内部状态
+    mood_block = profile.get("mood_style") or ""
+    mood_block += ("\n" if mood_block else "") + describe_mood(state)
+
+    # 简历 / 经历深挖方向 / 真题素材 / 当前考点参照 / 已考考点：按顺序拼成一段。
+    # 简历按 query（当前话题 + 候选人上一句）聚焦检索，而不是每轮灌全文。
+    #
+    # 「当前考点参照」放在靠后位置：它是本轮最该被看到的东西（决定追问往哪挖），
+    # 而模型对提示词尾部更敏感。没有参照（无数据 / 自拟题 / 行为面）时自动为空。
+    blocks = [
+        text.strip()
+        for text in (
+            resume_block(profile, query),
+            deep_dive_block(profile),
+            real_question_block(profile),
+            recap,
+            _build_avoid_block(profile, asked_topics),
+            rubric_hint_block(profile, _current_topic(asked_topics)),
+        )
+        if text and text.strip()
+    ]
+    context_blocks = "\n\n".join(blocks) + "\n\n" if blocks else ""
+
+    # 真题规则只在真的抽到真题时注入；否则留空，避免模型无中生有
+    real_questions = profile.get("real_questions") or []
+    real_rule = _REAL_RULE.format(quota=len(real_questions)) if real_questions else ""
+
+    # 简历工具规则同样只在真的有简历时注入：没有简历就没有可查的东西
+    tool_rule = _TOOL_RULE if (profile.get("resume") or "").strip() else ""
+
+    return INTERVIEWER_SYSTEM.format(
+        interview_type=profile.get("interview_type", "技术面"),
+        scene=profile.get("scene", ""),
+        level_label=profile.get("level_label", ""),
+        major=profile.get("major", ""),
+        depth=profile.get("depth", ""),
+        probe_style=profile.get("probe_style", ""),
+        strictness=profile.get("strictness", ""),
+        focus=profile.get("focus", ""),
+        mood_block=mood_block,
+        dimensions="\n".join(f"- {d}" for d in profile.get("dimensions", [])),
+        reference=reference_for(profile),
+        candidate_bg=profile.get("candidate_bg", ""),
+        context_blocks=context_blocks,
+        real_rule=real_rule,
+        tool_rule=tool_rule,
+        total_rounds=total,
+        cur_q=cur_q,
+        probes_used=probes_used,
+        max_probes=max_probes,
+        state_hint=state_hint,
+        reflect_block=_REFLECT_BLOCK if profile.get("allow_reflect", True) else _REFLECT_BLOCK_OFF,
+    )
+
+
+def _apply_fallbacks(
+    data: dict[str, Any],
+    profile: dict[str, Any],
+    cur_q: int,
+    probes_used: int,
+    reflects_in_a_row: int,
+    mood_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """代码兜底：把模型给出的决策限制在合法区间内。
+
+    这是 DESIGN.md 第五节强调的一层——模型可能绕圈或越界，
+    计数权必须握在代码手里，而不是交给模型自觉。
+
+    注意这里只把上限当"保险丝"：正常情况下节奏由模型判断，
+    只有它明显失控（连续空转、追问不收敛、主问题问满）时才强行掐断。
+    上限本身受情绪调制（不耐烦时更快放弃这道题），但调制与裁决都在代码侧完成。
+    """
+    total_rounds = int(profile.get("total_rounds", 5))
+    max_probes = effective_max_probes(profile, mood_state or {})
+    allow_reflect = bool(profile.get("allow_reflect", True))
+
+    action = str(data.get("action") or "ask").strip().lower()
+    if action not in {"ask", "probe", "reflect", "end"}:
+        action = "ask"
+
+    def _fallback_question() -> str:
+        return "probe" if probes_used < max_probes else "ask"
+
+    if cur_q == 0:
+        # 开场那轮必须是提问
+        action = "ask"
+    elif cur_q >= total_rounds:
+        # 主问题问满，强制收尾
+        action = "end"
+    elif action == "reflect" and (
+        not allow_reflect or reflects_in_a_row >= MAX_REFLECTS_IN_A_ROW
+    ):
+        # 非提问回合超限，或者本场根本没开这个口子
+        action = _fallback_question()
+    elif action == "probe" and probes_used >= max_probes:
+        # 追问超限，强制换题
+        action = "ask"
+
+    data["action"] = action
+    data["reply"] = str(data.get("reply") or "").strip()
+    # topic 是"这轮问的是哪个考点"，用来做同场 / 跨场去重。
+    # 模型偶尔会漏填或填成非同类型，这里统一收敛成去空白的字符串，缺省为空串。
+    topic = data.get("topic")
+    data["topic"] = str(topic).strip() if topic is not None else ""
+    # tool / tool_query 也一并收敛：非法取值归为"不调用工具"，
+    # 避免模型偶发填出第三种取值时把后续检索逻辑带偏。
+    data["tool"], data["tool_query"] = _normalize_tool(data)
+    return data
+
+
+def _normalize_tool(data: dict[str, Any]) -> tuple[str, str]:
+    """收敛 tool / tool_query 两个字段，非法取值一律归为不调用工具。"""
+    tool = str(data.get("tool") or "").strip().lower()
+    if tool not in {TOOL_NONE, TOOL_RESUME}:
+        tool = TOOL_NONE
+    return tool, str(data.get("tool_query") or "").strip()
+
+
+def _clear_tool(data: dict[str, Any]) -> None:
+    """抹掉"待查"标记。
+
+    每一轮的工具动作在这一轮内就已经落地（查到了 / 没命中 / 二次调用失败），
+    决策里就不能再留着 resume_lookup —— 否则它会跟着历史消息回传给下一轮，
+    被模型当成"我这一轮还该去查"，造成重复检索。
+    """
+    data["tool"] = TOOL_NONE
+    data["tool_query"] = ""
+
+
+def _resume_tool_round(
+    messages: list[dict[str, str]],
+    plan: dict[str, Any],
+    profile: dict[str, Any],
+    api_key: str,
+    model: str,
+    cur_q: int,
+    probes_used: int,
+    reflects_in_a_row: int,
+    mood_state: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str]:
+    """面试官主动查阅简历原文：先检索、再出话，最多循环 MAX_TOOL_ROUNDS 轮。
+
+    模型在第一轮决策里把 tool 置为 resume_lookup 时，代码去执行这次检索，
+    再把检索到的原文回灌给模型，让它给出真正面向候选人的那一轮话——
+    这样"先查简历再提问"是真实发生的动作，而不是模型嘴上说说。
+
+    v6 起这曾是**写死的两步**（查一次、再出话一次）。改成带上限的循环后，
+    模型可以"查了 A 发现还要核对 B"，但上限由代码握着：
+    MAX_TOOL_ROUNDS 到了就停，绝不因为模型反复要查而把单轮成本拉爆。
+
+    返回 (最终决策, 工具轨迹说明)。没有简历、检索没命中、二次调用失败
+    都回落到第一轮决策，保证面试不因新增能力而中断。
+
+    契约：**返回的决策一律不带"待查"标记**（走完循环、或任何回落路径），
+    所以调用方拿到的 data 可以直接写进历史。
+    """
+    tool, tool_query = _normalize_tool(plan)
+    if tool != TOOL_RESUME or not (profile.get("resume_chunks") or []):
+        _clear_tool(plan)
+        return plan, ""
+
+    current = plan
+    convo = list(messages)
+    traces: list[str] = []
+
+    for round_no in range(1, MAX_TOOL_ROUNDS + 1):
+        tool, tool_query = _normalize_tool(current)
+        if tool != TOOL_RESUME:
+            break  # 模型不再要查了，这一轮到此为止
+
+        hits = resume_rag.top(profile, tool_query, resume_rag.TOP_K_INTERVIEW)
+        if not hits:
+            # 查了但没命中：如实记一笔，不再让模型接着查。
+            # 同一份索引再查一次还是同样的结果，继续循环只是白花调用。
+            traces.append(f"查阅简历「{tool_query or '—'}」（未命中）")
+            break
+
+        traces.append(
+            "查阅简历「{}」→ {}".format(
+                tool_query or "—", "、".join(f"{c['id']}·{c['section']}" for c in hits)
+            )
+        )
+
+        # 关键：最后一次查阅时，必须让模型**这一轮就出最终话术**。
+        # 否则命中上限时留下的 reply 是"我再核对一段"这类内部动作描述，
+        # 会被当成面试官的话念给候选人听。
+        last_chance = round_no >= MAX_TOOL_ROUNDS
+        if last_chance:
+            instruction = (
+                "（以上是你刚刚检索到的简历原文。这是本轮最后一次查阅机会，"
+                "请立刻给出这一轮的最终回复，JSON 格式保持不变；"
+                'tool 一律填 "none"、tool_query 填空字符串。）'
+            )
+        else:
+            instruction = (
+                "（以上是你刚刚检索到的简历原文。请据此给出这一轮的最终回复，"
+                'JSON 格式保持不变；不需要再查阅就填 tool="none"，'
+                "确实还要核对别的条目才填 resume_lookup。）"
+            )
+
+        follow_up = convo + [
+            {"role": "assistant", "content": json.dumps(current, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": resume_rag.detail_block(hits, title="你查阅到的简历原文")
+                + "\n\n"
+                + instruction,
+            },
+        ]
+        try:
+            nxt = _apply_fallbacks(
+                chat_json(follow_up, api_key, model, temperature=0.7),
+                profile,
+                cur_q,
+                probes_used,
+                reflects_in_a_row,
+                mood_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[简历工具调用失败，回落上一轮决策] {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+
+        if not nxt.get("reply"):
+            # 调用没崩，但话是空的——同样回落，宁可少查一次也不能给候选人一片空白
+            break
+
+        current = nxt
+        convo = follow_up  # 下一轮接在这一轮之后，模型能看到已经查过什么
+
+    _clear_tool(current)
+    return current, "；".join(traces)
+
+
+def _resume_query(
+    history: list[dict[str, Any]], asked_topics: list[str] | None = None
+) -> str:
+    """给简历检索用的查询串：候选人上一句 + 当前考点。
+
+    用「候选人刚说的话」而不是面试官的问题，是因为下一轮要不要深挖、
+    往哪个方向深挖，取决于候选人提到了简历里的哪段经历。
+    """
+    parts: list[str] = []
+    for msg in reversed(history or []):
+        if msg.get("role") == "user" and str(msg.get("content") or "").strip():
+            parts.append(str(msg["content"]))
+            break
+    if asked_topics:
+        parts.append(str(asked_topics[-1]))
+    return " ".join(parts)
+
+
+def interviewer_turn(
+    history: list[dict[str, str]],
+    profile: dict[str, Any],
+    api_key: str,
+    cur_q: int = 0,
+    probes_used: int = 0,
+    reflects_in_a_row: int = 0,
+    mood_state: dict[str, Any] | None = None,
+    asked_topics: list[str] | None = None,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """面试官走一轮。
+
+    参数：
+        history            —— 对话历史（assistant = 面试官，user = 候选人）；空列表表示刚开场
+        cur_q              —— 已经问出的主问题数量
+        probes_used        —— 当前这道主问题已经追问的次数
+        reflects_in_a_row  —— 已经连续做了几次"不提问回合"
+        mood_state         —— 面试官此刻的情绪状态（mood.py 产出），影响措辞与追问上限
+        asked_topics       —— 本场已经问过的考点，用来避免重复出题
+    """
+    # 长会话压缩：只把最近 HISTORY_WINDOW 条原文发给模型，更早的压成前情提要。
+    # 去重、进度这些状态本来就单独注入系统提示词，所以窗口化不会丢关键信息。
+    window = history[-HISTORY_WINDOW:] if history else []
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": _build_interviewer_system(
+                profile,
+                cur_q,
+                probes_used,
+                reflects_in_a_row,
+                mood_state,
+                asked_topics,
+                _resume_query(history, asked_topics),
+                summarize_history(history),
+            ),
+        }
+    ]
+    if window:
+        messages.extend(to_api_messages(window))
+    else:
+        messages.append({"role": "user", "content": "（面试现在开始，请开场并问第一道题。）"})
+
+    data = chat_json(messages, api_key, model, temperature=0.7)
+    data = _apply_fallbacks(
+        data, profile, cur_q, probes_used, reflects_in_a_row, mood_state
+    )
+
+    # 同场 / 跨场去重的代码兜底：提示词里已经列了"已考考点"，但模型偶尔仍会
+    # 无视它、换题时又选回同一个考点。这里给一次点名纠正的机会——仍重复就接受，
+    # 不无限重试（宁可能一次重复，也不能把面试卡死）。
+    asked = {str(t).strip() for t in (asked_topics or []) if str(t).strip()}
+    if data["action"] == "ask" and data["topic"] and data["topic"] in asked:
+        retry_messages = messages + [
+            {"role": "assistant", "content": json.dumps(data, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": (
+                    f"（「{data['topic']}」这个考点前面已经问过了。请换一个还没问过的考点，"
+                    "重新给出这一轮的主问题，并保持 JSON 格式不变。）"
+                ),
+            },
+        ]
+        try:
+            retried = _apply_fallbacks(
+                chat_json(retry_messages, api_key, model, temperature=0.7),
+                profile, cur_q, probes_used, reflects_in_a_row, mood_state,
+            )
+        except ValueError:
+            retried = None
+        if (
+            retried
+            and retried["action"] == "ask"
+            and retried["topic"]
+            and retried["topic"] not in asked
+        ):
+            data = retried
+
+    # 面试官主动查阅简历原文（tool = resume_lookup）：两步走——先检索、再出话。
+    # 不调工具时，首轮决策就是最终决策，行为与之前完全一致（安全降级）。
+    data, tool_trace = _resume_tool_round(
+        messages,
+        data,
+        profile,
+        api_key,
+        model,
+        cur_q,
+        probes_used,
+        reflects_in_a_row,
+        mood_state,
+    )
+    # 工具轨迹随决策一起落盘，报告里"面试官决策轨迹"表据此多出一列，
+    # 让评委看得到"面试官这一轮主动查了简历第几段"。
+    # 待查标记由 _resume_tool_round 统一清掉（见该函数的契约）。
+    data["tool_trace"] = tool_trace
+    _clear_tool(data)
+
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 智能体 2 · 评估官
+# ---------------------------------------------------------------------------
+
+EVALUATOR_SYSTEM = """你是一位资深面试评委。请根据这场{interview_type}的完整对话记录，对候选人做出结构化评估。
+
+【本场面试配置】
+{summary}
+提问深度：{depth}
+评判标准：{strictness}
+
+【面试官状态轨迹】
+{mood_block}
+
+【评分维度】必须使用下面给定的维度，不要自己发明，也不要增减：
+{dimensions}
+
+【考点评分参照】本场面试官问到了下面这些考点，请对照要点清单判分。
+{rubric_block}
+
+{resume_block}
+参照使用规则：
+1. must_hit 是核心要点，候选人没讲到就要扣，并写明漏了哪条。
+2. 候选人给出参照之外但同样正确的答法，照常算分——参照是底线不是天花板，禁止因为「和参照不一样」而扣分。
+3. common_errors 里踩中的概念错误，必须写进 risks。
+4. 某个考点如果本场根本没被问到，就在 comment 里写明「本场未问到」，missed 留空；不要把没问过的考点算成候选人的遗漏。
+5. 本场题目若不在此参照范围内（标注为「未提供考点参照」），按通用标准正常评，不要生造要点。
+
+【评分要求】
+1. 每个维度 0-100 分。评语必须引用候选人在面试记录里的原话或具体表现，不许写「感觉不错」这类空话。
+2. 严格但不苛刻：对应届生不要求工程经验深度，但要求逻辑清晰、有真实细节。
+3. 有明显硬伤（概念错误、答非所问、全程没有具体事例）要直接指出。
+{extra}
+
+【归因要求】
+面试官这一侧的状态是刻意模拟出来的实验条件，不是客观标准。所以你要给两个分数：
+- overall_score：在这场对话里他实际表现出的水平（照常评，不要打折）。
+- adjusted_score：剥离面试官状态干扰后，你估计的他的真实水平。
+如果某几轮面试官明显不耐烦、时间压力升高或刻意挑刺，候选人随之出现的紧张、
+过度道歉、语无伦次，不应全部算进他的真实水平。
+attribution 必须写具体：指出是哪几轮受到干扰、哪个扣分项是被面试官逼出来的。
+如果本场面试官状态始终中性，adjusted_score 与 overall_score 可以相同，并如实说明。
+
+rubric_check 是可选字段：本场有参照就逐条给出（每个考点一条）。若本场未提供参照，可省略该字段。
+resume_check 同样是可选字段：只有在本场提供了「候选人简历」时才填。没有提供简历就省略该字段。
+
+只输出 JSON，不要输出任何其他文字，格式如下：
+{{
+  "overall_score": 0 到 100 的整数,
+  "adjusted_score": 0 到 100 的整数（剥离面试官状态干扰后的真实水平估计）,
+  "level": "不建议推进 或 待定 或 建议推进 或 强烈推荐",
+  "attribution": "归因说明：哪些扣分来自面试官状态，哪些来自候选人自身；状态中性时如实写明",
+  "dimensions": [
+    {{"name": "维度名称", "score": 0 到 100 的整数, "comment": "评语，必须引用候选人原话或具体表现"}}
+  ],
+  "rubric_check": [
+    {{"topic": "考点原文", "must_hit": ["候选人讲到的核心要点"], "missed": ["没讲到的核心要点"],
+     "errors": ["踩中的常见误区"], "comment": "一句话说明"}}
+  ],
+  "resume_check": {{
+    "consistent": true 或 false（自述与简历是否一致）,
+    "issues": [
+      {{"claim": "简历里的原句或要点", "said": "候选人在面试中的说法", "comment": "矛盾 / 夸大的具体说明"}}
+    ],
+    "uncovered": ["简历里有、但整场没被问到的关键经历"],
+    "comment": "一句话总结；没有简历或未发现不一致时如实说明"
+  }},
+  "highlights": ["亮点，2-3 条"],
+  "risks": ["风险或硬伤，2-3 条"],
+  "summary": "一段话总评，150 字以内"
+}}"""
+
+_STAR_EXTRA = """4. 本场是行为面，请额外检查每个回答是否符合 STAR 结构
+（Situation 情境 / Task 任务 / Action 行动 / Result 结果），
+指出缺了哪一环，并重点看 Action 里候选人【本人】做了什么、Result 是否有量化结果。"""
+
+_TECH_EXTRA = """4. 本场是技术面，请额外关注：概念是否说清、有没有真实的项目或实习细节、
+遇到不会的问题时是硬编还是坦诚说明思路。"""
+
+
+def evaluate_interview(
+    history: list[dict[str, str]],
+    profile: dict[str, Any],
+    api_key: str,
+    mood_trace: list[dict[str, Any]] | None = None,
+    asked_topics: list[str] | None = None,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """评估官：按本场能力模型给面试表现打分，并对面试官状态做归因。
+
+    `asked_topics` 是本场**实际问到**的考点（app 逐轮累积）。
+    必须传：否则评估官会拿到该难度档的全部 15~17 条参照，把没问过的考点
+    判成候选人的「遗漏」，再喂给教练生成"去补这个考点"的错误建议。
+    """
+    # 一致性核查的检索串：候选人全场说过的话 + 本场考点。
+    # 评估官要核对的是"整场自述 vs 简历"，所以比面试官侧看得更全（top-3 条切片）。
+    evidence_query = " ".join(
+        str(m.get("content") or "") for m in history if m.get("role") == "user"
+    )[:1200] + " " + " ".join(str(t) for t in (profile.get("topics") or []))
+    system = EVALUATOR_SYSTEM.format(
+        interview_type=profile.get("interview_type", "技术面"),
+        summary=profile_summary(profile),
+        depth=profile.get("depth", ""),
+        strictness=profile.get("strictness", ""),
+        mood_block=format_mood_trace(mood_trace, profile.get("mood_mode", "")),
+        dimensions="\n".join(f"- {d}" for d in profile.get("dimensions", [])),
+        rubric_block=rubric_block(profile, asked_topics),
+        resume_block=resume_evidence_block(profile, evidence_query),
+        extra=_STAR_EXTRA if profile.get("interview_type") == "行为面" else _TECH_EXTRA,
+    )
+    return chat_json(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"以下是完整面试记录：\n\n{format_transcript(history)}"},
+        ],
+        api_key,
+        model,
+        temperature=0.2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 智能体 3 · 教练
+# ---------------------------------------------------------------------------
+
+COACH_SYSTEM = """你是一位专门辅导应届生的面试教练，说话直接、务实，不讲套话。
+
+【本场背景】
+{summary}
+
+【面试官状态轨迹】
+{mood_block}
+
+{extra}
+
+请根据面试记录和评委评估，做一份可执行的复盘。要求：
+1. 指出的每个问题都必须有面试记录里的证据（引用候选人的原话或表现），不许凭空评价。
+2. 示范答案要写成候选人能直接背下来的口语稿，不要写成书面报告。
+3. drills 必须是 3 天内能做完的具体动作，不写「多练习」这种空话。
+4. 如果本场面试官状态明显偏离中性（不耐烦、时间压力升高、刻意挑刺），
+   必须额外看一件事：候选人在这种压力下的稳定性——是否慌乱、是否反复道歉、
+   是否一被追问就推翻自己原本正确的结论。这部分写进 resilience。
+   同时明确告诉候选人：哪些表现是被对方逼出来的，遇到这类面试官要如何稳住自己。
+   如果本场面试官状态中性，resilience 里如实写"本场未出现压力场景"。
+5. 如果给了「考点遗漏与误区」，drills 要直接针对漏掉的具体要点来练，
+   不要写成「多练习」这类泛化动作。
+
+只输出 JSON，不要输出任何其他文字，格式如下：
+{{
+  "weakest": [
+    {{"problem": "问题", "evidence": "面试记录里的原话或表现", "fix": "具体怎么改"}}
+  ],
+  "rewrites": [
+    {{"question": "面试官问的问题", "original": "候选人的原回答（可压缩，保留问题特征）",
+      "improved": "改写后的示范答案（口语稿，150 字以内）", "why": "为什么这样改更好"}}
+  ],
+  "resilience": {{
+    "summary": "候选人在压力下的稳定性表现",
+    "evidence": "面试记录里的原话或表现",
+    "fix": "下次遇到这类面试官该怎么稳住"
+  }},
+  "drills": ["接下来 3 天可以练的具体动作，共 3 条"],
+  "encouragement": "一句真诚的鼓励，不要浮夸"
+}}"""
+
+_COACH_STAR = """本次是行为面，请特别检查候选人的回答是否补齐了 STAR 四环
+（情境 / 任务 / 行动 / 结果），指出缺了哪一环；示范答案里要把 Action 中「我」做了什么
+和 Result 的量化结果补上。"""
+
+_COACH_TECH = """本次是技术面，请特别关注：概念说得清不清楚、有没有真实的项目或实习细节、
+遇到不会的问题时是硬编还是坦诚说明思路。示范答案要给出「结构化表达」的模板，
+比如先给结论、再讲原理、最后落到项目实践。"""
+
+
+def _rubric_missed_block(evaluation: dict[str, Any]) -> str:
+    """从评估官的 rubric_check 里摘出「漏了哪条要点 / 踩了哪个误区」，供教练定位 drills。
+
+    没有该字段（或参照缺失）时返回空串，调用方据此决定要不要拼进提示词。
+    """
+    rows = evaluation.get("rubric_check") or []
+    lines: list[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        missed = item.get("missed") or []
+        errors = item.get("errors") or []
+        if not missed and not errors:
+            continue
+        piece = f"考点「{item.get('topic', '')}」："
+        if missed:
+            piece += "漏了 " + "；".join(str(x) for x in missed) + "。"
+        if errors:
+            piece += "概念错误：" + "；".join(str(x) for x in errors) + "。"
+        lines.append(piece)
+    return "\n".join(lines)
+
+
+def coach_review(
+    history: list[dict[str, str]],
+    evaluation: dict[str, Any],
+    profile: dict[str, Any],
+    api_key: str,
+    mood_trace: list[dict[str, Any]] | None = None,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """教练：基于面试记录 + 评估结果，输出改进建议与示范答案。"""
+    is_behavior = profile.get("interview_type") == "行为面"
+    system = COACH_SYSTEM.format(
+        summary=profile_summary(profile),
+        mood_block=format_mood_trace(mood_trace, profile.get("mood_mode", "")),
+        extra=_COACH_STAR if is_behavior else _COACH_TECH,
+    )
+    missed = _rubric_missed_block(evaluation)
+    missed_part = f"评委标注的考点遗漏与误区：\n{missed}\n\n" if missed else ""
+    user = (
+        f"评委给出的综合得分：{evaluation.get('overall_score', '未知')}\n"
+        f"评委估计的真实水平：{evaluation.get('adjusted_score', '未知')}\n"
+        f"评委的归因说明：{evaluation.get('attribution', '')}\n"
+        f"评委结论：{evaluation.get('level', '')}\n"
+        f"评委总评：{evaluation.get('summary', '')}\n"
+        f"评委指出的风险：{'；'.join(evaluation.get('risks', []))}\n\n"
+        f"{missed_part}"
+        f"面试记录：\n\n{format_transcript(history)}"
+    )
+    return chat_json(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        api_key,
+        model,
+        temperature=0.4,
+    )
