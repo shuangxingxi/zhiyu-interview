@@ -464,7 +464,6 @@ AIagent/
 ├── test_resume_optimize.py  # 单元测试：简历优化（改写必须对得上原文、不许补原文没有的数字）
 ├── test_voice.py   # 单元测试：口播文本清理、MP3 帧校验、永久/瞬时错误分类（v15）
 ├── vendor/         # 第三方前端库（glasatarjs，MIT；见 vendor/README.md 的来源与改动声明）
-├── 大赛材料/       # 演示视频脚本与作品 PPT
 ├── .trae/documents/  # v2–v3 的原始实施方案（历史记录，保留原样）
 ├── requirements.txt
 ├── history.json    # 面试记录（运行后生成，不入库）
