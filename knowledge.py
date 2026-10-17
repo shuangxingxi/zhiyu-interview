@@ -770,6 +770,10 @@ def profile_summary(profile: dict[str, Any]) -> str:
 # 所以加载器与 load_rubrics() 一样只做静默降级，绝不抛异常。
 # ---------------------------------------------------------------------------
 REAL_Q_FILE = Path(__file__).with_name("real_questions.json")
+# 自建真题：由项目自有 270 条评分参照反向改写而来（零外部许可风险）。
+# 它只作为**补位**——外部真题优先，池子为空时（人工智能 / 电子信息 /
+# 自动化 / 通信工程）才启用，避免把"真实企业真题"的说法用在自建题上。
+BUILTIN_Q_FILE = Path(__file__).with_name("real_questions_builtin.json")
 
 
 def load_real_questions() -> dict[str, Any]:
@@ -785,19 +789,48 @@ def load_real_questions() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def load_builtin_questions() -> dict[str, Any]:
+    """读取自建真题库；与 load_real_questions 同款静默降级。"""
+    try:
+        with BUILTIN_Q_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[builtin_q] 自建真题库读取失败，已降级：{exc}", file=sys.stderr, flush=True)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def real_question_source(profile: dict[str, Any]) -> list[dict[str, Any]]:
     """按面试类型取真题池：行为面用「行为面」池，技术面用「技术面[专业]」池。
 
     没有对应数据（例如电子信息的技术面）时返回空列表，调用方据此静默降级。
+
+    补位规则：外部真题优先；外部池为空时改用**自建真题**（同样按专业取）。
+    两者都为空才真的没有题。
     """
     data = load_real_questions()
     if not data:
-        return []
+        data = {}
+
     if profile.get("interview_type") == "行为面":
         pool = data.get("行为面")
-    else:
-        pool = (data.get("技术面") or {}).get(profile.get("major", ""))
-    return pool if isinstance(pool, list) else []
+        if isinstance(pool, list) and pool:
+            return pool
+        # 行为面没有外部题时也回落到自建（当前自建未生成行为面，故通常为空）
+        builtin = load_builtin_questions()
+        fallback = builtin.get("行为面")
+        return fallback if isinstance(fallback, list) else []
+
+    major = profile.get("major", "")
+    pool = (data.get("技术面") or {}).get(major)
+    if isinstance(pool, list) and pool:
+        return pool
+
+    builtin = load_builtin_questions()
+    fallback = (builtin.get("技术面") or {}).get(major)
+    return fallback if isinstance(fallback, list) else []
 
 
 def _sample_real_questions(profile: dict[str, Any], quota: int) -> list[dict[str, Any]]:
@@ -833,11 +866,29 @@ def real_question_block(profile: dict[str, Any]) -> str:
         return ""
 
     quota = len(lines)
+    # 措辞必须与实际来源一致：外部题才叫「真实企业面试真题」，
+    # 自建题（src=自建）要如实说明是「按评分参照改写的题」——
+    # 否则等于让模型对候选人宣称一个不实出处。
+    is_builtin = any(str(it.get("src", "")) == "自建" for it in items)
+    if is_builtin:
+        header = "【面试题素材 · 按评分参照改写】（素材，不是脚本）\n"
+        origin = (
+            f"下面 {quota} 道题是按本专业考点与常见误区改写的题目，"
+            f"本场最多挑其中 {quota} 道作为主问题素材，"
+            "其余主问题仍要从上面的考点参考里选，不要整场都用这些题。\n"
+            "**不要向候选人声称这些题来自某家真实企业**；若被问起，"
+            "如实说明是围绕本专业考点设计的题目。\n"
+        )
+    else:
+        header = "【真实企业面试真题】（素材，不是脚本）\n"
+        origin = (
+            f"下面 {quota} 道题来自真实企业面试题库，本场最多挑其中 {quota} 道作为主问题素材，"
+            "其余主问题仍要从上面的考点参考里选，不要整场都用真题。\n"
+        )
     return (
-        "【真实企业面试真题】（素材，不是脚本）\n"
-        f"下面 {quota} 道题来自真实企业面试题库，本场最多挑其中 {quota} 道作为主问题素材，"
-        "其余主问题仍要从上面的考点参考里选，不要整场都用真题。\n"
-        "这些题是素材不是脚本：请用你自己的话口语化地问出来，可以结合候选人的经历调整问法，"
+        header
+        + origin
+        + "这些题是素材不是脚本：请用你自己的话口语化地问出来，可以结合候选人的经历调整问法，"
         "严禁照念原文；取材真题时，topic 字段请填该题的主题短语（见括号内），"
         "这样同场 / 跨场去重逻辑才能识别。\n"
         + "\n".join(lines)
