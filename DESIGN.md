@@ -451,6 +451,9 @@ AIagent/
 ├── notion_sync.py  # 知识库归档到 Notion（干跑 / 推送两种模式，非运行时依赖）
 ├── launcher.ps1    # 一键启动器（找 Python → 查依赖 → 起 Streamlit → 开浏览器）
 ├── 启动知遇面试.bat  # 双击入口，转调 launcher.ps1
+├── 知遇AI面试.lnk  # Windows 快捷方式（指向 启动知遇面试.bat，供桌面 / 开始菜单使用）
+├── _build_builtin_questions.py  # 一次性生成器：由 270 条参照反向改写 real_questions_builtin.json
+├── _build_design_docx.py        # 一次性生成器：由 DESIGN.md 生成 DESIGN.docx（复用旧 docx 样式）
 ├── test_tool_call.py  # 单元测试：面试官工具调用机制（离线，替换 chat_json 为假模型）
 ├── test_mood.py    # 单元测试：情绪状态机（纯函数，无需替身；含边界与反例断言）
 ├── test_interview_state.py  # 单元测试：计数器联动、考点去重、报告行构造
@@ -465,10 +468,15 @@ AIagent/
 ├── test_voice.py   # 单元测试：口播文本清理、MP3 帧校验、永久/瞬时错误分类（v15）
 ├── vendor/         # 第三方前端库（glasatarjs，MIT；见 vendor/README.md 的来源与改动声明）
 ├── .trae/documents/  # v2–v3 的原始实施方案（历史记录，保留原样）
+├── 真题抽检清单.md    # real_questions.json 的人工抽检清单（分层抽样 + 许可依据）
+├── 知识库考点溯源表.md # 270 条考点 → 课程 → 教材 → 章节的逐条溯源（证明知识库有据可查）
 ├── requirements.txt
 ├── history.json    # 面试记录（运行后生成，不入库）
 ├── .snapshots/     # 进行中面试的快照，一场一个文件（运行后生成；剔除简历与音频）
-└── DESIGN.md       # 本文档
+├── README.md       # 快速开始、功能一览、文档导航
+├── DESIGN.md       # 本文档（设计说明与决策依据）
+├── DESIGN.docx     # 本文档的 Word 版（由 _build_design_docx.py 生成，内容同源）
+└── 变更清单-v7.md  # v7–v15 逐文件改动清单（文件名保留 v7，内容已覆盖到 v15）
 ```
 
 运行方式（Windows PowerShell）：

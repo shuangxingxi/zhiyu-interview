@@ -51,7 +51,7 @@ py -3.12 -m unittest test_voice -v
 | 文档 | 内容 |
 |---|---|
 | [`DESIGN.md`](DESIGN.md) | **权威设计文档**：定位、三级自适应、决策状态机、评估体系、风险与应对 |
-| [`变更清单-v7.md`](变更清单-v7.md) | v7–v11 的逐项改动与**实测验证结论**（含一个实测发现的缺陷修复） |
+| [`变更清单-v7.md`](变更清单-v7.md) | v7–v15 的逐项改动与**实测验证结论**（含一个实测发现的缺陷修复；v12 / v13 见 `DESIGN.md` 路线图） |
 | [`知识库考点溯源表.md`](知识库考点溯源表.md) | 270 条考点逐条映射到本科教材章节（含核对状态） |
 | [`真题抽检清单.md`](真题抽检清单.md) | 外部真题来源的覆盖范围与人工抽检清单 |
 
@@ -78,9 +78,17 @@ AIagent/
 ├── notion_sync.py      # 知识库归档到 Notion（干跑 / 推送，非运行时依赖）
 ├── launcher.ps1        # 一键启动器（找 Python → 查依赖 → 起 Streamlit → 开浏览器）
 ├── 启动知遇面试.bat     # 双击入口，转调 launcher.ps1
+├── 知遇AI面试.lnk       # Windows 快捷方式（指向上面的 .bat）
+├── _build_builtin_questions.py  # 一次性生成器（自建真题库）
+├── _build_design_docx.py        # 一次性生成器（DESIGN.md → DESIGN.docx）
 ├── vendor/             # 第三方前端库（glasatarjs，MIT；来源与改动见 vendor/README.md）
+├── requirements.txt    # 运行依赖（streamlit / openai / httpx / PyMuPDF / python-docx / edge-tts）
 ├── .trae/documents/    # v2–v3 的原始实施方案（历史记录，保留原样）
-└── test_*.py           # 12 套离线单测（共 342 个用例）
+├── test_*.py           # 12 套离线单测（共 342 个用例）
+├── DESIGN.md           # 权威设计文档（另有同源的 DESIGN.docx）
+├── 变更清单-v7.md       # v7–v15 逐文件改动清单
+├── 知识库考点溯源表.md   # 270 条考点 → 教材章节的逐条溯源
+└── 真题抽检清单.md      # 外部真题的覆盖范围与人工抽检清单
 ```
 
 ## 隐私说明
