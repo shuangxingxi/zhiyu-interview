@@ -8,13 +8,17 @@
 
 ```powershell
 py -3.12 -m pip install -r requirements.txt
-$env:DEEPSEEK_API_KEY = "sk-xxxx"        # 必需：面试官 / 评估官 / 教练
+$env:DEEPSEEK_API_KEY = "sk-xxxx"        # 必需：面试官 / 评估官 / 教练 / 建议官 / 简历优化官
 $env:SILICONFLOW_API_KEY = "sk-xxxx"     # 可选：语音识别与合成兜底
 py -3.12 -m streamlit run app.py
 ```
 
 浏览器打开后，在左侧选「场景 → 专业 → 难度」，可选填候选人背景或上传简历，
 点「开始面试」即可。API Key 也可以直接在侧边栏手填，不必设环境变量。
+
+侧边栏另有一组**「📝 简历优化（独立功能）」**：上传简历即可拿到**诊断 + 逐条改写对照**，
+**不需要先开一场面试**。它的卖点是"不替你编简历"——模型给出的每条改写，
+本地都会核对原句是否真在简历里、改写有没有补上原文没有的数字，对不上的一律剔除。
 
 ## 跑测试
 
@@ -29,10 +33,18 @@ py -3.12 -m unittest test_chat_json -v
 py -3.12 -m unittest test_history_store -v
 py -3.12 -m unittest test_rubric_hint -v
 py -3.12 -m unittest test_evaluator_rubric -v
+py -3.12 -m unittest test_builtin_questions -v
+py -3.12 -m unittest test_advice -v
+py -3.12 -m unittest test_resume_optimize -v
+py -3.12 -m unittest test_voice -v
 ```
 
-8 套共 **209 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
+12 套共 **342 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
 **检索用真件**（真简历、真切片、真跑本地 BM25）。
+
+> 注：`test_session_store` 与 `test_history_store` 依赖 `tempfile` 的清理权限。
+> 在受限沙箱下这两套可能报 `PermissionError`，那是**环境问题**、与代码无关；
+> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 342 例应全部通过。
 
 ## 文档导航
 
@@ -49,24 +61,36 @@ py -3.12 -m unittest test_evaluator_rubric -v
 ```
 AIagent/
 ├── app.py              # Streamlit 界面 + 面试状态机
-├── agents.py           # 三体 Agent：面试官 / 评估官 / 教练
+├── agents.py           # 五个智能体：面试官 / 评估官 / 教练 / 建议官 / 简历优化官
 ├── knowledge.py        # 场景 × 专业 × 难度 策略库 + 能力模型 + 参照库加载
 ├── mood.py             # 面试官情绪纯函数状态机
 ├── interview_state.py  # 计数器状态机（纯函数）
+├── advice.py           # 提升建议：维度短板识别 + 建议收敛（纯函数）
 ├── resume.py           # 简历解析（PDF / Word / TXT → 纯文本，仅内存）
 ├── resume_rag.py       # 简历 RAG（切片 + 本地字符 n-gram BM25）
+├── resume_optimize.py  # 简历优化：结构诊断 + 量化密度 + 改写防编造核对（纯函数）
 ├── voice.py            # 语音识别（SenseVoice）与合成（edge-tts + 兜底）
 ├── avatar.py           # 语音动效组件（声波球，纯前端 HTML）
 ├── session_store.py    # 会话快照存储（一场一文件 + 原子写）
 ├── history_store.py    # 历史记录存储与统计（趋势 / 维度对比 / 删除）
 ├── rubrics.json        # 评分参照库（270 条，与代码分离便于校订）
 ├── real_questions.json # 真实企业真题素材库（含来源署名与许可证）
-└── test_*.py           # 8 套离线单测（共 209 个用例）
+├── real_questions_builtin.json  # 自建真题（补齐 4 个专业）
+├── notion_sync.py      # 知识库归档到 Notion（干跑 / 推送，非运行时依赖）
+├── launcher.ps1        # 一键启动器（找 Python → 查依赖 → 起 Streamlit → 开浏览器）
+├── 启动知遇面试.bat     # 双击入口，转调 launcher.ps1
+├── vendor/             # 第三方前端库（glasatarjs，MIT；来源与改动见 vendor/README.md）
+├── 大赛材料/           # 演示视频脚本与作品 PPT
+├── .trae/documents/    # v2–v3 的原始实施方案（历史记录，保留原样）
+└── test_*.py           # 12 套离线单测（共 342 个用例）
 ```
 
 ## 隐私说明
 
 - **简历**：只在当前会话内存中处理，**从不写入磁盘**，面试结束即清除。
+  「简历优化」功能同理：结果也只留在页面上，只有你主动点「导出优化建议」时才落成文件。
+- **提升建议**：按评分维度给出的建议**不写入 `history.json`**——它每条都引用你的原话，
+  属于个人化内容。它只出现在本场报告页，以及你主动导出报告时的 Markdown 里。
 - **面试逐字稿**：会落盘到 `history.json`（供回看与跨场对比）。该文件已加入
   `.gitignore`，因为其中可能含真实候选人的个人信息。界面提供**逐场删除**与
   **清空全部**（两步确认）两个入口。

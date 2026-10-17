@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import sys
 import time
 
@@ -58,9 +59,20 @@ SF_VOICES: dict[str, str] = {
     "zh-CN-YunyangNeural": "charles",  # 磁性男声（播报腔）
 }
 
-# edge-tts 被拒后静默多久不再重试（秒）。期间直接用硅基流动合成，避免每句白等。
-_EDGE_RETRY_AFTER = 600
+# edge-tts 熔断时长（秒）。分两档：永久性故障（403 拒绝第三方客户端）长熔断，
+# 瞬时故障（超时、连接重置、空音频）短熔断——只抖一下不该停掉十分钟。
+_EDGE_RETRY_AFTER_HARD = 600
+_EDGE_RETRY_AFTER_SOFT = 30
 _edge_down_until = 0.0
+
+# 单句合成的有界重试次数。瞬时故障重试，永久故障不重试（重试也白搭）。
+_EDGE_MAX_ATTEMPTS = 3
+
+# MP3 帧以 0xFF 同步字开头。空字节串或非 MP3 头都算无效——
+# 否则空音频会被 app.py 的 `if audio:` 静默吞掉：用户没声音，也不知道为什么。
+_MP3_MAGIC = 0xFF
+# 一个完整的 MP3 帧头是 4 字节；不足 4 字节的数据即使首字节是 0xFF 也不可播。
+_MP3_HEADER_MIN = 4
 
 # 语气由两条正交的轴叠加：难度档给基线，情绪状态给偏移。
 # 值是 (语速偏移 %, 音调偏移 Hz)。每句再叠一点随机抖动，
@@ -85,6 +97,50 @@ def _tone_args(level: str, mood: str = "") -> tuple[str, str]:
     delta_rate, delta_pitch = _MOOD_TONE.get(mood, (0, 0))
     rate = base_rate + delta_rate + random.randint(-3, 3)
     return f"{rate:+d}%", f"{pitch + delta_pitch:+d}Hz"
+
+
+# 口播前要剥掉的 markdown 记号。提示词里已经要求面试官「不要用 Markdown」，
+# 但模型不总照做；一旦漏出 ** 或 - 列表，TTS 会把星号、短横线逐字念出来。
+_MD_RULES: tuple[tuple[str, str], ...] = (
+    (r"```[\s\S]*?```", " "),  # 代码块整块丢掉
+    (r"`([^`]*)`", r"\1"),  # 行内代码留内容
+    (r"!\[[^\]]*\]\([^)]*\)", " "),  # 图片整条丢掉
+    (r"\[([^\]]*)\]\([^)]*\)", r"\1"),  # 链接留文字
+    (r"^#{1,6}\s+", ""),  # 标题号
+    (r"\*\*([^*]+)\*\*", r"\1"),  # 加粗
+    (r"\*([^*]+)\*", r"\1"),  # 斜体
+    (r"^[-*+]\s+", ""),  # 无序列表
+    (r"^\d+\.\s+", ""),  # 有序列表
+    (r"<\/?[a-zA-Z][^>]*>", " "),  # 残留 HTML 标签
+)
+
+
+def tts_text(text: str) -> str:
+    """把准备朗读的文本清成纯口播文本。
+
+    与 `agents.py` 提示词里的「不要用 Markdown」是**双保险**：
+    提示词约束模型，这里兜住模型没听话的情况。剥完再压掉多余空白，
+    否则标记符被替换成空格后会在句中留下奇怪的停顿。
+    """
+    out = str(text or "")
+    for pattern, repl in _MD_RULES:
+        out = re.sub(pattern, repl, out, flags=re.MULTILINE)
+    # 标记符剥掉后残留的噪声字符（全角/半角都算），避免被逐字念出
+    out = re.sub(r"[*_#|^=+~`]", " ", out)
+    # 换行在朗读里没有意义，只在句中留下怪停顿。
+    # 先把「含换行的整段空白」压成一个 \n（只吃一个会把 \n\n 的第二个 \n
+    # 当成前导字符，误判成非标点而多补一个逗号），
+    # 再按「换行前的字符是不是标点」决定补不补逗号：
+    # 已经是标点就不再补，否则会念出「：，」这种连用。
+    out = re.sub(r"[ \t]*\n[ \t\n]*", "\n", out)
+    out = re.sub(r"([^。！？；：，、,.!?;:])\n", r"\1，", out)
+    out = out.replace("\n", "")
+    out = re.sub(r"\s{2,}", " ", out)
+    # 汉字之间的空格对中文合成没有意义，塌掉避免怪停顿
+    out = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", out)
+    # 连续标点压成一个（换行替换可能和原文标点撞车）
+    out = re.sub(r"([，,])[，,]+", r"\1", out)
+    return out.strip().strip("，")
 
 
 def transcribe(audio_bytes: bytes, api_key: str) -> str:
@@ -143,20 +199,42 @@ def synthesize(
 
     edge-tts 是异步接口，而 Streamlit 的脚本线程里没有事件循环，
     所以这里用 asyncio.run 起一个临时循环收完整个音频流。
+
+    传进来的文本先过一遍 `tts_text` 清掉 markdown 记号：提示词要求面试官
+    不要用 Markdown，但模型不总照做，漏出来的星号会被逐字念出来。
     """
+    text = tts_text(text)
+    if not text:
+        return b""
     rate, pitch = _tone_args(level, mood)
 
     edge_error: Exception | None = None
     if time.time() >= _edge_down_until:
-        try:
-            return asyncio.run(_synth(text, voice, rate, pitch))
-        except Exception as exc:  # 网络、403、空音频……一律进入兜底
-            edge_error = exc
-            _mark_edge_down()
+        # 瞬时故障重试、永久故障立刻放弃：把两类错误分开处理，
+        # 否则一次网络抖动就会和"403 永久拒绝"一样把 edge 停用十分钟。
+        for attempt in range(_EDGE_MAX_ATTEMPTS):
+            try:
+                audio = asyncio.run(_synth(text, voice, rate, pitch))
+                if is_valid_audio(audio):
+                    return audio
+                # 合成"成功"但拿到空流/坏帧：当作瞬时故障，重试后仍空才降级
+                edge_error = RuntimeError("edge-tts 返回空音频或非 MP3 数据")
+            except Exception as exc:  # noqa: BLE001
+                edge_error = exc
+                if _is_permanent_edge_error(exc):
+                    _mark_edge_down(permanent=True)
+                    break
+            if attempt < _EDGE_MAX_ATTEMPTS - 1:
+                time.sleep(0.4 * (attempt + 1))
+        else:
+            _mark_edge_down(permanent=False)
 
     if fallback_key:
         try:
-            return _synth_siliconflow(text, voice, rate, fallback_key)
+            audio = _synth_siliconflow(text, voice, rate, fallback_key)
+            if is_valid_audio(audio):
+                return audio
+            raise RuntimeError("硅基流动返回空音频或非 MP3 数据")
         except Exception as exc:
             raise RuntimeError(
                 f"edge-tts 与硅基流动均合成失败：edge={edge_error}; sf={exc}"
@@ -167,12 +245,64 @@ def synthesize(
     raise RuntimeError("edge-tts 暂不可用（熔断期内），且未配置硅基流动 Key")
 
 
-def _mark_edge_down() -> None:
-    """标记 edge-tts 进入熔断期，并往 stderr 留一行提示（方便排查）。"""
+def is_valid_audio(data: bytes) -> bool:
+    """音频字节是否可用：非空且以 MP3 帧同步字开头。
+
+    这一步不能省。合成接口可能"成功"返回空流（例如英文音色读不了中文），
+    空字节串传到界面会被 `if audio:` 静默吞掉——用户只是听不到声音，
+    界面上没有任何提示，排查时也无从下手。
+
+    只判首字节 0xFF 会让 `b"\\xff"` 这种残缺数据通过，所以要求至少
+    有完整的帧头长度（4 字节）且首字节为 0xFF。`None` 先被 `bool` 挡住，
+    否则 `len(None)` 会抛 TypeError——调用方把 None 传进来是最常见的空值来源。
+    """
+    return bool(data) and len(data) >= _MP3_HEADER_MIN and data[0] == _MP3_MAGIC
+
+
+def _is_permanent_edge_error(exc: Exception) -> bool:
+    """这个异常是永久性的（重试也不会好）吗？
+
+    edge-tts 自 2026-10 起对第三方客户端拒绝握手（403，见 rany2/edge-tts#490），
+    这类错误重试无意义，应当直接长熔断；超时、连接重置属于瞬时故障，值得重试。
+
+    注意 `"invalid response status"` 这句措辞 403 和 500 都会用，所以不能只看措辞，
+    必须先按状态码分流：429（限流）和 5xx（服务端故障）都是瞬时的，
+    否则一次后端抖动就会把 edge 熔断好几分钟。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    # 先按状态码判：429 / 5xx 一律算瞬时
+    for code in _parse_status_codes(text):
+        if code == 429 or 500 <= code <= 599:
+            return False
+    for marker in ("403", "401", "forbidden", "unauthorized", "invalid response status"):
+        if marker in text:
+            return True
+    return False
+
+
+_STATUS_RE = re.compile(r"\b([1-5]\d{2})\b")
+
+
+def _parse_status_codes(text: str) -> tuple[int, ...]:
+    """从异常文本里挖出可能的 HTTP 状态码。
+
+    只在 100–599 之间取值，避免把 "read timeout 3000ms" 里的 3000 当成状态码。
+    """
+    return tuple(int(m) for m in _STATUS_RE.findall(text) if 100 <= int(m) <= 599)
+
+
+def _mark_edge_down(permanent: bool) -> None:
+    """标记 edge-tts 进入熔断期，并往 stderr 留一行提示（方便排查）。
+
+    永久故障（403）熔断十分钟，瞬时故障只熔断半分钟——一次抖动不该
+    让整场面试都用兜底音色。
+    """
     global _edge_down_until
-    _edge_down_until = time.time() + _EDGE_RETRY_AFTER
+    window = _EDGE_RETRY_AFTER_HARD if permanent else _EDGE_RETRY_AFTER_SOFT
+    _edge_down_until = time.time() + window
+    kind = "永久故障" if permanent else "瞬时故障"
     print(
-        f"[TTS] edge-tts 不可用，{_EDGE_RETRY_AFTER}s 内改用硅基流动合成",
+        f"[TTS] edge-tts {kind}，{window}s 内改用硅基流动合成",
         file=sys.stderr,
     )
 

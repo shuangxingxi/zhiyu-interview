@@ -22,12 +22,15 @@ import streamlit as st
 import history_store
 import interview_state
 import mood
+import resume_optimize
 import session_store
 from agents import (
+    advisor_review,
     coach_review,
     evaluate_interview,
     interviewer_turn,
     reset_usage,
+    resume_review,
     test_connection,
     usage_snapshot,
 )
@@ -43,7 +46,14 @@ from knowledge import (
     profile_summary,
 )
 from resume import ACCEPTED_TYPES, extract_text
-from voice import DEFAULT_VOICE, VOICES, correct_asr, synthesize, transcribe
+from voice import (
+    DEFAULT_VOICE,
+    VOICES,
+    correct_asr,
+    is_valid_audio,
+    synthesize,
+    transcribe,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 HISTORY_FILE = BASE_DIR / "history.json"
@@ -114,6 +124,774 @@ def _awaiting_interviewer() -> bool:
 
 
 st.set_page_config(page_title="知遇 · AI 虚拟面试官", page_icon="🎤", layout="wide")
+
+
+# =====================================================================
+# 全局 CSS —— 知遇 · AI 虚拟面试官
+# 风格：暖纸编辑风
+#   暖米纸面底 / 墨黑正文 / 柿橙点缀 #C2481B / 衬线标题 /
+#   圆角卡片 / 柔和投影 / 宽松留白
+# 说明：仅注入外观样式（unsafe_allow_html），不触碰功能类名与 JS。
+# =====================================================================
+st.markdown(
+    """
+    <style>
+    /* ============================================================
+       知遇 · 全局设计系统 ——「暖纸编辑风」
+       暖米纸面底 / 墨黑正文 / 柿橙点缀 #C2481B / 衬线标题 /
+       圆角卡片 / 柔和投影 / 宽松留白
+       ============================================================ */
+    :root {
+        --zy-paper: #F5F0E8;
+        --zy-surface: #FFFFFF;
+        --zy-ink: #211D19;
+        --zy-muted: #6B6259;
+        --zy-faint: #9A9184;
+        --zy-accent: #C2481B;
+        --zy-accent-deep: #9E3A14;
+        --zy-accent-soft: #FBEAE0;
+        --zy-line: #E5DCCD;
+        --zy-line-strong: #D8CFC0;
+        --zy-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", "SimSun", serif;
+        --zy-sans: "Microsoft YaHei UI", "Noto Sans SC", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+        --zy-shadow-sm: 0 1px 2px rgba(33, 29, 25, 0.05);
+        --zy-shadow-md: 0 1px 2px rgba(33, 29, 25, 0.04), 0 12px 32px rgba(33, 29, 25, 0.07);
+    }
+
+    /* ============================================================
+       0. 全局基础
+       ============================================================ */
+    html, body,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    [data-testid="stAppViewContainer"] .main {
+        background-color: var(--zy-paper) !important;
+        color: var(--zy-ink);
+        font-family: var(--zy-sans);
+        letter-spacing: 0.01em;
+    }
+    [data-testid="stAppViewContainer"] *:focus-visible {
+        outline: 2px solid var(--zy-accent) !important;
+        outline-offset: 1px;
+    }
+
+    /* ============================================================
+       1. 侧边栏 —— 暖白底 / 柔和右线
+       ============================================================ */
+    [data-testid="stSidebar"] {
+        background-color: #F1EADF !important;
+        border-right: 1px solid var(--zy-line);
+        min-width: 300px;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+        padding: 1.75rem 1.25rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarNav"] {
+        background-color: #F1EADF !important;
+        border-bottom: 1px solid var(--zy-line);
+        padding-top: 0.5rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarNav"] a {
+        color: var(--zy-ink);
+        font-weight: 500;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover {
+        color: var(--zy-accent);
+        background-color: var(--zy-surface);
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarNav"] a[aria-current="page"] {
+        background-color: var(--zy-accent-soft);
+        color: var(--zy-accent-deep);
+        font-weight: 700;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+        padding: 0 0.25rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+    [data-testid="stSidebar"] [data-testid="stHeading"] h1 {
+        font-family: var(--zy-serif);
+        font-size: 1.3125rem;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        color: var(--zy-ink);
+        margin: 0.25rem 0 0.875rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 2px solid var(--zy-accent);
+        display: inline-block;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stSidebar"] [data-testid="stHeading"] h2 {
+        font-size: 0.9375rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        color: var(--zy-ink);
+        margin: 1.25rem 0 0.5rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        color: var(--zy-muted);
+        font-size: 0.875rem;
+        line-height: 1.6;
+    }
+
+    /* ============================================================
+       2. 按钮 —— 胶囊形 / 柿橙主色 / hover 转墨黑
+       ============================================================ */
+    [data-testid="stButton"] button,
+    [data-testid="stFormSubmitButton"] button,
+    [data-testid="stDownloadButton"] button,
+    [data-testid="baseButton-primary"],
+    [data-testid="baseButton-secondary"],
+    [data-testid="baseButton-primaryFormSubmit"],
+    [data-testid="baseButton-secondaryFormSubmit"] {
+        border-radius: 999px !important;
+        font-family: inherit;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        padding: 0.5rem 1.5rem;
+        border-width: 1px;
+        border-style: solid;
+        box-shadow: none !important;
+        transition: background-color 0.18s ease, border-color 0.18s ease,
+                    color 0.18s ease, transform 0.18s ease;
+    }
+    [data-testid="stButton"] button[kind="primary"],
+    [data-testid="baseButton-primary"],
+    [data-testid="baseButton-primaryFormSubmit"] {
+        background-color: var(--zy-accent) !important;
+        border-color: var(--zy-accent) !important;
+        color: #FFFFFF !important;
+    }
+    [data-testid="stButton"] button[kind="primary"]:hover:not(:disabled),
+    [data-testid="baseButton-primary"]:hover:not(:disabled),
+    [data-testid="baseButton-primaryFormSubmit"]:hover:not(:disabled) {
+        background-color: var(--zy-ink) !important;
+        border-color: var(--zy-ink) !important;
+        color: #FFFFFF !important;
+    }
+    [data-testid="stButton"] button[kind="secondary"],
+    [data-testid="baseButton-secondary"],
+    [data-testid="baseButton-secondaryFormSubmit"] {
+        background-color: var(--zy-surface) !important;
+        border-color: var(--zy-line-strong) !important;
+        color: var(--zy-ink) !important;
+    }
+    [data-testid="stButton"] button[kind="secondary"]:hover:not(:disabled),
+    [data-testid="baseButton-secondary"]:hover:not(:disabled),
+    [data-testid="baseButton-secondaryFormSubmit"]:hover:not(:disabled) {
+        border-color: var(--zy-ink) !important;
+        color: var(--zy-accent) !important;
+    }
+    [data-testid="stButton"] button:disabled,
+    [data-testid="baseButton-primary"]:disabled,
+    [data-testid="baseButton-secondary"]:disabled {
+        background-color: #E7E0D3 !important;
+        border-color: #E7E0D3 !important;
+        color: var(--zy-faint) !important;
+    }
+
+    /* ============================================================
+       3. 表单控件
+       ============================================================ */
+    /* --- selectbox / multiselect --- */
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+    [data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+        background-color: var(--zy-surface) !important;
+        border: 1px solid var(--zy-line-strong) !important;
+        border-radius: 10px !important;
+        color: var(--zy-ink);
+    }
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div:hover,
+    [data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover {
+        border-color: var(--zy-accent) !important;
+    }
+    [data-testid="stSelectbox"] [data-baseweb="select"] input,
+    [data-testid="stMultiSelect"] [data-baseweb="select"] input,
+    [data-testid="stSelectbox"] [data-baseweb="select"] span,
+    [data-testid="stMultiSelect"] [data-baseweb="select"] span {
+        color: var(--zy-ink);
+    }
+    [data-baseweb="popover"] [data-baseweb="menu"],
+    [data-baseweb="menu"],
+    [data-baseweb="popover"] {
+        background-color: var(--zy-surface) !important;
+        border: 1px solid var(--zy-line) !important;
+        border-radius: 12px !important;
+        box-shadow: var(--zy-shadow-md) !important;
+    }
+    [data-baseweb="menu"] li,
+    [data-baseweb="menu"] [role="option"] {
+        background-color: transparent;
+        color: var(--zy-ink);
+    }
+    [data-baseweb="menu"] li:hover,
+    [data-baseweb="menu"] [role="option"]:hover {
+        background-color: var(--zy-accent-soft);
+    }
+    [data-baseweb="menu"] li[aria-selected="true"],
+    [data-baseweb="menu"] li[aria-current="true"],
+    [data-baseweb="menu"] [role="option"][aria-selected="true"] {
+        background-color: var(--zy-accent) !important;
+        color: #FFFFFF !important;
+    }
+
+    /* --- radio --- */
+    [data-testid="stRadio"] [role="radiogroup"] label {
+        color: var(--zy-ink);
+        font-size: 0.9375rem;
+    }
+    [data-testid="stRadio"] [data-baseweb="radio"] > span:first-child {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line-strong);
+        width: 18px;
+        height: 18px;
+    }
+    [data-testid="stRadio"] [data-baseweb="radio"] input:checked + span {
+        background-color: var(--zy-accent);
+        border-color: var(--zy-accent);
+    }
+    [data-testid="stRadio"] [data-baseweb="radio"] input:checked + span > span {
+        background-color: #FFFFFF !important;
+    }
+
+    /* --- text_input / text_area / number_input --- */
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stNumberInput"] input,
+    [data-testid="stDateInput"] input {
+        background-color: var(--zy-surface) !important;
+        border: 1px solid var(--zy-line-strong) !important;
+        border-radius: 10px !important;
+        box-shadow: none !important;
+        color: var(--zy-ink) !important;
+        caret-color: var(--zy-accent);
+    }
+    [data-testid="stTextInput"] input:focus,
+    [data-testid="stTextArea"] textarea:focus,
+    [data-testid="stNumberInput"] input:focus,
+    [data-testid="stDateInput"] input:focus {
+        border-color: var(--zy-accent) !important;
+        box-shadow: 0 0 0 3px rgba(194, 72, 27, 0.14) !important;
+    }
+    [data-testid="stTextInput"] input::placeholder,
+    [data-testid="stTextArea"] textarea::placeholder {
+        color: var(--zy-faint);
+    }
+    [data-testid="stTextInput"] [data-baseweb="input"],
+    [data-testid="stTextArea"] [data-baseweb="textarea"] {
+        background-color: transparent;
+    }
+
+    /* --- checkbox --- */
+    [data-testid="stCheckbox"] label {
+        color: var(--zy-ink);
+        font-size: 0.9375rem;
+    }
+    [data-testid="stCheckbox"] [data-baseweb="checkbox"] > span:first-child {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line-strong);
+        border-radius: 5px !important;
+    }
+    [data-testid="stCheckbox"] [data-baseweb="checkbox"] input:checked + span {
+        background-color: var(--zy-accent);
+        border-color: var(--zy-accent);
+    }
+
+    /* --- file_uploader --- */
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] {
+        background-color: var(--zy-surface) !important;
+        border: 1.5px dashed var(--zy-line-strong) !important;
+        border-radius: 14px !important;
+        box-shadow: none !important;
+        color: var(--zy-ink);
+    }
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"]:hover {
+        border-color: var(--zy-accent) !important;
+        background-color: #FFFDF9 !important;
+    }
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] button {
+        border: none !important;
+        border-radius: 999px !important;
+        background-color: var(--zy-accent) !important;
+        color: #FFFFFF !important;
+        font-weight: 600;
+    }
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        border-radius: 10px !important;
+    }
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] button {
+        border: 1px solid var(--zy-line-strong);
+        border-radius: 999px !important;
+    }
+
+    /* ============================================================
+       4. Expander —— 白色圆角卡片 / 柔和投影
+       ============================================================ */
+    [data-testid="stExpander"] details {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        border-radius: 14px !important;
+        box-shadow: var(--zy-shadow-sm) !important;
+        overflow: hidden;
+    }
+    [data-testid="stExpander"] summary {
+        color: var(--zy-ink);
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        padding: 0.8rem 1.1rem;
+    }
+    [data-testid="stExpander"] summary:hover {
+        color: var(--zy-accent);
+        background-color: #FFFDF9;
+    }
+    [data-testid="stExpander"] summary svg {
+        color: var(--zy-muted);
+    }
+
+    /* ============================================================
+       5. Chat 消息气泡 —— 大圆角 / 面试官白卡 / 用户柿橙
+       ============================================================ */
+    [data-testid="stChatMessage"] {
+        background-color: transparent;
+    }
+    [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
+        border-radius: 16px !important;
+        padding: 0.9rem 1.2rem;
+        font-size: 1rem;
+        line-height: 1.7;
+        max-width: 78%;
+    }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"])
+    [data-testid="stChatMessageContent"] {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        box-shadow: var(--zy-shadow-sm) !important;
+        color: var(--zy-ink);
+    }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
+    [data-testid="stChatMessageContent"] {
+        background-color: var(--zy-accent);
+        border: 1px solid var(--zy-accent);
+        box-shadow: 0 6px 18px rgba(194, 72, 27, 0.22) !important;
+        color: #FFFFFF;
+    }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
+    [data-testid="stChatMessageContent"] a {
+        color: #FFFFFF;
+        text-decoration: underline;
+    }
+    [data-testid="stChatMessageAvatarUser"],
+    [data-testid="stChatMessageAvatarAssistant"] {
+        border-radius: 50% !important;
+        background-color: var(--zy-accent-soft);
+        font-size: 1rem;
+    }
+
+    /* ============================================================
+       6. Tabs —— 下划线式 / 暖色底线
+       ============================================================ */
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        background-color: transparent;
+        border-bottom: 1px solid var(--zy-line);
+        gap: 0.25rem;
+        padding: 0;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-list"] button[role="tab"] {
+        background-color: transparent;
+        border: none;
+        border-bottom: 3px solid transparent;
+        color: var(--zy-muted);
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        padding: 0.625rem 1.25rem;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-list"] button[role="tab"]:hover {
+        color: var(--zy-ink);
+        border-bottom-color: var(--zy-line-strong);
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-list"] button[role="tab"][aria-selected="true"] {
+        color: var(--zy-accent);
+        border-bottom: 3px solid var(--zy-accent);
+        font-weight: 700;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"],
+    [data-testid="stTabs"] [data-baseweb="tab-border"] {
+        display: none;
+    }
+
+    /* ============================================================
+       7. Spinner
+       ============================================================ */
+    [data-testid="stSpinner"] {
+        color: var(--zy-ink);
+        font-weight: 500;
+    }
+    [data-testid="stSpinner"] [data-testid="stSpinnerText"] {
+        color: var(--zy-muted);
+    }
+    [data-testid="stSpinner"] svg {
+        stroke: var(--zy-accent) !important;
+        fill: var(--zy-accent) !important;
+        color: var(--zy-accent) !important;
+    }
+
+    /* ============================================================
+       8. 提示框 —— 暖白圆角 / 左侧柿橙竖条
+       ============================================================ */
+    [data-testid="stAlert"],
+    [data-testid="stNotification"] {
+        background-color: var(--zy-surface) !important;
+        border: 1px solid var(--zy-line) !important;
+        border-left: 4px solid var(--zy-accent) !important;
+        border-radius: 12px !important;
+        box-shadow: var(--zy-shadow-sm) !important;
+        color: var(--zy-ink);
+        font-size: 0.9375rem;
+    }
+    [data-testid="stAlert"] svg,
+    [data-testid="stNotification"] svg {
+        fill: var(--zy-accent);
+        color: var(--zy-accent);
+    }
+    [data-testid="stAlert"] p,
+    [data-testid="stNotification"] p {
+        color: var(--zy-ink);
+    }
+
+    /* ============================================================
+       9. 标题层级 —— 衬线标题 / 编辑排版
+       ============================================================ */
+    [data-testid="stHeading"] h1,
+    [data-testid="stTitle"] h1,
+    [data-testid="stMarkdownContainer"] h1 {
+        font-family: var(--zy-serif);
+        font-size: 2.125rem;
+        font-weight: 800;
+        letter-spacing: 0;
+        line-height: 1.22;
+        color: var(--zy-ink);
+        margin: 0 0 1.375rem;
+    }
+    [data-testid="stHeading"] h2,
+    [data-testid="stHeader"] h2,
+    [data-testid="stMarkdownContainer"] h2 {
+        font-family: var(--zy-serif);
+        font-size: 1.5rem;
+        font-weight: 700;
+        line-height: 1.3;
+        color: var(--zy-ink);
+        margin: 2rem 0 0.75rem;
+    }
+    [data-testid="stHeading"] h3,
+    [data-testid="stMarkdownContainer"] h3 {
+        font-size: 1rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        color: var(--zy-accent);
+        margin: 1.5rem 0 0.625rem;
+    }
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li {
+        color: var(--zy-ink);
+        font-size: 1rem;
+        line-height: 1.75;
+    }
+    [data-testid="stMarkdownContainer"] a {
+        color: var(--zy-accent);
+        font-weight: 500;
+        text-decoration: none;
+        border-bottom: 1px solid rgba(194, 72, 27, 0.35);
+    }
+    [data-testid="stMarkdownContainer"] strong {
+        color: var(--zy-ink);
+        font-weight: 700;
+    }
+
+    /* ============================================================
+       10. 分割线
+       ============================================================ */
+    [data-testid="stDivider"] hr,
+    [data-testid="stMarkdownContainer"] hr {
+        border: none;
+        border-top: 1px solid var(--zy-line);
+        margin: 1.75rem 0;
+    }
+
+    /* ============================================================
+       11. Metric 卡片 —— 白卡圆角 / 柿橙大数字
+       ============================================================ */
+    [data-testid="stMetric"] {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        border-radius: 14px !important;
+        box-shadow: var(--zy-shadow-sm) !important;
+        padding: 1rem 1.25rem;
+    }
+    [data-testid="stMetricLabel"] {
+        color: var(--zy-muted);
+        font-size: 0.8125rem;
+        font-weight: 500;
+        letter-spacing: 0.06em;
+    }
+    [data-testid="stMetricValue"] {
+        font-family: var(--zy-serif);
+        color: var(--zy-accent);
+        font-weight: 800;
+        font-size: 1.75rem;
+    }
+    [data-testid="stMetricDelta"] {
+        color: var(--zy-ink);
+    }
+
+    /* ============================================================
+       12. 容器与表单细节
+       ============================================================ */
+    [data-testid="stVerticalBlock"] > div,
+    .block-container {
+        padding-top: 2.25rem;
+        padding-bottom: 3rem;
+    }
+    [data-testid="stForm"] {
+        border: 1px solid var(--zy-line);
+        border-radius: 16px !important;
+        box-shadow: var(--zy-shadow-sm) !important;
+        padding: 1.5rem;
+        background-color: var(--zy-surface);
+    }
+    [data-testid="stCaptionContainer"] {
+        color: var(--zy-muted);
+        font-size: 0.8125rem;
+    }
+    [data-testid="stWidgetLabel"] p {
+        color: var(--zy-ink);
+        font-weight: 600;
+        font-size: 0.9375rem;
+    }
+
+    /* ============================================================
+       13. 顶栏与页脚
+       ============================================================ */
+    [data-testid="stHeader"] {
+        background-color: var(--zy-paper) !important;
+        border-bottom: 1px solid var(--zy-line);
+    }
+    [data-testid="stDecoration"] {
+        display: none;
+    }
+    footer {
+        visibility: hidden;
+    }
+
+    /* ============================================================
+       14. 进度条 —— 胶囊轨道 / 柿橙填充
+       ============================================================ */
+    [data-testid="stProgress"] > div > div > div {
+        background-color: #EAE2D6 !important;
+        border-radius: 999px !important;
+        height: 8px;
+    }
+    [data-testid="stProgress"] > div > div > div > div {
+        background-color: var(--zy-accent) !important;
+        border-radius: 999px !important;
+    }
+    [data-testid="stProgress"] [data-testid="stMarkdownContainer"] p {
+        color: var(--zy-muted);
+        font-size: 0.875rem;
+        white-space: pre-line;
+    }
+
+    /* ============================================================
+       15. 聊天输入框
+       ============================================================ */
+    [data-testid="stChatInput"] {
+        background-color: var(--zy-paper);
+        border-top: 1px solid var(--zy-line);
+        padding: 0.75rem 0 0.25rem;
+    }
+    [data-testid="stChatInput"] textarea {
+        background-color: var(--zy-surface) !important;
+        border: 1px solid var(--zy-line-strong) !important;
+        border-radius: 14px !important;
+        box-shadow: var(--zy-shadow-sm) !important;
+        color: var(--zy-ink);
+        caret-color: var(--zy-accent);
+    }
+    [data-testid="stChatInput"] textarea:focus {
+        border-color: var(--zy-accent) !important;
+        box-shadow: 0 0 0 3px rgba(194, 72, 27, 0.14) !important;
+    }
+    [data-testid="stChatInput"] button {
+        color: var(--zy-accent) !important;
+    }
+
+    /* ============================================================
+       16. 数据表格 / 音频 / 滚动条
+       ============================================================ */
+    [data-testid="stDataFrame"],
+    [data-testid="stTable"] {
+        border: 1px solid var(--zy-line);
+        border-radius: 12px !important;
+        background-color: var(--zy-surface);
+        overflow: hidden;
+    }
+    [data-testid="stAudioInput"] {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line-strong);
+        border-radius: 14px !important;
+        padding: 0.5rem 0.75rem;
+    }
+    [data-testid="stAudio"] audio {
+        width: 100%;
+    }
+    ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+    }
+    ::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+        background: var(--zy-line-strong);
+        border-radius: 999px;
+        border: 2px solid var(--zy-paper);
+    }
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--zy-accent);
+    }
+
+    /* ============================================================
+       17. 自定义组件 —— Hero / 特性网格 / 会话头部栏
+       ============================================================ */
+    .zy-hero {
+        position: relative;
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        border-radius: 24px;
+        box-shadow: var(--zy-shadow-md);
+        padding: 2.75rem 2.75rem 2.625rem;
+        margin: 0 0 1.375rem;
+        overflow: hidden;
+    }
+    .zy-hero::after {
+        content: "";
+        position: absolute;
+        right: -64px;
+        top: -64px;
+        width: 200px;
+        height: 200px;
+        border-radius: 50%;
+        background: radial-gradient(circle, var(--zy-accent-soft) 0%, rgba(251, 234, 224, 0) 70%);
+    }
+    .zy-kicker {
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        color: var(--zy-accent);
+        margin: 0 0 1rem;
+    }
+    .zy-title {
+        font-family: var(--zy-serif);
+        font-size: 4rem;
+        font-weight: 800;
+        letter-spacing: -0.01em;
+        line-height: 1.08;
+        color: var(--zy-ink);
+        margin: 0;
+    }
+    .zy-title em {
+        font-style: normal;
+        color: var(--zy-accent);
+    }
+    .zy-sub {
+        font-size: 1.0625rem;
+        line-height: 1.75;
+        color: var(--zy-muted);
+        max-width: 46em;
+        margin: 1.125rem 0 0;
+    }
+    .zy-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1.125rem;
+        margin: 0 0 1.375rem;
+    }
+    .zy-cell {
+        background-color: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        border-radius: 18px;
+        box-shadow: var(--zy-shadow-sm);
+        padding: 1.375rem 1.5rem 1.5rem;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .zy-cell:hover {
+        transform: translateY(-3px);
+        box-shadow: var(--zy-shadow-md);
+    }
+    .zy-num {
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--zy-accent);
+    }
+    .zy-cell h4 {
+        font-family: var(--zy-serif);
+        margin: 0.5rem 0 0.375rem;
+        font-size: 1.125rem;
+        font-weight: 800;
+        color: var(--zy-ink);
+    }
+    .zy-cell p {
+        margin: 0;
+        font-size: 0.9rem;
+        line-height: 1.7;
+        color: var(--zy-muted);
+    }
+    .zy-band {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 1rem;
+        flex-wrap: wrap;
+        border-bottom: 1px solid var(--zy-line);
+        padding-bottom: 0.875rem;
+        margin-bottom: 1.375rem;
+    }
+    .zy-mark {
+        font-family: var(--zy-serif);
+        font-size: 1.625rem;
+        font-weight: 800;
+        letter-spacing: -0.01em;
+        line-height: 1.15;
+        color: var(--zy-ink);
+    }
+    .zy-mark em {
+        font-style: normal;
+        color: var(--zy-accent);
+    }
+    .zy-meta {
+        font-size: 0.875rem;
+        letter-spacing: 0.03em;
+        color: var(--zy-muted);
+        text-align: right;
+    }
+    @media (max-width: 900px) {
+        .zy-grid {
+            grid-template-columns: 1fr;
+        }
+        .zy-hero {
+            padding: 2rem 1.375rem;
+        }
+        .zy-title {
+            font-size: 2.75rem;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +1033,10 @@ def restore_snapshot(data: dict) -> None:
     ss["voice_signature"] = ""
     ss["evaluation"] = {}
     ss["coach"] = {}
+    # 建议与简历优化都不落盘，恢复出来的场次自然也没有它们。
+    # 这里显式清空，避免残留上一场（或上一次简历优化）的结果与本场混在一起。
+    ss["advice"] = {}
+    ss["resume_advice"] = {}
     ss["error"] = ""
     ss["status"] = "running"
     # 原场次用过简历，但简历不落盘 → 恢复后针对性提问会退化，界面上要明确提示
@@ -313,6 +1095,10 @@ def init_state() -> None:
         "started_at": datetime.now(),
         "evaluation": {},
         "coach": {},
+        # 提升建议（按评分维度给）+ 简历优化结果。
+        # 两者都**不落盘**：建议含逐字稿引用，简历优化含简历原文改写，都只活在本会话内存。
+        "advice": {},
+        "resume_advice": {},
         "usage": {},  # 本场 token 计量（开局清零，报告生成后取值）
         # 清空历史记录需要两步确认（不可撤销），这个标记记住"已点过一次"
         "confirm_clear_history": False,
@@ -364,6 +1150,8 @@ def start_interview(profile: dict, api_key: str) -> None:
     st.session_state.started_at = datetime.now()
     st.session_state.evaluation = {}
     st.session_state.coach = {}
+    st.session_state.advice = {}
+    st.session_state.resume_advice = {}
     st.session_state.error = ""
     st.session_state.audio_by_index = {}
     st.session_state.autoplay_index = -1
@@ -392,6 +1180,12 @@ def speak(text: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[TTS 失败] {exc}", file=sys.stderr, flush=True)
+        return
+    # 合成可能"成功"返回空流（例如整段都是 markdown、清完就空了），
+    # 这时不能把 b"" 挂进 audio_by_index：界面上的 `if audio:` 会静默跳过，
+    # 用户只是听不到声音，也看不出是合成失败还是文本被清空。
+    if not is_valid_audio(audio):
+        print("[TTS 跳过] 合成结果为空或非 MP3 数据", file=sys.stderr, flush=True)
         return
     index = len(st.session_state.history) - 1
     st.session_state.audio_by_index[index] = audio
@@ -550,12 +1344,23 @@ def finish_interview() -> None:
             coach = coach_review(
                 history, evaluation, profile, st.session_state.api_key, mood_trace=trace
             )
+            # 建议官排在教练之后：它要读教练没覆盖的那一层（按维度补什么）。
+            # 但它是**可选**的——失败只记一笔降级说明，绝不让整份报告生成失败：
+            # 评估与教练已经产出，因为多要一份建议而丢掉整份报告是本末倒置。
+            try:
+                advisor = advisor_review(
+                    history, evaluation, profile, st.session_state.api_key
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[建议官调用失败，报告缺该栏] {exc}", file=sys.stderr, flush=True)
+                advisor = {}
         except Exception as exc:  # noqa: BLE001
             st.session_state.error = f"生成报告失败：{exc}"
             return
 
         st.session_state.evaluation = evaluation
         st.session_state.coach = coach
+        st.session_state.advice = advisor
         # 报告生成完再取一次计量，这样本场消耗把评估官与教练的调用也算进去
         st.session_state.usage = usage_snapshot()
 
@@ -578,6 +1383,10 @@ def finish_interview() -> None:
                 "usage": st.session_state.usage,
                 "evaluation": evaluation,
                 "coach": coach,
+                # 「提升建议」刻意不落盘：它的每条建议都引用候选人原话，属于个人化
+                # 内容（与简历同级）。留存只在**用户主动导出报告**时发生，
+                # 与 README 声明的"简历从不写入磁盘"保持一致口径。
+                # 想在这里补一行落盘时，必须同步修改 README 的隐私声明。
             }
         )
     finally:
@@ -779,6 +1588,139 @@ def _render_candidate_section() -> str:
     return "\n".join(parts)
 
 
+def _render_resume_optimize_section(api_key: str) -> None:
+    """简历优化入口：独立于面试，上传简历就能用。
+
+    刻意与「候选人背景与简历」分开：那一组是为了**面试**取材（上传后面试官会
+    围绕它提问），这一组是为了**改简历**。两者的目标岗位可以不同——用户可能
+    想改一份投算法岗的简历，同时不想为它开一场面试。
+    """
+    st.caption("独立功能：改简历不需要先开一场面试。结果只留在本页内存，不写入历史记录。")
+
+    uploaded = st.file_uploader(
+        "在这里上传要优化的简历",
+        type=ACCEPTED_TYPES,
+        key="optimize_upload",
+        help="支持 PDF / Word / TXT。解析后只在内存中处理，不落盘。",
+    )
+
+    if uploaded is not None:
+        signature = f"opt:{uploaded.name}:{uploaded.size}"
+        if signature != st.session_state.get("optimize_signature"):
+            text, message = extract_text(uploaded.name, uploaded.getvalue())
+            st.session_state.optimize_signature = signature
+            st.session_state.optimize_text = text
+            st.session_state.optimize_name = uploaded.name if text else ""
+            st.session_state.optimize_error = message
+            # 换了简历，上一份的结果作废——否则会显示"新简历 + 旧建议"
+            st.session_state.resume_advice = {}
+    elif st.session_state.get("optimize_name"):
+        # 控件被清空：同步丢掉内存里的简历与原建议，与 sync_resume 同款处理
+        st.session_state.optimize_text = ""
+        st.session_state.optimize_name = ""
+        st.session_state.optimize_error = ""
+        st.session_state.optimize_signature = ""
+        st.session_state.resume_advice = {}
+
+    if st.session_state.get("optimize_name"):
+        st.success(f"已读取：{st.session_state.optimize_name}")
+    elif st.session_state.get("optimize_error"):
+        st.warning(st.session_state.optimize_error)
+
+    st.text_input(
+        "目标岗位（用于匹配度建议）",
+        key="ro_target_role",
+        placeholder="例：后端开发实习生 / 算法工程师",
+        help="留空也能生成，只是建议不会针对某个具体岗位。",
+    )
+
+    ready = bool(st.session_state.get("optimize_text")) and bool(api_key)
+    if st.button("生成优化建议", disabled=not ready, use_container_width=True):
+        with st.spinner("正在诊断简历…"):
+            try:
+                st.session_state.resume_advice = resume_review(
+                    st.session_state.optimize_text,
+                    api_key,
+                    target_role=st.session_state.ro_target_role,
+                    major=str((st.session_state.profile or {}).get("major") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.error = f"简历优化失败：{exc}"
+        st.rerun()
+
+    if not api_key:
+        st.caption("填入 DeepSeek API Key 后即可生成。")
+
+    result = st.session_state.get("resume_advice") or {}
+    if result:
+        st.divider()
+        if result.get("score") is not None:
+            st.metric("简历评分", result["score"])
+        if result.get("verdict"):
+            st.info(result["verdict"])
+
+        problems = result.get("problems") or []
+        if problems:
+            st.markdown("**诊断**")
+            for item in problems:
+                icon = {"high": "🔴", "medium": "🟠", "low": "🟡"}.get(
+                    item.get("severity", ""), "•"
+                )
+                st.markdown(f"{icon} **{item.get('problem', '')}**")
+                if item.get("evidence"):
+                    st.caption(f"原文：{item['evidence']}")
+                st.caption(f"怎么改：{item.get('advice', '')}")
+
+        rewrites = result.get("rewrites") or []
+        if rewrites:
+            st.markdown("**改写对照**")
+            for i, item in enumerate(rewrites, start=1):
+                with st.expander(f"{i}. {item.get('original', '')[:24]}…"):
+                    st.markdown(f"**原句**：{item.get('original', '')}")
+                    st.success(f"**改写**：{item.get('improved', '')}")
+                    st.caption(f"为什么：{item.get('why', '')}")
+
+        if result.get("missing"):
+            st.markdown("**还需要补的内容**")
+            for item in result["missing"]:
+                st.markdown(f"- {item}")
+        if result.get("keywords"):
+            st.markdown("**关键词建议**")
+            st.caption("只列你真实掌握的方向；不建议堆砌不熟悉的名词。")
+            st.markdown(" ".join(f"`{k}`" for k in result["keywords"]))
+        if result.get("checklist"):
+            st.markdown("**投简历前自查**")
+            for item in result["checklist"]:
+                st.markdown(f"- [ ] {item}")
+
+        # 如实标注两道本地核对的结果，让人知道"没编造"是被验证过的。
+        # 两种被剔除的原因分开说：编造原句 与 凭空补数字 是不同性质的问题。
+        dropped = int(result.get("dropped_rewrites") or 0)
+        invented = int(result.get("invented_numbers") or 0)
+        ungrounded = int(result.get("ungrounded_evidence") or 0)
+        if dropped or ungrounded:
+            st.warning(
+                f"本地核对已剔除 {dropped} 条改写"
+                f"（其中 {invented} 条是改写里补了原文没有的数字）、"
+                f"{ungrounded} 条诊断引用（对不上原文）——避免出现你没写过的内容。"
+            )
+
+        quant = result.get("quantification") or {}
+        if quant.get("lines"):
+            st.caption(
+                f"本地统计：{quant['lines']} 行里 {quant['quantified']} 行含量化结果"
+                f"（{quant['ratio']:.0%}）。"
+            )
+        _, btn_col = st.columns([3, 1])
+        btn_col.download_button(
+            "导出优化建议",
+            data=build_resume_advice_markdown(),
+            file_name=f"简历优化建议-{datetime.now().strftime('%Y%m%d-%H%M')}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+
 def _render_voice_section() -> None:
     """语音与动效。关闭语音时整段收起，避免无意义的控件堆在侧边栏。"""
     st.session_state.voice_on = st.checkbox(
@@ -895,6 +1837,9 @@ def render_sidebar() -> None:
         with st.expander("👤 候选人背景与简历", expanded=False):
             candidate_bg = _render_candidate_section()
 
+        with st.expander("📝 简历优化（独立功能）", expanded=False):
+            _render_resume_optimize_section(api_key)
+
         with st.expander("🎙️ 语音与动效", expanded=False):
             _render_voice_section()
 
@@ -943,11 +1888,21 @@ def render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 
 
+def render_page_header(meta: str) -> None:
+    """页面顶部的会话栏：左侧字标、右侧场次信息。替代裸的 st.title + st.caption。"""
+    st.markdown(
+        f'<div class="zy-band">'
+        f'<span class="zy-mark">知遇<em> · AI 虚拟面试官</em></span>'
+        f'<span class="zy-meta">{meta}</span>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_interview() -> None:
     profile = st.session_state.profile
 
-    st.title("知遇 · AI 虚拟面试官")
-    st.caption(f"当前场次：{profile_summary(profile)}")
+    render_page_header(profile_summary(profile))
 
     if st.session_state.get("resume_lost_note"):
         st.warning(
@@ -1055,6 +2010,94 @@ def render_interview() -> None:
 # 或直接作为参赛材料 / 演示视频的附件。
 # 纯字符串拼接，不调用模型，也不影响面试主流程。
 # ---------------------------------------------------------------------------
+
+
+def build_resume_advice_markdown() -> str:
+    """把简历优化建议整理成一份 Markdown 文本（用户主动导出时才产出）。"""
+    result = st.session_state.get("resume_advice") or {}
+    lines: list[str] = []
+
+    def add(text: str = "") -> None:
+        lines.append(text)
+
+    add("# 简历优化建议")
+    add()
+    add(f"- 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    add(f"- 简历文件：{st.session_state.get('optimize_name') or '—'}")
+    target = str(st.session_state.get("ro_target_role") or "").strip()
+    add(f"- 目标岗位：{target or '未指定'}")
+    if result.get("score") is not None:
+        add(f"- 简历评分：**{result['score']}**")
+    add()
+    if result.get("verdict"):
+        add(f"> {result['verdict']}")
+        add()
+
+    problems = result.get("problems") or []
+    if problems:
+        add("## 一、诊断")
+        add()
+        for item in problems:
+            add(f"### {item.get('category', '') or '问题'}（{item.get('severity', '')}）")
+            add()
+            add(item.get("problem", ""))
+            add()
+            if item.get("evidence"):
+                add(f"- 原文：{item['evidence']}")
+            add(f"- 怎么改：{item.get('advice', '')}")
+            add()
+
+    rewrites = result.get("rewrites") or []
+    if rewrites:
+        add("## 二、改写对照")
+        add()
+        add("> 改写只用简历里已有的信息重新组织；本地已逐条核对原句出处，找不到出处的已剔除。")
+        add()
+        for i, item in enumerate(rewrites, start=1):
+            add(f"**{i}.** {item.get('original', '')}")
+            add()
+            add(f"- 改写：{item.get('improved', '')}")
+            if item.get("why"):
+                add(f"- 为什么：{item['why']}")
+            add()
+
+    if result.get("missing"):
+        add("## 三、还需要补的内容")
+        add()
+        for item in result["missing"]:
+            add(f"- {item}")
+        add()
+    if result.get("keywords"):
+        add("## 四、关键词建议")
+        add()
+        add("> 只列你真实掌握的方向，不建议堆砌不熟悉的名词。")
+        add()
+        for item in result["keywords"]:
+            add(f"- {item}")
+        add()
+    if result.get("checklist"):
+        add("## 五、投简历前自查")
+        add()
+        for item in result["checklist"]:
+            add(f"- [ ] {item}")
+        add()
+
+    quant = result.get("quantification") or {}
+    if quant.get("lines"):
+        add("---")
+        add(f"- 本地统计：{quant['lines']} 行里 {quant['quantified']} 行含量化结果"
+            f"（{quant['ratio']:.0%}）。")
+    dropped = int(result.get("dropped_rewrites") or 0)
+    invented = int(result.get("invented_numbers") or 0)
+    ungrounded = int(result.get("ungrounded_evidence") or 0)
+    if dropped or ungrounded:
+        add(f"- 本地核对剔除：{dropped} 条改写（其中 {invented} 条补了原文没有的数字）、"
+            f"{ungrounded} 条诊断引用（对不上原文）。")
+    add()
+    add("> 本建议由「知遇」AI 虚拟面试智能体的简历优化功能生成。")
+    add("> 改写只重组简历里已有的信息，不新增任何未写过的经历或数字；")
+    add("> 标注为「缺数字」的地方请用你自己的真实数据补上。")
+    return "\n".join(lines)
 
 
 def build_report_markdown() -> str:
@@ -1210,9 +2253,51 @@ def build_report_markdown() -> str:
             add(f"> {coach['encouragement']}")
             add()
 
+    advice_result = st.session_state.get("advice") or {}
+    if advice_result.get("advice"):
+        add("## 三、提升建议（下一场面试前该补什么）")
+        add()
+        add("> 与上一节的「教练复盘」互补：教练改的是**说法**（这句话该怎么讲），")
+        add("> 这一节补的是**能力与经历**（这个维度缺什么、下次面试前做什么）。")
+        add()
+        if advice_result.get("priority"):
+            add("### 如果只改一件事")
+            add()
+            for i, item in enumerate(advice_result["priority"], start=1):
+                add(f"{i}. {item}")
+            add()
+        for item in advice_result["advice"]:
+            add(f"### {item.get('dimension', '')}"
+                + (f"（{item['score']} 分）" if item.get("score") is not None else ""))
+            add()
+            if item.get("missing"):
+                add("- 本次未给出该维度的建议。")
+                add()
+                continue
+            if item.get("gap"):
+                add(f"- 缺什么：{item['gap']}")
+            if item.get("evidence"):
+                add(f"- 依据：{item['evidence']}")
+            for action in item.get("actions") or []:
+                add(f"- 动作：{action}")
+            if item.get("self_check"):
+                add(f"- 自测：{item['self_check']}")
+            add()
+        if advice_result.get("quick_wins"):
+            add("### 明天就能改")
+            add()
+            for i, item in enumerate(advice_result["quick_wins"], start=1):
+                add(f"{i}. {item}")
+            add()
+        if advice_result.get("next_setup"):
+            add("### 下一场怎么练")
+            add()
+            add(advice_result["next_setup"])
+            add()
+
     decisions = st.session_state.decisions or []
     if decisions:
-        add("## 三、面试官决策轨迹")
+        add("## 四、面试官决策轨迹")
         add()
         add("> 这一栏体现「不是念题库」：每一轮追问或换题都有明确依据，「工具调用」列可见面试官是否主动查阅了简历原文。")
         add()
@@ -1223,7 +2308,7 @@ def build_report_markdown() -> str:
 
     if trace:
         mode_label = profile.get("mood_mode", "")
-        add(f"## 四、面试官状态轨迹（情绪模式：{mode_label or '—'}）")
+        add(f"## 五、面试官状态轨迹（情绪模式：{mode_label or '—'}）")
         add()
         add(mood.summarize(trace, mode_label))
         add()
@@ -1237,7 +2322,7 @@ def build_report_markdown() -> str:
 
     history = st.session_state.history or []
     if history:
-        add("## 五、完整文字稿")
+        add("## 六、完整文字稿")
         add()
         for msg in history:
             speaker = "面试官" if msg.get("role") == "assistant" else "候选人"
@@ -1386,7 +2471,7 @@ def render_history_tab() -> None:
 
 
 def render_report() -> None:
-    st.title("知遇 · AI 虚拟面试官")
+    render_page_header("本场面试已结束 · 复盘报告")
     st.success(f"面试已结束 · {profile_summary(st.session_state.profile)}")
 
     real_items = [
@@ -1415,7 +2500,9 @@ def render_report() -> None:
     evaluation = st.session_state.evaluation
     coach = st.session_state.coach
 
-    tab1, tab2, tab3, tab4 = st.tabs(["评分报告", "教练复盘", "面试记录", "历史记录"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["评分报告", "教练复盘", "提升建议", "面试记录", "历史记录"]
+    )
 
     with tab1:
         if not evaluation:
@@ -1579,6 +2666,58 @@ def render_report() -> None:
                 st.info(coach["encouragement"])
 
     with tab3:
+        advice_result = st.session_state.get("advice") or {}
+        if not advice_result.get("advice"):
+            st.info(
+                "暂未生成提升建议。它是在评估官与教练之后单独调用的——"
+                "若那一轮调用失败，评分与教练复盘不受影响。"
+            )
+        else:
+            st.caption(
+                "与「教练复盘」互补：教练改的是**说法**（那句话该怎么讲），"
+                "这一节补的是**能力与经历**（这个维度缺什么、下次面试前做什么）。"
+            )
+            priority = advice_result.get("priority") or []
+            if priority:
+                st.subheader("如果只改一件事")
+                for i, item in enumerate(priority, start=1):
+                    st.markdown(f"{i}. {item}")
+
+            for item in advice_result["advice"]:
+                score = item.get("score")
+                title = item.get("dimension", "")
+                if score is not None:
+                    title += f"（{score} 分）"
+                with st.expander(title, expanded=score is not None and score < 70):
+                    if item.get("missing"):
+                        st.caption("本次未给出该维度的建议。")
+                        continue
+                    if item.get("gap"):
+                        st.markdown(f"**缺什么**：{item['gap']}")
+                    if item.get("evidence"):
+                        st.caption(f"依据：{item['evidence']}")
+                    for action in item.get("actions") or []:
+                        st.markdown(f"- {action}")
+                    if item.get("self_check"):
+                        st.info(f"自测：{item['self_check']}")
+
+            quick = advice_result.get("quick_wins") or []
+            if quick:
+                st.subheader("明天就能改")
+                for i, item in enumerate(quick, start=1):
+                    st.markdown(f"{i}. {item}")
+
+            if advice_result.get("next_setup"):
+                st.subheader("下一场怎么练")
+                st.markdown(advice_result["next_setup"])
+
+            if advice_result.get("evidence_missing"):
+                st.caption(
+                    f"其中有 {advice_result['evidence_missing']} 条建议没能引用到你的原话，"
+                    "已如实标出——「缺量化结果」这类建议本身就不针对某一句原话。"
+                )
+
+    with tab4:
         decisions = st.session_state.decisions
         if decisions:
             st.subheader("面试官决策轨迹")
@@ -1590,7 +2729,7 @@ def render_report() -> None:
             speaker = "面试官" if msg["role"] == "assistant" else "候选人"
             st.markdown(f"**{speaker}**：{msg['content']}")
 
-    with tab4:
+    with tab5:
         render_history_tab()
 
     if st.button("重新开始面试", type="primary"):
@@ -1614,19 +2753,38 @@ def main() -> None:
 
     status = st.session_state.status
     if status == "idle" or st.session_state.profile is None:
-        st.title("知遇 · AI 虚拟面试官")
-        st.caption("多场景 · 多专业 · 多难度自适应的模拟面试智能体")
         # 有未完成的面试快照时，先给出「继续 / 重新开始」的选择，不做静默恢复
         render_recovery_banner()
         st.markdown(
             """
-在左侧完成配置（**场景 → 专业 → 难度**，以及**面试官情绪**），填好 API Key 后点击「开始面试」。
-
-面试官不会念题库：他会根据你的回答现场判断是**继续追问**还是**换下一道题**，
-情绪也会随你的回答实时变化。面试结束后自动生成**评分报告**和**教练复盘**
-（含归因分析和可以直接背的示范答案）。
-            """
+            <div class="zy-hero">
+                <div class="zy-kicker">AI Interview Agent</div>
+                <div class="zy-title">知遇<em>。</em></div>
+                <p class="zy-sub">多场景 · 多专业 · 多难度自适应的模拟面试智能体。
+                他不会念题库——会根据你的回答现场判断继续追问还是换题，
+                情绪也随回答实时变化；面试结束后自动生成评分报告与教练复盘。</p>
+            </div>
+            <div class="zy-grid">
+                <div class="zy-cell">
+                    <div class="zy-num">01 / 现场判断</div>
+                    <h4>不念题库</h4>
+                    <p>每一轮追问或换题都有明确依据，完整决策轨迹在复盘页可查。</p>
+                </div>
+                <div class="zy-cell">
+                    <div class="zy-num">02 / 情绪模拟</div>
+                    <h4>面试官有状态</h4>
+                    <p>耐心、精力、时间压力动态变化，训练你在压力下的稳定性。</p>
+                </div>
+                <div class="zy-cell">
+                    <div class="zy-num">03 / 评估复盘</div>
+                    <h4>评分 + 教练</h4>
+                    <p>维度评分、归因分析、可以直接背的示范答案，结束即得。</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+        st.caption("开始：在左侧完成配置（场景 → 专业 → 难度，以及面试官情绪），填好 API Key 后点击「开始面试」。")
         st.info("小提示：技术面和专业方向相关，行为面则主要考 STAR 结构，可分别各练一场。")
     elif status == "running":
         render_interview()

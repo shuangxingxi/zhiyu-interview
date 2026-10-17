@@ -1,14 +1,22 @@
-"""三体 Agent 的实现：面试官 / 评估官 / 教练。
+"""面试相关 Agent 的实现：面试官 / 评估官 / 教练 / 建议官 / 简历优化官。
 
 设计说明（对应 DESIGN.md 第四、五节）：
     不引入 LangChain / AutoGen。本场景的"行动空间"只有 3 种
     （追问 / 换题 / 结束），自研一个轻量决策循环即可，可控、可解释、零框架依赖。
 
-三个角色的分工：
-    面试官 interviewer_turn  —— 多轮对话，全量 messages 回传。
+五个角色的分工：
+    面试官 interviewer_turn   —— 多轮对话，全量 messages 回传。
         每轮返回结构化决策，代码再做一次兜底约束（见 _apply_fallbacks）。
     评估官 evaluate_interview —— 面试结束后单次调用，按能力模型打分。
     教练   coach_review       —— 基于记录 + 评估，给出可执行的改进方案。
+    建议官 advisor_review     —— 在教练之后调用，**按评分维度**逐条给出"下次面试前
+        该补什么"，与教练的"这句话该怎么讲"互补（分工见 advice.py 表）。
+    简历优化官 resume_review  —— 独立于面试：上传简历即可调用，产出诊断 + 改写对照。
+        与面试链路无关，所以它**不读逐字稿**、也不需要先面一场试。
+
+本模块只负责"怎么问模型"。「模型输出怎么收敛成确定结构」以及所有本地判定
+（维度是否真实存在、改写有没有编造、量化密度）都在 advice / resume_optimize
+两个纯函数模块里，可离线单测。
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ from knowledge import (
     rubric_hint_block,
 )
 from mood import describe as describe_mood, effective_max_probes
+import advice
+import resume_optimize
 import resume_rag
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -1054,3 +1064,239 @@ def coach_review(
         model,
         temperature=0.4,
     )
+
+
+# ---------------------------------------------------------------------------
+# 智能体 4 · 建议官
+#
+# 与教练的分野是这一节最要紧的事。两者都拿评估结果 + 逐字稿，但视角相反：
+#     教练：**回看** —— 你刚才那句话答得不好，它本来该怎么讲（rewrites 是话术）
+#     建议官：**前看** —— 这个能力维度上你缺的是哪一类东西，下次面试前补什么
+# 所以建议官被要求按**评分维度**给建议（每个维度一条），而不是按"哪道题答错"，
+# 从数据形状上就把两者区分开，避免报告里出现两份高度雷同的"最需要改的问题"。
+# ---------------------------------------------------------------------------
+
+ADVISOR_SYSTEM = """你是一位带过上百名应届生的求职教练。你不是来复述这场面试的，而是来告诉候选人：**下一次面试前，具体该补什么**。
+
+【本场背景】
+{summary}
+
+【评委的评分结果】
+{evaluation_block}
+
+{dimensions_block}
+{extra}
+请按下面四条要求给出建议：
+
+1. **按维度给，不按题目给**。上面每个维度写一条建议（`dimension` 必须逐字使用上面给出的维度名称）。
+   已经做得好的维度也要给——写"保持"，并说明**具体保持什么**，不要写"继续保持"这类空话。
+2. **每条建议必须能落地**。`actions` 是本条维度下 1~3 个具体动作，要能在 3 天内开始做：
+   写"把 Redis 的持久化机制（RDB/AOF 触发条件与恢复流程）整理成一张对照卡，下次面试能画出来"，
+   不要写"多学习 Redis"。动作要指向**可交付物**（一张卡、一段代码、一次复盘、一个能讲 90 秒的故事）。
+3. **`gap` 要指出缺的是哪一类东西**，而不是重复维度分低这件事。区别在于：
+   - 缺知识：某个知识点没答上来 → 补哪个具体知识点；
+   - 缺经历：讲不出真实项目细节 → 需要造哪一段可讲的经历（做一个小项目 / 把课程作业讲深）；
+   - 缺表达：知道但讲不清、没有结构 → 练哪种表达结构（先结论后原理、STAR 里补哪一环）；
+   - 缺量化：全程没有数字结果 → 需要补出哪个具体数字，以及怎么把它测出来。
+4. **`evidence` 必须是面试记录里的原话或具体表现**。引用候选人说过的一句原话最好；
+   如果要说的是"全程没有量化结果"这类表现，就写清楚是**哪一轮、什么表现**。
+   不许写"感觉基础不扎实"这类没有依据的评价。
+
+`priority` 是**跨维度的执行顺序**：如果时间只够改一件事，先改哪件，为什么。
+`quick_wins` 是**今晚/明天就能改、且下一场立刻见效**的动作，只写 2~4 条，必须具体到"改哪句话、加哪个数字"。
+`next_setup` 是**下一场面试该怎么配置**：用哪一档难度、技术面还是行为面、要不要开高强度情绪模式来练抗压。
+结合上面评委的结论给出理由。
+
+只输出 JSON，不要输出任何其他文字，格式如下：
+{{
+  "advice": [
+    {{"dimension": "维度名称（必须逐字使用上面给出的名称）",
+      "gap": "这个维度上缺的是哪一类东西：缺知识 / 缺经历 / 缺表达 / 缺量化，以及具体缺什么",
+      "evidence": "面试记录里的原话或具体表现",
+      "actions": ["1~3 个 3 天内能开始做的具体动作，指向可交付物"],
+      "self_check": "一个自测问题：候选人能用它判断自己补到位了没有"}}
+  ],
+  "priority": ["跨维度的执行顺序，1~3 条，说明先改什么、为什么"],
+  "quick_wins": ["2~4 条今晚或明天就能改、下一场立刻见效的具体动作"],
+  "next_setup": "下一场面试该怎么配置，以及理由"
+}}"""
+
+_ADVISOR_STAR = """本场是行为面。给建议时请注意：行为面最常缺的是 **Action 里「我」做了什么** 和
+**Result 里的量化结果**，而不是知识本身。如果候选人讲不出个人贡献，`gap` 要写成
+「缺经历：这段经历里你本人的贡献边界没说清」，`actions` 要指向"把这段经历拆成
+『我负责的具体动作 + 可验证的结果』，写成 90 秒能讲完的稿子"。"""
+
+_ADVISOR_TECH = """本场是技术面。给建议时请注意：技术面最常缺的是 **原理层面的深度**
+（会用来会用，但说不出为什么这样设计）和 **真实项目细节**（只有课程作业，没有可深挖的取舍）。
+针对"表述不专业"这类问题，`actions` 要指向"把结论—原理—实践的表述模板套到某个具体知识点上练"。"""
+
+
+def advisor_review(
+    history: list[dict[str, str]],
+    evaluation: dict[str, Any],
+    profile: dict[str, Any],
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """建议官：按评分维度给出"下次面试前该补什么"，并收敛成确定结构。
+
+    刻意**不接收** `mood_trace`：压力下的稳定性已经由教练的 `resilience` 覆盖，
+    建议官再看一遍只会产出重复内容。它要看的是"能力项"，不是"这一场的过程"。
+
+    返回结构由 `advice.normalize` 收敛：维度名不在本场维度里的一律丢弃，
+    没拿到建议的维度补占位。所以调用方拿到的一定与评分页的维度对得上。
+    """
+    is_behavior = profile.get("interview_type") == "行为面"
+    system = ADVISOR_SYSTEM.format(
+        summary=profile_summary(profile),
+        evaluation_block=advice.advice_block(evaluation),
+        dimensions_block="【本场的评分维度】（每条都要给一条建议，名称逐字一致）\n"
+        + "\n".join(f"- {name}" for name in profile.get("dimensions", [])),
+        extra=_ADVISOR_STAR if is_behavior else _ADVISOR_TECH,
+    )
+    user = (
+        f"面试记录：\n\n{format_transcript(history)}"
+    )
+    data = chat_json(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        api_key,
+        model,
+        temperature=0.4,
+    )
+    return advice.normalize(data, evaluation)
+
+
+# ---------------------------------------------------------------------------
+# 智能体 5 · 简历优化官
+#
+# 与面试链路完全解耦：输入是简历原文，输出是诊断 + 改写对照。
+# 所以它既不需要逐字稿，也不需要先面一场试——上传简历就能拿到结果。
+#
+# 提示词里最要紧的是那条红线：**不许编造**。模型天然倾向于"把简历写得更好看"，
+# 而"更好看"很容易滑向"替他编一段经历"。这条红线在提示词里写死一次，
+# 再由 resume_optimize.normalize_report 在本地逐条核对一次（引用对不上就丢弃），
+# 两道关卡都必要：提示词降低发生率，本地核对兜住漏网的。
+# ---------------------------------------------------------------------------
+
+RESUME_SYSTEM = """你是一位在大厂做过五年招聘、也帮人改过上千份简历的简历顾问。现在请你帮候选人优化简历。
+
+【本次目标】
+{target}
+
+【简历原文】
+{resume}
+
+【本地已检出的结构情况】（系统自动统计，供你参考，不必重复计算）
+{skeleton}
+
+请按下面五条要求给出优化建议：
+
+1. **不许编造**。这是红线：改写只能用简历里**已有**的信息去重新组织、量化、收紧措辞。
+   严禁新增候选人没写过的经历、项目、公司、头衔、时间、奖项或数字。
+   如果原文没有数字，就在 `advice` 里告诉他"这个结果需要你自己补一个真实数字，比如
+   处理条数 / 耗时 / 提升比例"，而不是替他填一个。
+2. **逐条给改写对照**。`rewrites` 里挑最该改的 3~5 条，逐条给出：
+   `original` 必须**逐字引用简历原文里的句子**（系统会核对，对不上的一律丢弃）；
+   `improved` 是改写后的句子，可以直接替换进简历；
+   `why` 说明为什么这样改更好（例如"把『负责』换成『独立实现』并补上规模，职责边界才清楚"）。
+   改写要遵守一条：
+   - 用「动作 + 对象 + 方法 + 可验证结果」四要素重写，把"参与了""负责了"这类虚词换成具体动词；
+   - 把笼统的描述收紧成有边界的一句话；
+   - **没有数字就不许编数字**，宁可在 `advice` 里指出这里缺一个数字。
+3. **诊断要有依据**。`problems` 的 `evidence` 要逐字引用简历原文里的句子（系统会核对，
+   对不上的引用会被清掉）。如果某条诊断（例如"没看到量化成果"）本来就不针对某一句，
+   `evidence` 填空字符串。
+4. **`missing` 只提真正该有而没写的内容**：结合目标岗位说清楚"还需要补一段什么样的经历"，
+   而不是泛泛地说"再多写点项目"。
+5. **`keywords` 是关键词建议**：结合目标岗位，列出这份简历里**应该出现但没出现**的
+   关键词（技术名词、工具、方法论）。只列他真实掌握的——这里只做提示，
+   不要引导他去堆砌不熟悉的名词。
+6. `score` 是你给这份简历整体的 0~100 分（针对上面的目标岗位）。
+   `checklist` 是投出去之前的自查清单，每条都要能当场验证（例如"每段经历都有一句量化结果"）。
+
+只输出 JSON，不要输出任何其他文字，格式如下：
+{{
+  "verdict": "一句话总评，说清这份简历最大的问题",
+  "score": 0 到 100 的整数,
+  "problems": [
+    {{"severity": "high 或 medium 或 low",
+      "category": "分类：结构 / 量化 / 措辞 / 匹配度 / 真实性",
+      "problem": "问题是什么",
+      "evidence": "简历原文里的原句；不针对某一句时填空字符串",
+      "advice": "具体怎么改"}}
+  ],
+  "rewrites": [
+    {{"original": "简历原文里的原句（逐字引用）",
+      "improved": "改写后的句子，可直接替换",
+      "why": "为什么这样改更好"}}
+  ],
+  "missing": ["这份简历针对该目标岗位还缺什么（缺哪类经历 / 缺哪块技能）"],
+  "keywords": ["结合目标岗位，建议补上的关键词（只列他真实掌握的）"],
+  "checklist": ["投简历前逐条自查，每条都能当场验证"]
+}}"""
+
+
+def _resume_skeleton(text: str) -> str:
+    """把本地检出的结构情况拼成一段提示词。
+
+    给这一段是为了让模型**别去猜**结构：小节有没有、量化占比多少，本地已经
+    用启发式算过一遍了。模型看到之后就不会把注意力浪费在"这份简历有没有技能小节"
+    这种本地就能答的问题上，而集中去写诊断和改写。
+    """
+    present = resume_optimize.present_sections(text)
+    missing = resume_optimize.missing_sections(text)
+    quant = resume_optimize.quantification(text)
+    lines = [
+        f"- 检出的小节：{'、'.join(present) if present else '（一个都没检出）'}",
+        f"- 通常必备但没检出：{'、'.join(missing) if missing else '（无）'}",
+        f"- 量化密度：{quant['lines']} 行里 {quant['quantified']} 行含量化结果"
+        f"（{quant['ratio']:.0%}）",
+        "- 说明：上面是本地正则的粗判，可能误判；与你看到的不一致时，以简历原文为准。",
+    ]
+    return "\n".join(lines)
+
+
+def resume_review(
+    resume_text: str,
+    api_key: str,
+    target_role: str = "",
+    major: str = "",
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """简历优化官：按简历原文给诊断 + 改写对照。
+
+    独立于面试：不读逐字稿、不进 `history.json`、不写快照。简历原文与结果都
+    只活在本会话内存里，与 `resume.py` / `resume_rag.py` 同一条隐私约束。
+
+    `target_role` / `major` 只用于让建议"对着目标岗位说"；都不填也能用，
+    此时提示词里的目标是"通用求职优化"，不假装知道他的方向。
+    """
+    text = (resume_text or "").strip()
+    if not text:
+        return {}
+
+    targets: list[str] = []
+    if target_role.strip():
+        targets.append(f"目标岗位：{target_role.strip()}")
+    if major.strip():
+        targets.append(f"专业方向：{major.strip()}")
+    target = "\n".join(targets) if targets else "未指定目标岗位，按通用校招简历标准优化。"
+
+    system = RESUME_SYSTEM.format(
+        target=target,
+        resume=text,
+        skeleton=_resume_skeleton(text),
+    )
+    data = chat_json(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "请按上面的要求，输出这份简历的优化建议。"},
+        ],
+        api_key,
+        model,
+        temperature=0.4,
+    )
+    return resume_optimize.normalize_report(data, text)
