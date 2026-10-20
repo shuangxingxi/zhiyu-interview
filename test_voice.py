@@ -107,9 +107,24 @@ class TestAudioValidation(unittest.TestCase):
         self.assertTrue(voice.is_valid_audio(b"\xff\xfa\x00\x00"))
         self.assertTrue(voice.is_valid_audio(b"\xff\xf3\x00\x00"))
 
-    def test_id3_header_rejected(self):
-        # edge-tts 不产出带 ID3 标签的流；ID3 开头说明不是我们要的音频
+    def test_bare_id3_rejected(self):
+        # 只有 3 字节的 "ID3" 不是可播音频
         self.assertFalse(voice.is_valid_audio(b"ID3"))
+
+    def test_id3_tagged_mp3_accepted(self):
+        # 硅基流动 CosyVoice2 返回的 mp3 首字节是 "ID3"（ID3v2 标签，含 TXXX 水印帧），
+        # 音频帧在标签之后。当年这条被误判成"非 MP3 数据"，
+        # 连续两次后 app.py 直接停用了整场语音——合成成功，用户却一句都没听到。
+        tag = b"ID3\x03\x00\x00\x00\x00\x00\x14" + b"\x00" * 20  # 标签体 0x14=20 字节
+        self.assertTrue(voice.is_valid_audio(tag + b"\xff\xfb\x90\x00" + b"\x00" * 64))
+
+    def test_id3_tag_only_rejected(self):
+        # 只有标签、标签之后没有音频数据 → 仍算无效
+        self.assertFalse(voice.is_valid_audio(b"ID3\x03\x00\x00\x00\x00\x00\x14" + b"\x00" * 20))
+
+    def test_truncated_id3_rejected(self):
+        # 标签头都不完整（不足 10 字节）→ 无效
+        self.assertFalse(voice.is_valid_audio(b"ID3\x03\x00\x00\x00"))
 
     def test_html_rejected(self):
         self.assertFalse(voice.is_valid_audio(b"<html>error</html>"))

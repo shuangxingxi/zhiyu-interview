@@ -33,7 +33,7 @@ SF_TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
 
 # 识别后纠错用的模型：复用项目已经接入的 DeepSeek，不新增依赖
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-ASR_CORRECT_MODEL = "deepseek-chat"
+ASR_CORRECT_MODEL = "deepseek-flash"
 
 # 单次网络调用的超时（秒）。SDK 默认 600 秒，语音是交互场景，
 # 卡住十分钟不如快速失败——调用方一律有回退路径（回退文字输入 / 原文）。
@@ -65,6 +65,14 @@ _EDGE_RETRY_AFTER_HARD = 600
 _EDGE_RETRY_AFTER_SOFT = 30
 _edge_down_until = 0.0
 
+# 兜底通道（硅基流动）的熔断时长。它同样是**同步阻塞**调用，实测一次失败
+# 要花 5 秒上下；如果每轮都去撞一遍，用户等到的只是"更长的沉默"。
+# 返回空音频/非 MP3 说明这个音色在这把 Key 下根本不可用，按永久故障长熔断；
+# 超时、5xx、429 只算瞬时故障。
+_SF_RETRY_AFTER_HARD = 600
+_SF_RETRY_AFTER_SOFT = 60
+_sf_down_until = 0.0
+
 # 单句合成的有界重试次数。瞬时故障重试，永久故障不重试（重试也白搭）。
 _EDGE_MAX_ATTEMPTS = 3
 
@@ -73,6 +81,10 @@ _EDGE_MAX_ATTEMPTS = 3
 _MP3_MAGIC = 0xFF
 # 一个完整的 MP3 帧头是 4 字节；不足 4 字节的数据即使首字节是 0xFF 也不可播。
 _MP3_HEADER_MIN = 4
+# 但 MP3 允许在音频数据前挂 ID3v2 标签（硅基流动 CosyVoice2 返回的音频就带一段
+# TXXX 水印帧），这种文件首字节是 "ID3" 而不是 0xFF，同样是可以播的音频。
+_ID3_MAGIC = b"ID3"
+_ID3_HEADER_LEN = 10
 
 # 语气由两条正交的轴叠加：难度档给基线，情绪状态给偏移。
 # 值是 (语速偏移 %, 音调偏移 Hz)。每句再叠一点随机抖动，
@@ -229,34 +241,71 @@ def synthesize(
         else:
             _mark_edge_down(permanent=False)
 
-    if fallback_key:
+    if fallback_key and time.time() >= _sf_down_until:
+        ok = False
+        sf_error: Exception | None = None
         try:
             audio = _synth_siliconflow(text, voice, rate, fallback_key)
-            if is_valid_audio(audio):
-                return audio
-            raise RuntimeError("硅基流动返回空音频或非 MP3 数据")
-        except Exception as exc:
-            raise RuntimeError(
-                f"edge-tts 与硅基流动均合成失败：edge={edge_error}; sf={exc}"
-            ) from exc
+            ok = is_valid_audio(audio)
+            if not ok:
+                sf_error = RuntimeError("硅基流动返回空音频或非 MP3 数据")
+        except Exception as exc:  # noqa: BLE001
+            sf_error = exc
+        if ok:
+            return audio
+        # 「返回了不可用的音频」按永久故障处理：接口说成功但给不出能播的 MP3，
+        # 多半是这个音色在这把 Key 下根本不可用，不必每分钟再去白等五秒。
+        unusable_output = sf_error is None or "空音频" in str(sf_error)
+        _mark_sf_down(
+            permanent=unusable_output or _is_permanent_edge_error(sf_error)
+        )
+        raise RuntimeError(
+            f"edge-tts 与硅基流动均合成失败：edge={edge_error}; sf={sf_error}"
+        ) from sf_error
 
     if edge_error is not None:
         raise edge_error
+    if fallback_key:
+        raise RuntimeError("edge-tts 与硅基流动都处于熔断期，暂时无法合成语音")
     raise RuntimeError("edge-tts 暂不可用（熔断期内），且未配置硅基流动 Key")
 
 
+def _id3_tag_end(data: bytes) -> int:
+    """ID3v2 标签的总长度（含 10 字节头）；不是完整标签则返回 0。
+
+    4 个长度字节是 synchsafe 的（每字节只用低 7 位），按普通整数解析会算错。
+    """
+    if len(data) < _ID3_HEADER_LEN:
+        return 0
+    size = 0
+    for byte in data[6:10]:
+        size = (size << 7) | (byte & 0x7F)
+    return _ID3_HEADER_LEN + size
+
+
 def is_valid_audio(data: bytes) -> bool:
-    """音频字节是否可用：非空且以 MP3 帧同步字开头。
+    """音频字节是否可用：非空，且是裸 MP3 帧头或「ID3v2 标签 + 音频数据」。
 
     这一步不能省。合成接口可能"成功"返回空流（例如英文音色读不了中文），
     空字节串传到界面会被 `if audio:` 静默吞掉——用户只是听不到声音，
     界面上没有任何提示，排查时也无从下手。
 
-    只判首字节 0xFF 会让 `b"\\xff"` 这种残缺数据通过，所以要求至少
-    有完整的帧头长度（4 字节）且首字节为 0xFF。`None` 先被 `bool` 挡住，
-    否则 `len(None)` 会抛 TypeError——调用方把 None 传进来是最常见的空值来源。
+    只判首字节 0xFF 会让 `b"\\xff"` 这种残缺数据通过，所以要求至少有
+    完整的帧头长度（4 字节）且首字节为 0xFF。但**不能因此把 ID3 开头的文件
+    判死**：ID3v2 标签是 MP3 的标准元数据，硅基流动 CosyVoice2 返回的音频
+    首字节正是 "ID3"（标签后才是帧数据）。2026-10-18 排查「面试官没有语音输出」
+    时确认：把这类正常音频判成"非 MP3 数据"，会让 app.py 连续两次后直接
+    停用整场语音——合成明明成功，用户却一句都没听到。
+    `None` 先被 `bool` 挡住，否则 `len(None)` 会抛 TypeError。
     """
-    return bool(data) and len(data) >= _MP3_HEADER_MIN and data[0] == _MP3_MAGIC
+    if not bool(data) or len(data) < _MP3_HEADER_MIN:
+        return False
+    if data.startswith(_ID3_MAGIC):
+        # 标签之后必须还有音频数据：只有标签、或标签长度本身超出整段数据，
+        # 都说明拿到的不是可播音频
+        end = _id3_tag_end(data)
+        return end > 0 and len(data) > end
+    return data[0] == _MP3_MAGIC
 
 
 def _is_permanent_edge_error(exc: Exception) -> bool:
@@ -289,6 +338,29 @@ def _parse_status_codes(text: str) -> tuple[int, ...]:
     只在 100–599 之间取值，避免把 "read timeout 3000ms" 里的 3000 当成状态码。
     """
     return tuple(int(m) for m in _STATUS_RE.findall(text) if 100 <= int(m) <= 599)
+
+
+def reset_edge_breaker() -> None:
+    """手动解除 edge-tts 与硅基流动的熔断。
+
+    熔断本来是为了避免每轮都去撞一个已经不可用的接口；但用户在侧边栏
+    点「重试语音合成」时必须真的重新试一次，否则点了也还是走兜底/直接跳过，
+    看起来就像按钮坏了。
+    """
+    global _edge_down_until, _sf_down_until
+    _edge_down_until = 0.0
+    _sf_down_until = 0.0
+
+
+def _mark_sf_down(permanent: bool) -> None:
+    """标记硅基流动进入熔断期（与 edge-tts 同一套软/硬两档策略）。"""
+    global _sf_down_until
+    window = _SF_RETRY_AFTER_HARD if permanent else _SF_RETRY_AFTER_SOFT
+    _sf_down_until = time.time() + window
+    print(
+        f"[TTS] 硅基流动{'永久故障' if permanent else '瞬时故障'}，{window}s 内不再尝试",
+        file=sys.stderr,
+    )
 
 
 def _mark_edge_down(permanent: bool) -> None:

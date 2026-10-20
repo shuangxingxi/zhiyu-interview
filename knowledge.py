@@ -1055,5 +1055,133 @@ def rubric_block(
         errors = item.get("common_errors") or []
         if errors:
             lines.append("常见误区（踩中要扣分并写进 risks）：" + "；".join(str(x) for x in errors))
+        # veto 是条目上的可选标记：标了才渲染这一行，没标就与旧行为完全一致。
+        # 它把"误区里最致命的那几条"单独拎出来，让评估官知道踩中它就是该考点不通过，
+        # 而不是与其它误区一起当普通扣分项处理。
+        veto = _clean_list(item.get("veto"))
+        if veto:
+            lines.append(
+                "一票否决的误区（踩中即该考点判为不通过，必须写进 risks）："
+                + "；".join(veto)
+            )
         chunks.append("\n".join(lines))
     return "\n\n".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# 考点级判定与聚合
+#
+# 评估官给的是**要点粒度**的对照结果（must_hit / missed / errors），
+# 但报告真正要回答的是"这道题整体过没过"。漏一条要点算不算硬伤，取决于它是不是核心，
+# 所以这里用一组固定规则把要点粒度升成考点粒度。规则全部写在代码里（不再让模型判一次），
+# 同一份 rubric_check 每次得到同一个结论，也便于离线复现。
+#
+# 否决项有两个来源：
+#   1. 条目显式标出的 veto 误区——踩中即判不通过（数据侧未标时这一段自然失效）；
+#   2. must_hit 全数未命中——整道题没答上，不该落进"部分通过"的模糊地带。
+# 两条都不触发时，才按命中 / 遗漏 / 误区的情况给出通过或部分通过。
+#
+# 与 rubric_for 一样，参照缺失或损坏时静默降级：只是不启用"显式否决"那一档，
+# 判定本身仍能算出来（评估官给的对照结果不依赖参照文件）。
+# ---------------------------------------------------------------------------
+
+VERDICT_PASS = "pass"
+VERDICT_PARTIAL = "partial"
+VERDICT_FAIL = "fail"
+VERDICT_UNKNOWN = "unknown"
+
+# 报告与界面共用这一套中文标签，分档名只在这一处定义。
+VERDICT_LABELS: dict[str, str] = {
+    VERDICT_PASS: "通过",
+    VERDICT_PARTIAL: "部分通过",
+    VERDICT_FAIL: "不通过",
+    VERDICT_UNKNOWN: "未记录",
+}
+
+
+def _clean_list(value: Any) -> list[str]:
+    """去空白、去空的字符串列表；非列表一律当空。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
+def _veto_of(entry: Any) -> list[str]:
+    """取条目显式标出的一票否决误区；没标（或条目缺失）返回空列表，即不启用否决。"""
+    if not isinstance(entry, dict):
+        return []
+    return _clean_list(entry.get("veto"))
+
+
+def topic_verdict(row: Any, veto: list[str] | None = None) -> tuple[str, str]:
+    """把一条 rubric_check 升成考点级判定，返回 (verdict, reason)。
+
+    分档规则自上而下，先命中的先算：
+        fail    —— 踩中一票否决误区 / 核心要点一条都没答到 / 出现概念错误；
+        partial —— 至少答到一条要点，但仍有遗漏；
+        pass    —— 要点全覆盖且没有误区；
+        unknown —— 既没命中也没遗漏，没留下可用的对照记录。
+    """
+    if not isinstance(row, dict):
+        return VERDICT_UNKNOWN, "该考点没有可用的对照记录"
+    hit = _clean_list(row.get("must_hit"))
+    missed = _clean_list(row.get("missed"))
+    errors = _clean_list(row.get("errors"))
+
+    veto_hits = [e for e in errors if any(v and v in e for v in (veto or []))]
+    if veto_hits:
+        return VERDICT_FAIL, "踩中一票否决误区：" + "；".join(veto_hits)
+    if missed and not hit:
+        return VERDICT_FAIL, "核心要点一条都没答到"
+    if errors:
+        return VERDICT_FAIL, "出现概念错误：" + "；".join(errors)
+    if missed:
+        return VERDICT_PARTIAL, "答到部分要点，仍有遗漏"
+    if hit:
+        return VERDICT_PASS, "要点均已覆盖"
+    return VERDICT_UNKNOWN, "该考点没有留下可用的对照记录"
+
+
+def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]:
+    """考点级聚合：本场每个考点过没过、哪些算薄弱项。
+
+    `profile` 只用来取该专业的参照条目（看条目有没有显式 veto 标记），
+    因此参照缺失时聚合照常工作，只是不启用"显式否决"那一档。
+
+    返回结构（报告与界面共用）：
+        topics  —— 每个考点的 {topic, verdict, label, reason, missed, errors}
+        counts  —— 各判定档的条数（键为 VERDICT_*）
+        total / passed / weak —— 考点数、通过数、薄弱考点（不通过 + 部分通过）
+    """
+    by_topic = load_rubrics().get(profile.get("major", ""))
+    if not isinstance(by_topic, dict):
+        by_topic = {}
+
+    topics: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        topic = str(row.get("topic") or "").strip()
+        verdict, reason = topic_verdict(row, _veto_of(by_topic.get(topic)))
+        topics.append(
+            {
+                "topic": topic,
+                "verdict": verdict,
+                "label": VERDICT_LABELS.get(verdict, verdict),
+                "reason": reason,
+                "missed": _clean_list(row.get("missed")),
+                "errors": _clean_list(row.get("errors")),
+            }
+        )
+
+    counts = {VERDICT_PASS: 0, VERDICT_PARTIAL: 0, VERDICT_FAIL: 0, VERDICT_UNKNOWN: 0}
+    for item in topics:
+        counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
+
+    return {
+        "topics": topics,
+        "counts": counts,
+        "total": len(topics),
+        "passed": counts[VERDICT_PASS],
+        "weak": [t for t in topics if t["verdict"] in (VERDICT_FAIL, VERDICT_PARTIAL)],
+    }

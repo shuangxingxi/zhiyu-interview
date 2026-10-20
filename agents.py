@@ -6,8 +6,9 @@
 
 五个角色的分工：
     面试官 interviewer_turn   —— 多轮对话，全量 messages 回传。
-        每轮返回结构化决策，代码再做一次兜底约束（见 _apply_fallbacks）。
-    评估官 evaluate_interview —— 面试结束后单次调用，按能力模型打分。
+        每轮返回结构化决策，代码再做一次兜底约束（验收门见 gate_*，兜底见 _apply_fallbacks）。
+    评估官 evaluate_interview —— 面试结束后两次独立调用：先按能力模型打分，
+    再由独立上下文的归因调用剥离面试官状态干扰。
     教练   coach_review       —— 基于记录 + 评估，给出可执行的改进方案。
     建议官 advisor_review     —— 在教练之后调用，**按评分维度**逐条给出"下次面试前
         该补什么"，与教练的"这句话该怎么讲"互补（分工见 advice.py 表）。
@@ -209,13 +210,30 @@ def chat_json(
 
 
 def test_connection(api_key: str, model: str = DEFAULT_MODEL) -> str:
-    """最简连通性测试，用于确认 API Key 是否可用。"""
+    """最简连通性测试，用于确认 API Key 是否可用。
+
+    `max_tokens` 不能再压到 20：deepseek-flash 默认开启思考模式，
+    reasoning tokens 也计入 completion_tokens。给 20 个 token 时思维链会把
+    预算全部吃掉，返回 `finish_reason='length'` + `content=''`——
+    实测 12 次里 11 次为空。界面于是显示「连接成功，模型回复：」，
+    后面什么都没有，用户只会当成链路坏了。
+
+    这里反而要留足预算：思考模式需要先想再答，卡太紧只会把答案挤掉。
+    拿到空内容时显式报错，而不是把空串当成"成功"交给界面。
+    """
     response = _client(api_key).chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "只回复两个字：你好"}],
-        max_tokens=20,
+        max_tokens=200,
     )
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    reply = (choice.message.content or "").strip()
+    if not reply:
+        raise RuntimeError(
+            f"模型返回了空内容（finish_reason={choice.finish_reason!r}）。"
+            "多半是思考模式把 token 配额用尽了，请重试一次。"
+        )
+    return reply
 
 
 def format_transcript(history: list[dict[str, str]]) -> str:
@@ -530,6 +548,111 @@ def _build_interviewer_system(
     )
 
 
+# ---------------------------------------------------------------------------
+# 统一验收门（对应 DESIGN.md 第五节：模型输出结构化 JSON，代码再做兜底约束）
+#
+# 三个智能体走的是同一条链路：模型产出 JSON → 代码验收 → 不合格走兜底。
+# "不合格"此前以零散的内联条件散在 interviewer_turn / _resume_tool_round /
+# _merge_attribution 里——同一条规则换个调用点就要重写一遍，也没法单独验证。
+# 这里把每道验收收成具名关卡：纯函数、无副作用、统一返回 (ok, reason)。
+#
+# 关卡只回答"这份产出合不合格、因为什么"，**不负责纠正**。纠正仍由各调用点
+# 既有的兜底分支执行：_apply_fallbacks 的计数裁决、考点撞车时的点名重试、
+# 工具回合的回落、归因缺失时的静默降级。不把关卡写成"自动纠正"，是因为纠正
+# 带有场景取舍——同样是撞车考点，"重试一次"还是"直接接受"由调用点决定，
+# 塞进关卡反而会把调用点的语义藏起来。
+#
+# 全项目关卡地图（同一种签名约定，位置按职责分放）：
+#     action / topic / reply / adjusted_score —— 本模块，三个智能体的决策产出
+#     resume_optimize.is_grounded             —— 简历改写能不能对上原文（不许编造）
+#     resume_optimize.introduced_numbers      —— 改写里有没有原文没有的数字
+#     knowledge.load_rubrics / rubric_for     —— 评分参照缺失或损坏时静默降级
+# 它们验收的是不同产物，合并成一个函数只会让彼此耦合，所以这里只统一"签名约定"，
+# 不强行把散在各模块的关卡收拢到一处。
+# ---------------------------------------------------------------------------
+
+# 面试官允许的动作空间，与提示词里的 JSON 契约逐字对应。
+# 单独提出来是为了让"合法动作有哪些"只有一个出处，而不是散落在正则/判断里。
+ACTIONS = frozenset({"ask", "probe", "reflect", "end"})
+
+
+def _asked_set(asked_topics: list[str] | None) -> set[str]:
+    """本场已问考点集合：统一去空白、忽略空串。"""
+    return {str(t).strip() for t in (asked_topics or []) if str(t).strip()}
+
+
+def gate_action(action: Any) -> tuple[bool, str]:
+    """关卡·动作：决策动作是否落在合法动作空间内。
+
+    大小写与空白由关卡自己收敛——模型把枚举写成 "ASK" 或 " probe " 都不算越界。
+    """
+    value = str(action or "").strip().lower()
+    if value in ACTIONS:
+        return True, ""
+    return False, f"动作取值非法：{value or '（空）'}"
+
+
+def gate_topic_duplicate(
+    data: dict[str, Any], asked_topics: list[str] | None
+) -> tuple[bool, str]:
+    """关卡·考点：这一轮提出的**新主问题**是不是撞上了本场已问过的考点。
+
+    只在 action == "ask" 时判定：追问 / 复述 / 收尾沿用同一道题，topic 不变是正常的，
+    不该被当成重复。考点为空的 ask 也不在这里拦——那属于"产出不完整"，
+    由 gate_new_question 负责。
+    """
+    if str(data.get("action") or "").strip().lower() != "ask":
+        return True, ""
+    topic = str(data.get("topic") or "").strip()
+    if not topic:
+        return True, ""
+    if topic in _asked_set(asked_topics):
+        return False, f"考点「{topic}」本场已经问过"
+    return True, ""
+
+
+def gate_new_question(
+    data: dict[str, Any], asked_topics: list[str] | None
+) -> tuple[bool, str]:
+    """关卡·考点（产出侧）：这一轮是否**构成一个可接受的新主问题**。
+
+    与 gate_topic_duplicate 是同一份产出的两个视角：前者负责"发现撞车"，
+    后者负责"确认可用"——重试之后拿它判断新产出能不能顶替被拦下的那一条。
+    合格要三件同时成立：action 是 ask、考点非空、考点没问过。
+    """
+    if str(data.get("action") or "").strip().lower() != "ask":
+        return False, "产出不是新主问题（action 不是 ask）"
+    topic = str(data.get("topic") or "").strip()
+    if not topic:
+        return False, "产出没有携带考点"
+    if topic in _asked_set(asked_topics):
+        return False, f"考点「{topic}」本场已经问过"
+    return True, ""
+
+
+def gate_reply(data: dict[str, Any]) -> tuple[bool, str]:
+    """关卡·回复：这一轮是否真的说出了能给候选人看的话。
+
+    空回复若被当成面试官发言写进历史，界面上就是一条空白消息——宁可回落上一轮，
+    也不能让候选人对着空气作答。
+    """
+    if str(data.get("reply") or "").strip():
+        return True, ""
+    return False, "回复为空"
+
+
+def gate_adjusted_score(data: dict[str, Any]) -> tuple[bool, str]:
+    """关卡·归因产物：归因调用给出的 adjusted_score 能不能拿来校正综合分。
+
+    只认非 bool 的数值：字符串 "85"、null、True 一并回落原始分，
+    否则报告里的"校正分"会变成一串脏数据。
+    """
+    adjusted = data.get("adjusted_score")
+    if isinstance(adjusted, (int, float)) and not isinstance(adjusted, bool):
+        return True, ""
+    return False, "归因产物没有可用的 adjusted_score"
+
+
 def _apply_fallbacks(
     data: dict[str, Any],
     profile: dict[str, Any],
@@ -551,8 +674,8 @@ def _apply_fallbacks(
     max_probes = effective_max_probes(profile, mood_state or {})
     allow_reflect = bool(profile.get("allow_reflect", True))
 
-    action = str(data.get("action") or "ask").strip().lower()
-    if action not in {"ask", "probe", "reflect", "end"}:
+    action = str(data.get("action") or "").strip().lower()
+    if not gate_action(action)[0]:
         action = "ask"
 
     def _fallback_question() -> str:
@@ -701,7 +824,7 @@ def _resume_tool_round(
             )
             break
 
-        if not nxt.get("reply"):
+        if not gate_reply(nxt)[0]:
             # 调用没崩，但话是空的——同样回落，宁可少查一次也不能给候选人一片空白
             break
 
@@ -782,8 +905,7 @@ def interviewer_turn(
     # 同场 / 跨场去重的代码兜底：提示词里已经列了"已考考点"，但模型偶尔仍会
     # 无视它、换题时又选回同一个考点。这里给一次点名纠正的机会——仍重复就接受，
     # 不无限重试（宁可能一次重复，也不能把面试卡死）。
-    asked = {str(t).strip() for t in (asked_topics or []) if str(t).strip()}
-    if data["action"] == "ask" and data["topic"] and data["topic"] in asked:
+    if not gate_topic_duplicate(data, asked_topics)[0]:
         retry_messages = messages + [
             {"role": "assistant", "content": json.dumps(data, ensure_ascii=False)},
             {
@@ -801,12 +923,9 @@ def interviewer_turn(
             )
         except ValueError:
             retried = None
-        if (
-            retried
-            and retried["action"] == "ask"
-            and retried["topic"]
-            and retried["topic"] not in asked
-        ):
+        # 重试产出要能顶替被拦下的那一条，必须**确实是个新主问题**（关卡判定），
+        # 否则宁可沿用第一版决策（哪怕考点重复一次），也不接受一个残缺产出。
+        if retried and gate_new_question(retried, asked_topics)[0]:
             data = retried
 
     # 面试官主动查阅简历原文（tool = resume_lookup）：两步走——先检索、再出话。
@@ -835,15 +954,12 @@ def interviewer_turn(
 # 智能体 2 · 评估官
 # ---------------------------------------------------------------------------
 
-EVALUATOR_SYSTEM = """你是一位资深面试评委。请根据这场{interview_type}的完整对话记录，对候选人做出结构化评估。
+EVALUATOR_SCORE_SYSTEM = """你是一位资深面试评委。请根据这场{interview_type}的完整对话记录，对候选人做出结构化评估。
 
 【本场面试配置】
 {summary}
 提问深度：{depth}
 评判标准：{strictness}
-
-【面试官状态轨迹】
-{mood_block}
 
 【评分维度】必须使用下面给定的维度，不要自己发明，也不要增减：
 {dimensions}
@@ -865,14 +981,8 @@ EVALUATOR_SYSTEM = """你是一位资深面试评委。请根据这场{interview
 3. 有明显硬伤（概念错误、答非所问、全程没有具体事例）要直接指出。
 {extra}
 
-【归因要求】
-面试官这一侧的状态是刻意模拟出来的实验条件，不是客观标准。所以你要给两个分数：
-- overall_score：在这场对话里他实际表现出的水平（照常评，不要打折）。
-- adjusted_score：剥离面试官状态干扰后，你估计的他的真实水平。
-如果某几轮面试官明显不耐烦、时间压力升高或刻意挑刺，候选人随之出现的紧张、
-过度道歉、语无伦次，不应全部算进他的真实水平。
-attribution 必须写具体：指出是哪几轮受到干扰、哪个扣分项是被面试官逼出来的。
-如果本场面试官状态始终中性，adjusted_score 与 overall_score 可以相同，并如实说明。
+本次调用**只提供候选人自身的表现材料，不含面试官状态信息**。面试官状态对表现的影响
+由另一次独立调用单独归因，所以你不要考虑它，也不要替面试官的行为开脱或加重。
 
 rubric_check 是可选字段：本场有参照就逐条给出（每个考点一条）。若本场未提供参照，可省略该字段。
 resume_check 同样是可选字段：只有在本场提供了「候选人简历」时才填。没有提供简历就省略该字段。
@@ -880,9 +990,7 @@ resume_check 同样是可选字段：只有在本场提供了「候选人简历�
 只输出 JSON，不要输出任何其他文字，格式如下：
 {{
   "overall_score": 0 到 100 的整数,
-  "adjusted_score": 0 到 100 的整数（剥离面试官状态干扰后的真实水平估计）,
   "level": "不建议推进 或 待定 或 建议推进 或 强烈推荐",
-  "attribution": "归因说明：哪些扣分来自面试官状态，哪些来自候选人自身；状态中性时如实写明",
   "dimensions": [
     {{"name": "维度名称", "score": 0 到 100 的整数, "comment": "评语，必须引用候选人原话或具体表现"}}
   ],
@@ -902,6 +1010,36 @@ resume_check 同样是可选字段：只有在本场提供了「候选人简历�
   "risks": ["风险或硬伤，2-3 条"],
   "summary": "一段话总评，150 字以内"
 }}"""
+
+# 归因是**独立上下文**的一次调用：只回答一件事——候选人的表现有多少是被面试官状态逼出来的。
+# 刻意与评分子调用分开，而不是在同一次调用里多要两个字段：同一次调用里，
+# 面试官的情绪表演会顺着上下文影响他对候选人的判断（审查方一旦继承起草方的叙事，
+# 审查就退化成自我确认）。所以评分子调用根本拿不到状态轨迹。
+EVALUATOR_ATTRIBUTION_SYSTEM = """你是一位资深面试评委。评分子任务已经完成，现在你只做一件事：
+判断候选人的表现有多少是被面试官状态逼出来的。
+
+【本场面试配置】
+{summary}
+
+【面试官状态轨迹】这是刻意模拟出来的实验条件，不是客观标准。
+{mood_block}
+
+【评分子任务的结果】不要推翻它，只在此基础上做校正。
+{score_brief}
+
+要求：
+1. adjusted_score：剥离面试官状态干扰后，你估计的他的真实水平（0 到 100 的整数）。
+2. attribution 必须写具体：指出是哪几轮受到干扰、哪个扣分项是被面试官逼出来的
+   （紧张、过度道歉、语无伦次不应全部算进真实水平）。
+3. 如果本场面试官状态始终中性，adjusted_score 可以与 overall_score 相同，并如实说明。
+4. 不许重新打分 overall_score，也不许修改维度分——你只输出下面两个字段。
+
+只输出 JSON，不要输出任何其他文字，格式如下：
+{{
+  "adjusted_score": 0 到 100 的整数（剥离面试官状态干扰后的真实水平估计）,
+  "attribution": "归因说明：哪些扣分来自面试官状态，哪些来自候选人自身；状态中性时如实写明"
+}}"""
+
 
 _STAR_EXTRA = """4. 本场是行为面，请额外检查每个回答是否符合 STAR 结构
 （Situation 情境 / Task 任务 / Action 行动 / Result 结果），
@@ -930,26 +1068,124 @@ def evaluate_interview(
     evidence_query = " ".join(
         str(m.get("content") or "") for m in history if m.get("role") == "user"
     )[:1200] + " " + " ".join(str(t) for t in (profile.get("topics") or []))
-    system = EVALUATOR_SYSTEM.format(
-        interview_type=profile.get("interview_type", "技术面"),
-        summary=profile_summary(profile),
-        depth=profile.get("depth", ""),
-        strictness=profile.get("strictness", ""),
-        mood_block=format_mood_trace(mood_trace, profile.get("mood_mode", "")),
-        dimensions="\n".join(f"- {d}" for d in profile.get("dimensions", [])),
-        rubric_block=rubric_block(profile, asked_topics),
-        resume_block=resume_evidence_block(profile, evidence_query),
-        extra=_STAR_EXTRA if profile.get("interview_type") == "行为面" else _TECH_EXTRA,
-    )
-    return chat_json(
+    transcript = format_transcript(history)
+
+    # 第一次调用：只评分。系统提示词里没有状态轨迹，评委看到的就是候选人自己的表现。
+    score = chat_json(
         [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"以下是完整面试记录：\n\n{format_transcript(history)}"},
+            {
+                "role": "system",
+                "content": EVALUATOR_SCORE_SYSTEM.format(
+                    interview_type=profile.get("interview_type", "技术面"),
+                    summary=profile_summary(profile),
+                    depth=profile.get("depth", ""),
+                    strictness=profile.get("strictness", ""),
+                    dimensions="\n".join(f"- {d}" for d in profile.get("dimensions", [])),
+                    rubric_block=rubric_block(profile, asked_topics),
+                    resume_block=resume_evidence_block(profile, evidence_query),
+                    extra=_STAR_EXTRA
+                    if profile.get("interview_type") == "行为面"
+                    else _TECH_EXTRA,
+                ),
+            },
+            {"role": "user", "content": f"以下是完整面试记录：\n\n{transcript}"},
         ],
         api_key,
         model,
         temperature=0.2,
     )
+    if not isinstance(score, dict):
+        score = {}
+    return _merge_attribution(score, transcript, profile, api_key, mood_trace, model)
+
+
+def _score_brief(score: dict[str, Any]) -> str:
+    """把评分结果压成归因调用能读的一段文字（维度分 + 评语 + 风险）。
+
+    归因调用要"不推翻评分、只做校正"，所以它必须看到评分结果本身，
+    尤其是各维度的评语——那里带着候选人原话，是判断"哪一轮被逼出来"的依据。
+    """
+    lines = [
+        f"综合分 overall_score：{score.get('overall_score', '未知')}",
+        f"结论 level：{score.get('level', '未知')}",
+    ]
+    for item in score.get("dimensions") or []:
+        if isinstance(item, dict):
+            lines.append(
+                f"- {item.get('name', '')}：{item.get('score', '')} 分｜"
+                f"{item.get('comment', '')}"
+            )
+    risks = score.get("risks") or []
+    if risks:
+        lines.append("风险：" + "；".join(str(r) for r in risks))
+    return "\n".join(lines)
+
+
+def _merge_attribution(
+    score: dict[str, Any],
+    transcript: str,
+    profile: dict[str, Any],
+    api_key: str,
+    mood_trace: list[dict[str, Any]] | None,
+    model: str,
+) -> dict[str, Any]:
+    """把「评分」与「归因」合并回一份评估结果。
+
+    评分结果里刻意不含 adjusted_score / attribution，这里先把它们丢掉，
+    只认归因那一次独立调用的产出：否则"评分调用顺手给了个校正分"就会绕过隔离。
+
+    任何失败都静默降级：报告宁可少一个归因字段，也不能因为多做一次调用而整份产不出来。
+    """
+    result = {
+        key: value
+        for key, value in score.items()
+        if key not in ("adjusted_score", "attribution")
+    }
+
+    if not mood_trace:
+        # 本场没有状态轨迹，归因无从谈起：不额外花一次调用，校正分与原始分一致。
+        result["adjusted_score"] = score.get("overall_score")
+        result["attribution"] = "本场未记录面试官状态轨迹，未做状态干扰归因。"
+        return result
+
+    # 第二次调用：只归因。这里才把状态轨迹交出去，且交出去的是**独立上下文**。
+    try:
+        attribution = chat_json(
+            [
+                {
+                    "role": "system",
+                    "content": EVALUATOR_ATTRIBUTION_SYSTEM.format(
+                        summary=profile_summary(profile),
+                        mood_block=format_mood_trace(
+                            mood_trace, profile.get("mood_mode", "")
+                        ),
+                        score_brief=_score_brief(score),
+                    ),
+                },
+                {"role": "user", "content": f"以下是完整面试记录：\n\n{transcript}"},
+            ],
+            api_key,
+            model,
+            temperature=0.2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[评估官归因调用失败，已按未校正分数记录] {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        attribution = None
+
+    data = attribution if isinstance(attribution, dict) else {}
+    adjusted = data.get("adjusted_score")
+    # 归因产物的验收：拿到可用的 adjusted_score 才用它校正，否则一律回落到原始分。
+    result["adjusted_score"] = (
+        int(adjusted) if gate_adjusted_score(data)[0] else score.get("overall_score")
+    )
+    result["attribution"] = str(data.get("attribution") or "").strip() or (
+        "本场归因未产出，已按未校正分数记录。"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

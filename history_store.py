@@ -2,7 +2,7 @@
 
 分两部分：
 
-1. **持久化**（`load_records` / `append_record` / `delete_record` / `clear_records`）
+1. **持久化**（`load_records` / `append_record` / `delete_record` / `clear_records` / `set_outcome`）
    读写 `history.json`。此前这部分逻辑直接写在 `app.py` 里，而 `app.py` 在 import
    阶段就调用 `st.set_page_config`、根本没法在 unittest 里导入——所以"删除记录"
    这种会**真的动用户数据**的操作，值得挪出来测。
@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,34 @@ def clear_records(path: Path) -> None:
     但保留文件能避免某些平台上"删了又被别的进程重建"的竞态困惑。
     """
     _write_records(path, [])
+
+
+def set_outcome(path: Path, time_key: str, outcome: str, note: str = "") -> bool:
+    """按落盘时间回填这一场的真实结局；找不到对应记录返回 False。
+
+    为什么用 time 当键而不是下标：界面上的下标会因为"删掉一场"而整体前移，
+    用户手上那个下标可能已经指向另一场了；而 `time` 是落盘时写死、
+    并且已经显示在列表标题里的字段，用它定位不存在错位的可能。
+
+    outcome 的取值由调用方（界面）从 calibration.OUTCOMES 里选，
+    这里只负责原样落盘；读取侧的兜底在 calibration.outcome_of，
+    所以即使历史文件被手改成乱码，也不会把界面搞崩。
+    """
+    records = load_records(path)
+    key = str(time_key or "").strip()
+    if not key:
+        return False
+    for record in records:
+        if str(record.get("time") or "").strip() != key:
+            continue
+        record["outcome"] = {
+            "value": str(outcome or "").strip(),
+            "note": str(note or "").strip(),
+            "time": datetime.now().isoformat(timespec="seconds"),
+        }
+        _write_records(path, records)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------

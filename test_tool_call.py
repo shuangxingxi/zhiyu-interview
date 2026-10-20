@@ -528,6 +528,28 @@ class TestInterviewerTurnToolIntegration(unittest.TestCase):
         self.assertEqual(fake.call_count, 2)
         self.assertEqual(data["topic"], "工程实践")
 
+    def test_duplicate_topic_triggers_one_retry_and_adopts_fresh_topic(self):
+        # 撞车 → 点名纠正一次；重试给出未问过的考点 → 采纳新产出
+        fake = FakeChat(
+            make_decision(topic="工程实践"),
+            make_decision(topic="并发编程", reply="换个考点问。"),
+        )
+        data = self.call_turn(fake, cur_q=1, asked_topics=["工程实践"])
+
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(data["topic"], "并发编程")
+        self.assertEqual(data["reply"], "换个考点问。")
+
+    def test_still_duplicate_retry_keeps_the_first_decision(self):
+        # 重试仍撞车：不无限重试，沿用第一版决策（宁可重复一次也不能把面试卡死）
+        first = make_decision(topic="工程实践")
+        fake = FakeChat(first, make_decision(topic="工程实践", reply="还是这个考点。"))
+        data = self.call_turn(fake, cur_q=1, asked_topics=["工程实践"])
+
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(data["topic"], "工程实践")
+        self.assertEqual(data["reply"], first["reply"], "沿用第一版决策")
+
     def test_opening_turn_forces_ask_even_after_lookup(self):
         # 开场轮必须是提问：工具回合的最终决策也要过这道兜底
         fake = FakeChat(
@@ -538,6 +560,103 @@ class TestInterviewerTurnToolIntegration(unittest.TestCase):
 
         self.assertEqual(data["action"], "ask")
         self.assertEqual(data["reply"], "开场还是得问问题。")
+
+
+class TestAcceptanceGates(unittest.TestCase):
+    """统一验收门：具名关卡只做"放行 / 拦下并说明原因"，纠正仍归调用点。
+
+    关卡是纯函数，直接喂构造数据即可，不需要假模型，也不需要网络。
+    """
+
+    def test_action_gate_accepts_case_and_whitespace(self):
+        for good in ["ask", "probe", "reflect", "end", " ASK ", "Probe"]:
+            with self.subTest(action=good):
+                self.assertTrue(agents.gate_action(good)[0])
+
+    def test_action_gate_rejects_everything_else(self):
+        for bad in ["", None, "追问", "ask2", "reflection", 123]:
+            with self.subTest(action=bad):
+                ok, reason = agents.gate_action(bad)
+                self.assertFalse(ok)
+                self.assertTrue(reason, "拦下时必须给出可读的原因")
+
+    def test_action_gate_is_the_single_source_of_the_action_space(self):
+        # 关卡判定的动作空间必须与 _apply_fallbacks 的收敛同源
+        self.assertEqual(agents.ACTIONS, {"ask", "probe", "reflect", "end"})
+        for action in agents.ACTIONS:
+            with self.subTest(action=action):
+                data = agents._apply_fallbacks(
+                    {"action": action, "reply": "问一句"},
+                    make_profile(),
+                    cur_q=1,
+                    probes_used=0,
+                    reflects_in_a_row=0,
+                    mood_state={},
+                )
+                self.assertEqual(data["action"], action, "合法动作不该被兜底改写")
+        self.assertEqual(
+            agents._apply_fallbacks(
+                {"action": "点名", "reply": "问一句"},
+                make_profile(),
+                cur_q=1,
+                probes_used=0,
+                reflects_in_a_row=0,
+                mood_state={},
+            )["action"],
+            "ask",
+            "非法动作一律回落 ask",
+        )
+
+    def test_topic_duplicate_gate_only_judges_new_questions(self):
+        asked = ["工程实践"]
+        self.assertTrue(
+            agents.gate_topic_duplicate({"action": "ask", "topic": "并发编程"}, asked)[0]
+        )
+        ok, reason = agents.gate_topic_duplicate(
+            {"action": "ask", "topic": "工程实践"}, asked
+        )
+        self.assertFalse(ok)
+        self.assertIn("工程实践", reason)
+        # 追问 / 复述 / 收尾沿用同一道题，topic 不变是正常的
+        for action in ["probe", "reflect", "end"]:
+            with self.subTest(action=action):
+                self.assertTrue(
+                    agents.gate_topic_duplicate(
+                        {"action": action, "topic": "工程实践"}, asked
+                    )[0]
+                )
+        # 空的 ask 不在这里拦：那属于"产出不完整"，由产出侧关卡负责
+        self.assertTrue(
+            agents.gate_topic_duplicate({"action": "ask", "topic": ""}, asked)[0]
+        )
+
+    def test_new_question_gate_requires_ask_topic_and_freshness(self):
+        asked = ["工程实践"]
+        self.assertTrue(
+            agents.gate_new_question({"action": "ask", "topic": "并发编程"}, asked)[0]
+        )
+        for bad in [
+            {"action": "probe", "topic": "并发编程"},
+            {"action": "end", "topic": ""},
+            {"action": "ask", "topic": ""},
+            {"action": "ask", "topic": "工程实践"},
+        ]:
+            with self.subTest(data=bad):
+                ok, reason = agents.gate_new_question(bad, asked)
+                self.assertFalse(ok)
+                self.assertTrue(reason)
+
+    def test_topic_gates_tolerate_missing_asked_list(self):
+        # 本场还没记录任何考点时不应误报重复
+        for gate in (agents.gate_topic_duplicate, agents.gate_new_question):
+            with self.subTest(gate=gate.__name__):
+                self.assertTrue(gate({"action": "ask", "topic": "并发"}, None)[0])
+
+    def test_reply_gate_rejects_blank(self):
+        self.assertTrue(agents.gate_reply({"reply": "你刚说的那点展开讲讲？"})[0])
+        for blank in ["", "   ", None, {}]:
+            with self.subTest(reply=blank):
+                self.assertFalse(agents.gate_reply({"reply": blank})[0])
 
 
 class TestUsageMetering(unittest.TestCase):

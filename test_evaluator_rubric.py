@@ -176,5 +176,313 @@ class TestEvaluateInterviewPassesAskedTopics(unittest.TestCase):
         )
 
 
+class TestScoreAttributionIsolation(unittest.TestCase):
+    """评分与归因必须是**两次独立调用**：状态轨迹不得进入评分上下文。
+
+    这是本次改动的核心不变量。原先一次调用里同时索要 overall_score 与
+    adjusted_score，等于把面试官的情绪轨迹摆在评委面前，让他先看见"不耐烦"
+    再给候选人打分——审查方一旦继承起草方的叙事，审查就退化成自我确认。
+    """
+
+    MOOD = [{"round": 1, "mood": "不耐烦", "patience": 1, "energy": 2, "pressure": 2}]
+
+    def _run(self, profile, replies, mood_trace):
+        """replies 按调用顺序依次返回（异常对象表示该次调用抛错）。
+
+        返回 (每次调用的 system/user, evaluate_interview 的结果)。
+        """
+        calls: list[dict[str, str]] = []
+        queue = list(replies)
+
+        def fake_chat_json(messages, api_key, model=None, **kwargs):
+            calls.append(
+                {"system": messages[0]["content"], "user": messages[-1]["content"]}
+            )
+            item = queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with mock.patch.object(agents, "chat_json", fake_chat_json):
+            result = agents.evaluate_interview(
+                [
+                    {"role": "assistant", "content": "讲讲你做的项目。"},
+                    {"role": "user", "content": "我做过推荐系统"},
+                ],
+                profile,
+                "fake-key",
+                mood_trace=mood_trace,
+                asked_topics=[profile["topics"][0]],
+            )
+        return calls, result
+
+    def test_mood_trace_only_reaches_the_attribution_call(self):
+        profile = make_profile("A")
+        calls, _ = self._run(
+            profile,
+            [
+                {"overall_score": 60, "dimensions": []},
+                {"adjusted_score": 88, "attribution": "第 1 轮的不耐烦把他带乱了"},
+            ],
+            self.MOOD,
+        )
+        self.assertEqual(len(calls), 2, "评分与归因必须是两次独立调用")
+        self.assertNotIn(
+            "不耐烦", calls[0]["system"], "状态轨迹不能进评分上下文"
+        )
+        self.assertIn("不耐烦", calls[1]["system"], "归因调用才该看到状态轨迹")
+
+    def test_adjusted_score_comes_from_the_attribution_call(self):
+        profile = make_profile("A")
+        _, result = self._run(
+            profile,
+            [
+                {"overall_score": 60, "dimensions": []},
+                {"adjusted_score": 88, "attribution": "第 1 轮受到干扰"},
+            ],
+            self.MOOD,
+        )
+        self.assertEqual(result["adjusted_score"], 88)
+        self.assertIn("第 1 轮", result["attribution"])
+
+    def test_scoring_call_cannot_dictate_the_adjusted_score(self):
+        # 评分子调用即便"顺手"给了校正分也必须丢弃，否则隔离形同虚设
+        profile = make_profile("A")
+        _, result = self._run(
+            profile,
+            [
+                {
+                    "overall_score": 60,
+                    "adjusted_score": 99,
+                    "attribution": "我自己顺手算的",
+                    "dimensions": [],
+                },
+                {"adjusted_score": 88, "attribution": "第 1 轮受到干扰"},
+            ],
+            self.MOOD,
+        )
+        self.assertEqual(result["adjusted_score"], 88)
+
+    def test_without_mood_trace_only_one_call_and_score_is_unchanged(self):
+        profile = make_profile("A")
+        calls, result = self._run(
+            profile, [{"overall_score": 60, "dimensions": []}], None
+        )
+        self.assertEqual(len(calls), 1, "没有状态轨迹就不该再花一次调用")
+        self.assertEqual(result["adjusted_score"], 60)
+        self.assertTrue(result["attribution"].strip())
+
+    def test_attribution_failure_degrades_to_the_original_score(self):
+        # 多做一次调用可以失败，但报告必须照常产出
+        profile = make_profile("A")
+        _, result = self._run(
+            profile,
+            [{"overall_score": 60, "dimensions": []}, ValueError("boom")],
+            self.MOOD,
+        )
+        self.assertEqual(result["adjusted_score"], 60)
+        self.assertTrue(result["attribution"].strip())
+
+
+class TestAdjustedScoreGate(unittest.TestCase):
+    """归因产物关卡：只有可用的 adjusted_score 才允许校正综合分。
+
+    归因是"多做一次调用"的附加产物，它的字段质量不能反过来污染报告——
+    模型给出字符串、布尔或 null 时，一律回落原始分（静默降级）。
+    """
+
+    MOOD = [{"round": 1, "mood": "不耐烦", "patience": 1, "energy": 2, "pressure": 2}]
+
+    def test_gate_accepts_only_real_numbers(self):
+        self.assertTrue(agents.gate_adjusted_score({"adjusted_score": 88})[0])
+        self.assertTrue(agents.gate_adjusted_score({"adjusted_score": 88.5})[0])
+        for bad in ["88", None, True, False, "", [], {}]:
+            with self.subTest(adjusted=bad):
+                ok, reason = agents.gate_adjusted_score({"adjusted_score": bad})
+                self.assertFalse(ok)
+                self.assertTrue(reason)
+        # 字段缺失也走同一条降级路径
+        self.assertFalse(agents.gate_adjusted_score({})[0])
+
+    def test_summary_block_does_not_raise_on_empty_score(self):
+        # _score_brief 是喂给归因调用的"评分摘要"，字段缺失时不能抛异常
+        self.assertTrue(agents._score_brief({}).strip())
+
+    def _run(self, profile, replies, mood_trace):
+        queue = list(replies)
+
+        def fake_chat_json(messages, api_key, model=None, **kwargs):
+            return queue.pop(0)
+
+        with mock.patch.object(agents, "chat_json", fake_chat_json):
+            return agents.evaluate_interview(
+                [
+                    {"role": "assistant", "content": "讲讲你做的项目。"},
+                    {"role": "user", "content": "我做过推荐系统"},
+                ],
+                profile,
+                "fake-key",
+                mood_trace=mood_trace,
+                asked_topics=[profile["topics"][0]],
+            )
+
+    def test_string_adjusted_score_degrades_to_original(self):
+        profile = make_profile("A")
+        result = self._run(
+            profile,
+            [
+                {"overall_score": 60, "dimensions": []},
+                {"adjusted_score": "88", "attribution": "第 1 轮受到干扰"},
+            ],
+            self.MOOD,
+        )
+        self.assertEqual(result["adjusted_score"], 60, "脏数据必须回落原始分")
+
+    def test_missing_attribution_field_keeps_reason_text(self):
+        # 归因调用没给出校正分，但仍写了说明：说明要保留，分数回落
+        profile = make_profile("A")
+        result = self._run(
+            profile,
+            [
+                {"overall_score": 60, "dimensions": []},
+                {"attribution": "本场状态基本中性"},
+            ],
+            self.MOOD,
+        )
+        self.assertEqual(result["adjusted_score"], 60)
+        self.assertIn("中性", result["attribution"])
+
+
+class TestTopicVerdict(unittest.TestCase):
+    """考点级判定：把要点粒度的对照结果升成"这道题整体过没过"。
+
+    规则全在代码里（knowledge.topic_verdict），同一份 rubric_check 每次得到同一结论。
+    """
+
+    def test_veto_error_is_a_hard_fail(self):
+        row = {
+            "topic": "TCP 三次握手",
+            "must_hit": ["第三次握手确认双方收发能力"],
+            "missed": [],
+            "errors": ["说成两次握手就够了"],
+        }
+        verdict, reason = knowledge.topic_verdict(row, veto=["说成两次握手就够了"])
+        self.assertEqual(verdict, knowledge.VERDICT_FAIL)
+        self.assertIn("一票否决", reason)
+
+    def test_error_without_veto_marker_is_still_a_fail(self):
+        # 条目没标 veto：踩误区照样判不通过，只是不会说成"一票否决"
+        row = {"topic": "x", "must_hit": ["a"], "missed": [], "errors": ["概念说反了"]}
+        verdict, reason = knowledge.topic_verdict(row)
+        self.assertEqual(verdict, knowledge.VERDICT_FAIL)
+        self.assertNotIn("一票否决", reason)
+        self.assertIn("概念错误", reason)
+
+    def test_all_must_hit_missed_is_a_fail(self):
+        row = {"topic": "x", "must_hit": [], "missed": ["要点一", "要点二"], "errors": []}
+        verdict, reason = knowledge.topic_verdict(row)
+        self.assertEqual(verdict, knowledge.VERDICT_FAIL)
+        self.assertIn("一条都没答到", reason)
+
+    def test_some_hit_some_missed_is_partial(self):
+        row = {"topic": "x", "must_hit": ["要点一"], "missed": ["要点二"], "errors": []}
+        self.assertEqual(knowledge.topic_verdict(row)[0], knowledge.VERDICT_PARTIAL)
+
+    def test_full_coverage_is_pass(self):
+        row = {"topic": "x", "must_hit": ["要点一", "要点二"], "missed": [], "errors": []}
+        self.assertEqual(knowledge.topic_verdict(row)[0], knowledge.VERDICT_PASS)
+
+    def test_empty_record_is_unknown(self):
+        for row in [{}, {"topic": "x"}, {"topic": "x", "must_hit": []}, None, "不是字典"]:
+            with self.subTest(row=row):
+                self.assertEqual(knowledge.topic_verdict(row)[0], knowledge.VERDICT_UNKNOWN)
+
+    def test_every_verdict_has_a_chinese_label(self):
+        for verdict in (
+            knowledge.VERDICT_PASS,
+            knowledge.VERDICT_PARTIAL,
+            knowledge.VERDICT_FAIL,
+            knowledge.VERDICT_UNKNOWN,
+        ):
+            with self.subTest(verdict=verdict):
+                self.assertTrue(knowledge.VERDICT_LABELS[verdict])
+
+
+class TestRubricVetoAndAggregate(unittest.TestCase):
+    """veto 标记渲染 + 考点级聚合（参照缺失时静默降级）。"""
+
+    FIXTURE = {
+        "计算机科学与技术": {
+            "TCP 三次握手": {
+                "must_hit": ["第三次握手确认双方收发能力"],
+                "bonus": [],
+                "common_errors": ["说成两次握手就够了"],
+                "veto": ["说成两次握手就够了"],
+            },
+            "进程调度": {
+                "must_hit": ["时间片轮转", "优先级抢占"],
+                "bonus": [],
+                "common_errors": ["把调度说成同步机制"],
+            },
+        }
+    }
+
+    ROWS = [
+        {"topic": "TCP 三次握手", "must_hit": ["第三次握手确认双方收发能力"], "missed": [], "errors": []},
+        {"topic": "进程调度", "must_hit": ["时间片轮转"], "missed": ["优先级抢占"], "errors": []},
+        {"topic": "模型自拟的考点", "must_hit": [], "missed": ["没答到"], "errors": []},
+    ]
+
+    def _profile(self):
+        profile = make_profile("B")
+        profile["major"] = "计算机科学与技术"
+        return profile
+
+    def test_veto_line_is_rendered_only_when_marked(self):
+        with mock.patch.object(knowledge, "load_rubrics", lambda: self.FIXTURE):
+            marked = knowledge.rubric_block(self._profile(), ["TCP 三次握手"])
+            plain = knowledge.rubric_block(self._profile(), ["进程调度"])
+        self.assertIn("一票否决", marked)
+        self.assertIn("说成两次握手就够了", marked)
+        self.assertNotIn("一票否决", plain, "没标 veto 的条目不该多出这一行")
+
+    def test_veto_marker_upgrades_a_scored_topic_to_fail(self):
+        row = {
+            "topic": "TCP 三次握手",
+            "must_hit": ["第三次握手确认双方收发能力"],
+            "missed": [],
+            "errors": ["说成两次握手就够了"],
+        }
+        with mock.patch.object(knowledge, "load_rubrics", lambda: self.FIXTURE):
+            agg = knowledge.aggregate_rubric_check(self._profile(), [row])
+        self.assertEqual(agg["topics"][0]["verdict"], knowledge.VERDICT_FAIL)
+        self.assertEqual(agg["counts"][knowledge.VERDICT_FAIL], 1)
+        self.assertEqual(agg["passed"], 0)
+
+    def test_counts_and_weak_list(self):
+        with mock.patch.object(knowledge, "load_rubrics", lambda: self.FIXTURE):
+            agg = knowledge.aggregate_rubric_check(self._profile(), self.ROWS)
+        self.assertEqual(agg["total"], 3)
+        self.assertEqual(agg["passed"], 1)
+        self.assertEqual(agg["counts"][knowledge.VERDICT_PARTIAL], 1)
+        self.assertEqual(agg["counts"][knowledge.VERDICT_FAIL], 1)
+        # 薄弱项只收不通过与部分通过，且保留原来的顺序
+        self.assertEqual([t["topic"] for t in agg["weak"]], ["进程调度", "模型自拟的考点"])
+        self.assertTrue(all(t["label"] for t in agg["topics"]))
+
+    def test_missing_rubrics_degrades_silently(self):
+        with mock.patch.object(knowledge, "load_rubrics", lambda: {}):
+            agg = knowledge.aggregate_rubric_check({}, self.ROWS)
+        self.assertEqual(agg["total"], 3, "参照缺失时判定仍要能算出来")
+        self.assertEqual(agg["passed"], 1)
+
+    def test_junk_rows_are_ignored(self):
+        rows = [{"topic": "进程调度", "must_hit": ["时间片轮转"]}, None, "不是字典", 3]
+        with mock.patch.object(knowledge, "load_rubrics", lambda: {}):
+            agg = knowledge.aggregate_rubric_check(self._profile(), rows)
+        self.assertEqual(agg["total"], 1)
+        self.assertEqual(agg["passed"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

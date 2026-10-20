@@ -292,5 +292,48 @@ class TestRecordLabel(unittest.TestCase):
         self.assertIsInstance(label, str)  # 不该抛异常
 
 
+class TestSetOutcome(TempBase):
+    """结局回填：按落盘时间定位记录，只改这一场的 outcome，不动别的。"""
+
+    def _seed(self):
+        history_store.append_record(self.path, make_record(time="2026-10-11T10:00:00", overall=70))
+        history_store.append_record(self.path, make_record(time="2026-10-12T10:00:00", overall=80))
+
+    def test_writes_outcome_and_note(self):
+        self._seed()
+        self.assertTrue(history_store.set_outcome(self.path, "2026-10-11T10:00:00", "被拒", " 自我介绍太长 "))
+        record = history_store.load_records(self.path)[0]
+        self.assertEqual(record["outcome"]["value"], "被拒")
+        self.assertEqual(record["outcome"]["note"], "自我介绍太长", "备注首尾空白要清掉")
+        self.assertTrue(record["outcome"]["time"], "要记录回填时间")
+
+    def test_only_targets_the_matching_record(self):
+        self._seed()
+        history_store.set_outcome(self.path, "2026-10-12T10:00:00", "拿到 offer")
+        records = history_store.load_records(self.path)
+        self.assertNotIn("outcome", records[0], "另一场不能被顺带写上结局")
+        self.assertEqual(records[1]["outcome"]["value"], "拿到 offer")
+
+    def test_repeated_backfill_overwrites(self):
+        self._seed()
+        history_store.set_outcome(self.path, "2026-10-11T10:00:00", "还没结果")
+        history_store.set_outcome(self.path, "2026-10-11T10:00:00", "进入下一轮")
+        self.assertEqual(
+            history_store.load_records(self.path)[0]["outcome"]["value"], "进入下一轮"
+        )
+
+    def test_unknown_time_returns_false_and_keeps_data(self):
+        self._seed()
+        self.assertFalse(history_store.set_outcome(self.path, "没有这个时间", "被拒"))
+        self.assertFalse(history_store.set_outcome(self.path, "", "被拒"))
+        records = history_store.load_records(self.path)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all("outcome" not in r for r in records))
+
+    def test_survives_corrupt_history_file(self):
+        self.path.write_text("{ 这不是 JSON", encoding="utf-8")
+        self.assertFalse(history_store.set_outcome(self.path, "任意", "被拒"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

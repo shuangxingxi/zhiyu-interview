@@ -19,6 +19,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import calibration
 import history_store
 import interview_state
 import mood
@@ -41,6 +42,9 @@ from knowledge import (
     MOOD_MODES,
     MOOD_ORDER,
     SCENES,
+    VERDICT_FAIL,
+    VERDICT_PARTIAL,
+    aggregate_rubric_check,
     build_profile,
     level_labels,
     profile_summary,
@@ -51,6 +55,7 @@ from voice import (
     VOICES,
     correct_asr,
     is_valid_audio,
+    reset_edge_breaker,
     synthesize,
     transcribe,
 )
@@ -647,10 +652,21 @@ st.markdown(
     /* ============================================================
        12. 容器与表单细节
        ============================================================ */
-    [data-testid="stVerticalBlock"] > div,
-    .block-container {
-        padding-top: 2.25rem;
-        padding-bottom: 3rem;
+    /* 只给「最外层」内容区留白。以前这里是 [data-testid="stVerticalBlock"] > div，
+       它会给每一个元素容器（含消息气泡内层）都加上 2.25rem/3rem 的上下内边距，
+       导致每条消息凭空多出 84px 高度、页面被撑高后自动滚到底，顶部内容被挤出视口。
+       —— 2026-10-18 修复「点击开始面试后看不到开场白」。
+       留白再收一档：面试中的整页高度只差几十像素就超一屏，超出的部分会被
+       Streamlit 自动滚到底吃掉。但顶部必须留够 3.75rem —— Streamlit 的
+       [data-testid="stHeader"] 是固定在顶部的透明浮层（约 60px），内容是从
+       滚动容器的 y=0 开始画、从浮层底下穿过去的；padding-top 给少了，会话栏
+       （知遇 · AI 虚拟面试官）就会被那层浮层压住，只剩下面一条分隔线，
+       看着像"上面有一行遮挡"（2026-10-18 报障）。 */
+    .block-container,
+    [data-testid="stMainBlockContainer"],
+    [data-testid="stMain"] > div:first-child {
+        padding-top: 3.75rem;
+        padding-bottom: 1.5rem;
     }
     [data-testid="stForm"] {
         border: 1px solid var(--zy-line);
@@ -856,8 +872,8 @@ st.markdown(
         gap: 1rem;
         flex-wrap: wrap;
         border-bottom: 1px solid var(--zy-line);
-        padding-bottom: 0.875rem;
-        margin-bottom: 1.375rem;
+        padding-bottom: 0.75rem;
+        margin-bottom: 0.75rem;
     }
     .zy-mark {
         font-family: var(--zy-serif);
@@ -1030,6 +1046,7 @@ def restore_snapshot(data: dict) -> None:
     ss["audio_by_index"] = {}
     ss["autoplay_index"] = -1
     ss["avatar_audio"] = b""
+    ss["avatar_index"] = -1
     ss["voice_signature"] = ""
     ss["evaluation"] = {}
     ss["coach"] = {}
@@ -1102,8 +1119,15 @@ def init_state() -> None:
         "usage": {},  # 本场 token 计量（开局清零，报告生成后取值）
         # 清空历史记录需要两步确认（不可撤销），这个标记记住"已点过一次"
         "confirm_clear_history": False,
+        # 本场记录落盘时写下的 time。报告页的"结局回填"靠它定位 history.json 里
+        # 那一条记录（而不是靠下标——下标会因为删掉别的场次而整体前移）。
+        "record_time": "",
         # API 连通性测试结果。存进 session_state，否则 rerun 一次就消失
         "conn_test": None,
+        # 一次性提示：`st.success()` 紧跟 `st.rerun()` 时提示渲染不出来（rerun
+        # 会立刻中断本次运行）。要"改完就重跑还要给反馈"的写操作先把话存这里，
+        # 由下一轮开头 `_flush_flash()` 显示后清空。
+        "flash": "",
         # 注意：`strict_mode` 刻意不在这里设默认值——它由侧边栏那个带 key 的
         # checkbox 自己管理。两边都设会让 Streamlit 报"默认值与 Session State 冲突"。
         "api_key": load_api_key(DEEPSEEK_KEY_ENV),
@@ -1123,9 +1147,25 @@ def init_state() -> None:
         "audio_by_index": {},  # 面试官消息下标 -> mp3 字节
         "autoplay_index": -1,  # 需要自动播放的消息下标
         "voice_signature": "",  # 已处理过的录音指纹，防止同一条录音被反复识别
+        # 录音控件的实例代号：每消费掉一段录音就 +1，让控件以全新实例重挂载。
+        # st.audio_input 复用同一个 key 时，录音结束后会残留一个已失效的
+        # MediaRecorder，界面上显示 "An error has occurred, please try again."
+        # （2026-10-18 报障：语音输入完就变那样，点控件左边的刷新按钮才好）。
+        "voice_widget_gen": 0,
         # 面试官语音动效：开关 + 最新一条语音（组件专用，rerun 时保持不变，避免 iframe 重载打断播放）
         "avatar_on": True,
         "avatar_audio": b"",
+        # 动效组件"占用"的那条消息下标：它自己会播这条语音，消息上就不能再挂
+        # 一个 st.audio 播放器——同一段 mp3 两套播放器各自计时，永远不同步
+        # （2026-10-18 报障：进度条走到 0:03，卡片却已经播完在等回答）。
+        "avatar_index": -1,
+        # 语音合成连续失败次数 + 停用说明。
+        # edge-tts 自 2026-10 起对第三方客户端永久 403（voice.py 里已确认），
+        # 兜底的硅基流动也可能返回空音频。每轮都白等好几秒，用户看到的
+        # 就是"点了开始面试，页面半天没反应"。连续失败到阈值就停用本会话
+        # 的语音合成（文字面试照常），侧边栏给出可一键恢复的说明。
+        "tts_failures": 0,
+        "tts_note": "",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1156,9 +1196,31 @@ def start_interview(profile: dict, api_key: str) -> None:
     st.session_state.audio_by_index = {}
     st.session_state.autoplay_index = -1
     st.session_state.voice_signature = ""
+    st.session_state.voice_widget_gen += 1
     st.session_state.avatar_audio = b""
+    st.session_state.avatar_index = -1
     st.session_state.status = "running"
     advance()
+
+
+# 语音合成连续失败到这个次数就停用本会话的语音。
+# 2 次足够确认"不是偶发抖动"（voice.py 里 403 已被判定为永久故障），
+# 又不至于让用户只因为一次网络抖动就失去整场语音。
+TTS_FAILURE_LIMIT = 2
+
+
+def _note_tts_failure(reason: str) -> None:
+    """记一次语音合成失败；达到阈值后停用本会话语音并留下可恢复的说明。"""
+    st.session_state.tts_failures = int(st.session_state.get("tts_failures") or 0) + 1
+    if st.session_state.tts_failures < TTS_FAILURE_LIMIT:
+        return
+    if st.session_state.get("tts_note"):
+        return
+    st.session_state.tts_note = (
+        f"语音合成连续 {TTS_FAILURE_LIMIT} 次失败，已自动停用本场语音，"
+        "文字面试照常进行（不影响出题与评分）。\n\n"
+        f"失败原因：{reason[:300]}"
+    )
 
 
 def speak(text: str) -> None:
@@ -1167,6 +1229,9 @@ def speak(text: str) -> None:
     合成失败绝不能影响面试：宁可没声音，也不能让整场面试报错中断。
     """
     if not (st.session_state.voice_on and text.strip()):
+        return
+    # 已经确认本机合成不可用：不再每轮都在这里白等好几秒。
+    if st.session_state.get("tts_note"):
         return
     try:
         level = (st.session_state.profile or {}).get("level", "B")
@@ -1180,18 +1245,22 @@ def speak(text: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[TTS 失败] {exc}", file=sys.stderr, flush=True)
+        _note_tts_failure(f"{type(exc).__name__}: {exc}")
         return
     # 合成可能"成功"返回空流（例如整段都是 markdown、清完就空了），
     # 这时不能把 b"" 挂进 audio_by_index：界面上的 `if audio:` 会静默跳过，
     # 用户只是听不到声音，也看不出是合成失败还是文本被清空。
     if not is_valid_audio(audio):
         print("[TTS 跳过] 合成结果为空或非 MP3 数据", file=sys.stderr, flush=True)
+        _note_tts_failure("合成结果为空或非 MP3 数据")
         return
+    st.session_state.tts_failures = 0
     index = len(st.session_state.history) - 1
     st.session_state.audio_by_index[index] = audio
     st.session_state.autoplay_index = index
     # 声波球组件只认"最新一条"：内容变化 = 有新语音 = 该它开口
     st.session_state.avatar_audio = audio
+    st.session_state.avatar_index = index
 
 
 def advance() -> None:
@@ -1223,16 +1292,18 @@ def advance() -> None:
     )
 
     try:
-        data = interviewer_turn(
-            st.session_state.history,
-            profile,
-            st.session_state.api_key,
-            cur_q=st.session_state.cur_q,
-            probes_used=st.session_state.probes_used,
-            reflects_in_a_row=st.session_state.reflects_in_a_row,
-            mood_state=st.session_state.mood_state,
-            asked_topics=st.session_state.asked_topics,
-        )
+        # 这一轮要等模型 2–4 秒；没有进度提示时页面看起来就是"点了没反应"。
+        with st.spinner("面试官正在看你的回答…"):
+            data = interviewer_turn(
+                st.session_state.history,
+                profile,
+                st.session_state.api_key,
+                cur_q=st.session_state.cur_q,
+                probes_used=st.session_state.probes_used,
+                reflects_in_a_row=st.session_state.reflects_in_a_row,
+                mood_state=st.session_state.mood_state,
+                asked_topics=st.session_state.asked_topics,
+            )
     except Exception as exc:  # noqa: BLE001
         # 回滚情绪状态，并保留候选人这条回答：界面据此给出「重试本轮」入口，
         # 用户不必重新输入（重新输入会留下两条连续的候选人消息）。
@@ -1266,7 +1337,12 @@ def advance() -> None:
     st.session_state.history.append(
         {"role": "assistant", "content": data["reply"], "decision": data}
     )
-    speak(data["reply"])
+    # TTS 是同步阻塞的，合成一幕可能要好几秒；只在真的要合成时才挂进度提示。
+    if st.session_state.voice_on and not st.session_state.get("tts_note"):
+        with st.spinner("面试官正在开口…"):
+            speak(data["reply"])
+    else:
+        speak(data["reply"])
     st.session_state.decisions.append(
         interview_state.decision_row(st.session_state.cur_q, data, ACTION_LABELS)
     )
@@ -1364,9 +1440,12 @@ def finish_interview() -> None:
         # 报告生成完再取一次计量，这样本场消耗把评估官与教练的调用也算进去
         st.session_state.usage = usage_snapshot()
 
+        # 记住这场记录的落盘时间：报告页的"结局回填"靠它定位这一条记录
+        record_time = datetime.now().isoformat(timespec="seconds")
+        st.session_state.record_time = record_time
         save_record(
             {
-                "time": datetime.now().isoformat(timespec="seconds"),
+                "time": record_time,
                 # 落盘时剔除简历及其切片索引：简历不进入任何持久化文件
                 "profile": {
                     k: v
@@ -1723,6 +1802,15 @@ def _render_resume_optimize_section(api_key: str) -> None:
 
 def _render_voice_section() -> None:
     """语音与动效。关闭语音时整段收起，避免无意义的控件堆在侧边栏。"""
+    note = st.session_state.get("tts_note")
+    if note:
+        st.warning(note)
+        if st.button("重试语音合成", use_container_width=True):
+            st.session_state.tts_note = ""
+            st.session_state.tts_failures = 0
+            reset_edge_breaker()
+            st.rerun()
+
     st.session_state.voice_on = st.checkbox(
         "启用语音面试",
         value=st.session_state.voice_on,
@@ -1911,11 +1999,9 @@ def render_interview() -> None:
             "如需简历提问，可结束本场后重新上传简历再开一场。"
         )
 
-    progress = f"已问 {st.session_state.cur_q}/{profile['total_rounds']} 道主问题"
-    if st.session_state.probes_used:
-        max_probes = mood.effective_max_probes(profile, st.session_state.mood_state)
-        progress += f"（当前题已追问 {st.session_state.probes_used}/{max_probes} 次）"
-    st.progress(min(st.session_state.cur_q / max(profile["total_rounds"], 1), 1.0), text=progress)
+    # 进度条只在侧边栏渲染（_render_running_panel）。
+    # 这里不再重复画一条：主区域每次重跑都会被 Streamlit 自动滚到底，
+    # 顶部内容（会话栏 / 进度 / 开场白开头）就被挤出视口——2026-10-18 修复。
 
     # 面试官语音动效：开启语音时显示声波球，并接管"最新一条"语音的自动播放
     avatar_visible = st.session_state.avatar_on and st.session_state.voice_on
@@ -1925,9 +2011,15 @@ def render_interview() -> None:
         role = "assistant" if msg["role"] == "assistant" else "user"
         with st.chat_message(role, avatar="🧑‍💼" if role == "assistant" else "🙋"):
             st.markdown(msg["content"])
+            # 动效组件正在播的那一条，消息上不再挂播放器：同一段 mp3 挂两套
+            # 播放器就是两个各自计时的进度条，怎么调都不会同步
+            # （2026-10-18 报障：进度条停在 0:03，卡片却已经播完写"等待你的回答"）。
+            # 语音由动效卡片负责播（它自己要靠这段音频驱动动效），卡片自带
+            # 「▶ 重播」；更早的消息仍保留播放器，供回听。
             audio = st.session_state.audio_by_index.get(index)
-            if audio:
-                # 声波球接管自动播放时，这里的播放器只留手动回听，避免双重出声
+            owned_by_avatar = bool(avatar_html) and index == st.session_state.avatar_index
+            if audio and not owned_by_avatar:
+                # 动效组件接管自动播放时，这里的播放器只留手动回听，避免双重出声
                 st.audio(
                     audio,
                     format="audio/mp3",
@@ -1941,7 +2033,10 @@ def render_interview() -> None:
     if avatar_html:
         _, avatar_col, _ = st.columns([1, 1.4, 1])
         with avatar_col:
-            st.iframe(avatar_html, height=330)
+            # 165px：330px 会把整页撑高约 250px，而 Streamlit 每次重跑都会把主区域
+            # 滚到底，顶部会话栏因此被切掉一条（2026-10-18 报障）。动效组件内部会按
+            # 可用高度等比缩放（avatar.py 的 fitCard），这里只是取景框，不必给太大。
+            st.iframe(avatar_html, height=165)
 
     # 上一轮调用失败：面试官还没接上话。
     # 这时**不再渲染输入框**（否则再答一次会留下两条连续的候选人消息），
@@ -1969,19 +2064,29 @@ def render_interview() -> None:
 
     sfc_key = siliconflow_key()
     if st.session_state.voice_on and sfc_key and not answer:
-        clip = st.audio_input("也可以按住说话作答", key="answer_clip")
+        # key 带上实例代号：录音消费完就换一个新控件，避免复用那个残留下
+        # 失效 MediaRecorder 的旧实例（表现为控件里显示
+        # "An error has occurred, please try again."，得手点刷新按钮）。
+        clip = st.audio_input(
+            "也可以按住说话作答", key=f"answer_clip_{st.session_state.voice_widget_gen}"
+        )
         if clip is not None:
             # 同一段录音只识别一次：靠指纹比对，而不是识别完就去清空控件
             signature = hashlib.md5(clip.getvalue()).hexdigest()
             if signature != st.session_state.voice_signature:
                 st.session_state.voice_signature = signature
+                # 这段录音已经吃掉了，下一轮换新控件（成功走下面的 rerun，
+                # 失败就在异常分支里 rerun，两种结局都让控件恢复干净）
+                st.session_state.voice_widget_gen += 1
                 with st.spinner("正在识别语音…"):
                     try:
                         answer = transcribe(clip.getvalue(), sfc_key)
                         answer = _correct_voice(answer)
                     except Exception as exc:  # noqa: BLE001
                         st.session_state.error = f"语音识别失败：{exc}"
-                        answer = ""
+                        st.rerun()
+                if not answer:
+                    st.rerun()
     elif st.session_state.voice_on and not answer and not sfc_key:
         st.caption("想用语音作答？在左侧填入硅基流动 API Key 后即可录音。")
 
@@ -2143,6 +2248,13 @@ def build_report_markdown() -> str:
             f"**{evaluation.get('adjusted_score', evaluation.get('overall_score', '-'))}**"
         )
         add(f"- 评委结论：{evaluation.get('level', '-')}")
+        # 回填过的结局写进报告：这份报告本身就是参赛/复盘材料，
+        # "这场后来被拒了"比一个孤立分数更能说明问题。
+        outcome_record = _find_record(st.session_state.get("record_time", ""))
+        if outcome_record and calibration.outcome_of(outcome_record):
+            add(f"- 真实结局（本人回填）：{calibration.outcome_label(outcome_record)}")
+            if calibration.outcome_note(outcome_record):
+                add(f"- 结局备注：{calibration.outcome_note(outcome_record)}")
         add()
         if evaluation.get("attribution"):
             add("### 归因：哪些扣分不该算在你头上")
@@ -2159,15 +2271,20 @@ def build_report_markdown() -> str:
             )
         rubric_check = [x for x in (evaluation.get("rubric_check") or []) if isinstance(x, dict)]
         if rubric_check:
+            # 要点粒度的对照结果由代码升成考点粒度（规则见 knowledge.topic_verdict），
+            # 不额外叫模型判一次——同一份记录每次得到同一个结论。
+            agg = aggregate_rubric_check(profile, rubric_check)
+            labels = {t["topic"]: t["label"] for t in agg["topics"]}
             add("### 考点命中情况")
             add()
             add("> 参照是底线不是天花板：清单之外的正确答案同样算分，没命中不等于答错。")
             add()
             table(
-                ["考点", "已命中", "遗漏", "误区"],
+                ["考点", "判定", "已命中", "遗漏", "误区"],
                 [
                     [
                         item.get("topic", ""),
+                        labels.get(item.get("topic", ""), ""),
                         "；".join(str(x) for x in (item.get("must_hit") or [])) or "—",
                         "；".join(str(x) for x in (item.get("missed") or [])) or "—",
                         "；".join(str(x) for x in (item.get("errors") or [])) or "—",
@@ -2175,6 +2292,16 @@ def build_report_markdown() -> str:
                     for item in rubric_check
                 ],
             )
+            counts = agg["counts"]
+            add()
+            add(
+                f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
+                f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个。"
+            )
+            if agg["weak"]:
+                add()
+                for entry in agg["weak"]:
+                    add(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
         resume_check = evaluation.get("resume_check")
         if isinstance(resume_check, dict):
             issues = [x for x in (resume_check.get("issues") or []) if isinstance(x, dict)]
@@ -2350,6 +2477,59 @@ def build_report_markdown() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _find_record(time_key: str) -> dict | None:
+    """按落盘时间在 history.json 里定位一场记录；找不到返回 None。"""
+    key = str(time_key or "").strip()
+    if not key:
+        return None
+    for record in load_records():
+        if str(record.get("time") or "").strip() == key:
+            return record
+    return None
+
+
+def _render_outcome_backfill(time_key: str, key_prefix: str) -> None:
+    """结局回填控件 —— 报告页与历史页共用一份实现。
+
+    面试评分是一次**预测**，真实结局才是**标签**；把标签补上之后，
+    跨场对照才有意义（对照规则在 calibration.calibrate）。
+
+    刻意只写回 history.json、**不碰评分**：评分口径由「场景 × 专业 × 难度」
+    三级配置唯一决定（DESIGN 第三节），若拿历史结局反推调分，
+    口径就会随样本漂移，与"提问与评分同源、可控可解释"冲突。
+    """
+    record = _find_record(time_key)
+    if record is None:
+        st.caption("这一场在历史记录里找不到了（可能已被删除），无法回填结局。")
+        return
+
+    current = calibration.outcome_of(record)
+    choice = st.selectbox(
+        "这一场的真实结局",
+        calibration.OUTCOMES,
+        index=calibration.OUTCOMES.index(current),
+        # OUTCOMES[0] 是空字符串（"未回填"的内部表示），直接渲染会是一个看不懂的空选项
+        format_func=lambda value: value or "（未回填）",
+        key=f"outcome_choice_{key_prefix}",
+        help="「被拒」只代表这一家没过，不代表你不行。「还没结果」「不适用」不参与校准。",
+    )
+    note = st.text_input(
+        "备注（可选）",
+        value=calibration.outcome_note(record),
+        key=f"outcome_note_{key_prefix}",
+        placeholder="例如：自我介绍太长 / 项目细节答不上来",
+    )
+    if st.button("保存结局", key=f"outcome_save_{key_prefix}"):
+        if history_store.set_outcome(HISTORY_FILE, time_key, choice, note):
+            # 不能直接 st.success 再 st.rerun()——rerun 会立刻中断本次运行，
+            # 那句提示根本渲染不出来（全仓其余 rerun 都是"状态驱动"的，用户
+            # 通过界面变化就能看出成功；这里是表单提交，必须给一句明确反馈）。
+            st.session_state.flash = "已回填。下面的校准结论会跟着更新。"
+            st.rerun()
+        else:
+            st.error("没找到这一场记录，可能已经被删掉了。")
+
+
 def render_history_tab() -> None:
     """历史记录页：跨场趋势 + 维度对比 + 逐场回看 + 删除入口。
 
@@ -2363,6 +2543,49 @@ def render_history_tab() -> None:
         return
 
     st.caption(f"共 {len(records)} 场面试记录，保存在 history.json")
+
+    # -- 结局回填与评分校准 ------------------------------------------------
+    # 分数只能说明"我这几场有没有进步"；要回答"这个分准不准"就必须有真实结局。
+    # 校准结论只做呈现，不反过来改写评分（理由见 _render_outcome_backfill）。
+    cal = calibration.calibrate(records)
+    st.subheader("评分校准")
+    st.caption(
+        "面试评分是一次预测，真实结局才是标签。在下面每一场里回填结局，"
+        "这里就能回答「我的分数准不准、是偏乐观还是偏保守」。"
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("已回填结局", f"{cal['labeled']} / {cal['scored']}")
+    col2.metric("样本（已判定）", cal["decided"], f"另有 {cal['unclear']} 场落在灰区" if cal["unclear"] else None)
+    accuracy = cal["accuracy"]
+    # 准确率的分母是 decided，样本不足时给出百分数会与旁边的「样本还太少」自相矛盾
+    if accuracy is None:
+        col3.metric("评分准确率", "—", "还没有可判定的场次")
+    elif cal["decided"] < calibration.MIN_SAMPLES_FOR_CONCLUSION:
+        col3.metric("评分准确率", "—", f"仅 {cal['decided']} 场可判定，样本不足")
+    else:
+        col3.metric("评分准确率", f"{round(accuracy * 100)}%", f"{cal['hits']} 对 / {cal['misses']} 错")
+    if cal["outcome_counts"]:
+        st.caption(
+            "结局分布："
+            + "；".join(f"{name} {count} 场" for name, count in cal["outcome_counts"].items())
+        )
+    for note in cal["notes"]:
+        st.markdown(f"- {note}")
+    if cal["by_level"]:
+        with st.expander("按难度档看（不同档位的基线不同，分开看才有意义）"):
+            st.dataframe(
+                [
+                    {
+                        "难度档": stats["level"],
+                        "校准场次": stats["samples"],
+                        "通过": stats["positive"],
+                        "被拒": stats["negative"],
+                        "均分": stats["avg_score"] if stats["avg_score"] is not None else "—",
+                    }
+                    for stats in sorted(cal["by_level"].values(), key=lambda s: s["level"])
+                ],
+                hide_index=True,
+            )
 
     # -- 跨场趋势 ---------------------------------------------------------
     series = history_store.trend_series(records)
@@ -2433,13 +2656,24 @@ def render_history_tab() -> None:
     st.subheader("逐场回看")
     for index in range(len(records) - 1, -1, -1):
         record = records[index]
-        with st.expander(history_store.record_label(record)):
+        outcome = calibration.outcome_of(record)
+        label = history_store.record_label(record)
+        # 回填过的场次把结局缀在标题上：一列扫下来就知道哪些还没回填。
+        # 控件 key 用落盘时间而不是下标——删掉一场会让后面所有下标前移，
+        # 用下标做 key 会把上一场填过的结局错显到这一场上。
+        # 但时间戳没有唯一性保证（同一秒内完成两场时会重复），key 里再缀下标
+        # 去重；定位记录仍然只用时间（time_key 与 widget key 是两回事）。
+        widget_prefix = f"hist_{record.get('time') or 'na'}_{index}"
+        with st.expander(f"{label} · {outcome}" if outcome else label):
             st.caption(record.get("level", ""))
             st.json(record.get("evaluation", {}))
+            st.divider()
+            _render_outcome_backfill(record.get("time"), widget_prefix)
             # 删除入口：DESIGN 的隐私应对写了"提供删除入口"，
             # 而落盘的 history.json 里存着完整逐字稿，必须让用户能自己清掉。
             if st.button("删除这一场", key=f"del_record_{index}"):
                 history_store.delete_record(HISTORY_FILE, index)
+                st.session_state.flash = "已删除这一场记录。"
                 st.rerun()
 
     # -- 清空全部 ---------------------------------------------------------
@@ -2454,9 +2688,11 @@ def render_history_tab() -> None:
         if col1.button("确认清空", type="primary"):
             history_store.clear_records(HISTORY_FILE)
             st.session_state.confirm_clear_history = False
+            st.session_state.flash = "已清空全部历史记录。"
             st.rerun()
         if col2.button("取消"):
             st.session_state.confirm_clear_history = False
+            st.session_state.flash = "已取消，记录没有变动。"
             st.rerun()
     else:
         if st.button("清空全部历史记录"):
@@ -2571,6 +2807,16 @@ def render_report() -> None:
                 item for item in (evaluation.get("rubric_check") or []) if isinstance(item, dict)
             ]
             if rubric_check:
+                agg = aggregate_rubric_check(st.session_state.profile or {}, rubric_check)
+                labels = {t["topic"]: t["label"] for t in agg["topics"]}
+                counts = agg["counts"]
+                st.markdown(
+                    f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
+                    f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个。"
+                )
+                if agg["weak"]:
+                    for entry in agg["weak"]:
+                        st.markdown(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
                 with st.expander("考点命中情况（评委判分时对照的要点清单）"):
                     st.caption(
                         "参照是底线不是天花板：清单之外的正确答案同样算分，没命中不等于答错。"
@@ -2579,6 +2825,7 @@ def render_report() -> None:
                         [
                             {
                                 "考点": item.get("topic", ""),
+                                "判定": labels.get(item.get("topic", ""), ""),
                                 "已命中": "；".join(str(x) for x in (item.get("must_hit") or [])),
                                 "遗漏": "；".join(str(x) for x in (item.get("missed") or [])),
                                 "误区": "；".join(str(x) for x in (item.get("errors") or [])),
@@ -2627,6 +2874,17 @@ def render_report() -> None:
 
             if evaluation.get("summary"):
                 st.info(evaluation["summary"])
+
+            # 结局回填：报告看完正好知道这场实际结果，是收集标签最自然的时机。
+            # 回填后历史记录页会把它并进"评分准不准"的校准结论里。
+            if st.session_state.get("record_time"):
+                st.divider()
+                st.subheader("这一场后来怎么样了")
+                st.caption(
+                    "面试评分是一次预测。回填真实结局之后，历史记录页会告诉你"
+                    "你的分数偏乐观还是偏保守。"
+                )
+                _render_outcome_backfill(st.session_state.get("record_time", ""), "report")
 
     with tab2:
         if not coach:
@@ -2744,9 +3002,18 @@ def render_report() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _flush_flash() -> None:
+    """显示上一轮存下的一次性提示。见 init_state 里 "flash" 的说明。"""
+    message = st.session_state.get("flash") or ""
+    if message:
+        st.session_state.flash = ""
+        st.success(message)
+
+
 def main() -> None:
     init_state()
     render_sidebar()
+    _flush_flash()
 
     if st.session_state.error:
         st.error(st.session_state.error)
