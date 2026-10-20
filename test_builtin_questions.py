@@ -26,10 +26,12 @@ class BuiltinFileTest(unittest.TestCase):
         tech = self.data["技术面"]
         self.assertEqual(sorted(tech), sorted(k.MAJORS))
 
-    def test_each_major_has_forty_five(self) -> None:
+    def test_each_major_matches_rubric_count(self) -> None:
+        """自建真题条数必须与考点库一一对应（新增考点后重建真题库）。"""
         for major in k.MAJORS:
             with self.subTest(major=major):
-                self.assertEqual(len(self.data["技术面"][major]), 45)
+                expected = sum(len(names) for names in k.MAJOR_MODEL[major]["topics"].values())
+                self.assertEqual(len(self.data["技术面"][major]), expected)
 
     def test_no_duplicate_questions(self) -> None:
         for major in k.MAJORS:

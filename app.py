@@ -1843,7 +1843,7 @@ def _render_jd_match_section() -> None:
         "目标专业（决定查哪套考点库）",
         MAJORS,
         key="jd_major",
-        help="与「基础配置」里的面试专业互不影响，只决定这次对照用哪个专业的 45 条考点。",
+        help="与「基础配置」里的面试专业互不影响，只决定这次对照查哪个专业的考点库。",
     )
     jd_text = st.text_area(
         "岗位 JD",

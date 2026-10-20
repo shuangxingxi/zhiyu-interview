@@ -3,7 +3,7 @@
 被测对象：JD → 考点/维度映射，以及「练过几条」的聚合。
 这层不调用模型，所以测试全离线；关键钉住三件事：
 
-    1. 维度映射覆盖全部 270 条考点，且具体考点不会被泛化关键词抢走；
+    1. 维度映射覆盖全部 277 条考点，且具体考点不会被泛化关键词抢走；
     2. JD 里的技术词真能对上考点，笼统 JD 不会硬凑（2 字泛词门控）；
     3. 练习情况只统计真正问到过的考点，`本场未问到` 占位行不算。
 
@@ -67,7 +67,7 @@ class TestAnalyzeJd(unittest.TestCase):
         topics = [item["topic"] for item in result["topics"]]
         self.assertIn(TXN_TOPIC, topics[:2])
         self.assertEqual(result["major"], CS)
-        self.assertEqual(result["library_size"], 45)
+        self.assertEqual(result["library_size"], len(RUBRICS[CS]))
 
     def test_evidence_is_quoted_from_jd(self):
         result = self.analyze(BE_JD)
