@@ -1054,14 +1054,20 @@ def rubric_block(
             lines.append("加分项（命中加分，不命中不扣）：" + "；".join(str(x) for x in bonus))
         errors = item.get("common_errors") or []
         if errors:
-            lines.append("常见误区（踩中要扣分并写进 risks）：" + "；".join(str(x) for x in errors))
+            lines.append(
+                "常见误区（踩中要扣分：写进该考点的 errors，并概括进 risks）："
+                + "；".join(str(x) for x in errors)
+            )
         # veto 是条目上的可选标记：标了才渲染这一行，没标就与旧行为完全一致。
         # 它把"误区里最致命的那几条"单独拎出来，让评估官知道踩中它就是该考点不通过，
         # 而不是与其它误区一起当普通扣分项处理。
+        # 措辞要求"原样写进 errors"：判定在代码里做的是子串匹配，
+        # 只要评估官改写成自己的话就会漏判（不能把否决权交给模型自由发挥）。
         veto = _clean_list(item.get("veto"))
         if veto:
             lines.append(
-                "一票否决的误区（踩中即该考点判为不通过，必须写进 risks）："
+                "一票否决的误区（踩中即该考点判为不通过：必须把命中的这一条**原样**"
+                "写进该考点的 errors，并写进 risks）："
                 + "；".join(veto)
             )
         chunks.append("\n".join(lines))
