@@ -22,6 +22,7 @@ import streamlit as st
 import calibration
 import history_store
 import interview_state
+import jd_match
 import mood
 import resume_optimize
 import session_store
@@ -1790,6 +1791,21 @@ def _render_resume_optimize_section(api_key: str) -> None:
                 f"本地统计：{quant['lines']} 行里 {quant['quantified']} 行含量化结果"
                 f"（{quant['ratio']:.0%}）。"
             )
+
+        identity = result.get("identity") or []
+        if identity:
+            st.markdown("**身份与表述核实**")
+            for item in identity:
+                icon = "🔴" if item.get("severity") == "high" else "🟠"
+                st.markdown(f"{icon} {item.get('signal', '')}")
+                st.caption(f"原文：{item.get('quote', '')}")
+                st.caption(f"怎么改：{item.get('advice', '')}")
+
+        formatting = result.get("formatting") or {}
+        if formatting.get("issues"):
+            st.markdown("**格式检查（本地）**")
+            for issue in formatting["issues"]:
+                st.markdown(f"- {issue}")
         _, btn_col = st.columns([3, 1])
         btn_col.download_button(
             "导出优化建议",
@@ -1798,6 +1814,127 @@ def _render_resume_optimize_section(api_key: str) -> None:
             mime="text/markdown",
             use_container_width=True,
         )
+
+
+def _jd_bridge_caption(result: dict) -> None:
+    """库外技术词在其他专业库里有考点时给一条对照提示，不算本专业命中。"""
+    bridges = result.get("bridges") or []
+    if not bridges:
+        return
+    text = "；".join(
+        f"{item.get('token', '')} → {item.get('major', '')}「{item.get('topic', '')}」"
+        for item in bridges
+    )
+    st.caption("这些说法在其他专业库里有相关考点（仅供对照，不算本专业命中）：" + text)
+
+
+def _render_jd_match_section() -> None:
+    """岗位 JD 对照：把招聘要求换算成考点与能力维度（纯本地，不调用模型）。
+
+    与「简历优化」并列、也独立于面试，只回答两件事：这个岗位大概率会问哪些
+    考点、这些考点你已经练过几条。只读历史记录，不写回任何东西。
+    """
+    st.caption(
+        "独立功能：把招聘要求对照到考点库，看看这个岗位会问什么、你已经练过几条。"
+        "纯本地匹配，不调用模型。"
+    )
+
+    st.selectbox(
+        "目标专业（决定查哪套考点库）",
+        MAJORS,
+        key="jd_major",
+        help="与「基础配置」里的面试专业互不影响，只决定这次对照用哪个专业的 45 条考点。",
+    )
+    jd_text = st.text_area(
+        "岗位 JD",
+        key="jd_text",
+        height=150,
+        placeholder=(
+            "粘贴招聘要求。例：负责推荐系统后端开发；熟悉 MySQL 索引优化与慢查询调优；"
+            "了解事务隔离级别；熟悉 TCP/IP 与 HTTP；有 Git 协作经验。"
+        ),
+    )
+
+    if st.button("分析这份 JD", use_container_width=True):
+        if not jd_text.strip():
+            st.warning("先粘贴一段 JD 再分析。")
+        else:
+            with st.spinner("正在对照考点库…"):
+                analyzed = jd_match.analyze_jd(
+                    jd_text,
+                    major=st.session_state.get("jd_major") or MAJORS[0],
+                    records=load_records(),
+                )
+            st.session_state.jd_analysis = {
+                "jd": jd_text,
+                "major": st.session_state.get("jd_major") or MAJORS[0],
+                "result": analyzed,
+            }
+
+    stored = st.session_state.get("jd_analysis") or {}
+    result = stored.get("result") or {}
+    if not result:
+        return
+    if stored.get("jd") and stored["jd"] != jd_text:
+        st.caption("下面是上一份 JD 的结果；改完 JD 请重新点「分析这份 JD」。")
+    current_major = st.session_state.get("jd_major") or MAJORS[0]
+    if stored.get("major") and stored["major"] != current_major:
+        st.caption(
+            f"上次分析用的是「{stored['major']}」；切换专业后请重新分析。"
+        )
+
+    topics = result.get("topics") or []
+    if not topics:
+        st.info(
+            "这份 JD 没对上考点库里的任何考点。可能是写得过于笼统，"
+            "或者方向不在当前专业范围内。"
+        )
+        uncovered = result.get("uncovered") or []
+        if uncovered:
+            st.caption("考点库没有覆盖的说法：" + "、".join(uncovered))
+        _jd_bridge_caption(result)
+        return
+
+    practiced = int(result.get("practiced") or 0)
+    st.markdown(
+        f"**这个岗位大概率会问这些**（命中 {len(topics)} 条，"
+        f"其中你练过 {practiced} 条）"
+    )
+    st.caption(
+        f"本专业 {result.get('library_size', 0)} 条考点里，你练过 "
+        f"{result.get('practiced_total', 0)} 条；最近一次通过 "
+        f"{result.get('passed_total', 0)} 条。"
+    )
+    for item in topics:
+        attempts = int(item.get("attempts") or 0)
+        if attempts:
+            record = (
+                f"练过 {attempts} 次 · 过 {item.get('pass', 0)} / "
+                f"部分 {item.get('partial', 0)} / 没过 {item.get('fail', 0)}"
+            )
+            latest = {"pass": "最近一次通过", "partial": "最近一次部分通过", "fail": "最近一次没过"}
+            if item.get("latest") in latest:
+                record += f"（{latest[item['latest']]}）"
+        else:
+            record = "还没练过"
+        st.markdown(
+            f"- **{item.get('topic', '')}**｜{item.get('dimension', '')}｜{record}"
+        )
+        evidence = item.get("evidence") or []
+        if evidence:
+            st.caption("　JD 依据：" + "；".join(evidence))
+
+    dims = result.get("dimensions") or []
+    if dims:
+        st.caption(
+            "对应的能力维度："
+            + "；".join(f"{item['name']}（{len(item['topics'])} 条）" for item in dims)
+        )
+    uncovered = result.get("uncovered") or []
+    if uncovered:
+        st.caption("JD 里这些说法考点库没有覆盖：" + "、".join(uncovered))
+    _jd_bridge_caption(result)
+    st.caption("依据是 JD 原文与考点名称/要点的字面重合，只能说明「可能问到」，不代表一定会问。")
 
 
 def _render_voice_section() -> None:
@@ -1927,6 +2064,9 @@ def render_sidebar() -> None:
 
         with st.expander("📝 简历优化（独立功能）", expanded=False):
             _render_resume_optimize_section(api_key)
+
+        with st.expander("🧭 岗位 JD 对照（独立功能）", expanded=False):
+            _render_jd_match_section()
 
         with st.expander("🎙️ 语音与动效", expanded=False):
             _render_voice_section()
@@ -2185,6 +2325,19 @@ def build_resume_advice_markdown() -> str:
         add()
         for item in result["checklist"]:
             add(f"- [ ] {item}")
+        add()
+
+    identity = result.get("identity") or []
+    formatting = result.get("formatting") or {}
+    if identity or formatting.get("issues"):
+        add("## 六、身份与格式核对（本地）")
+        add()
+        for item in identity:
+            add(f"- **{item.get('signal', '')}**")
+            add(f"  - 原文：{item.get('quote', '')}")
+            add(f"  - 怎么改：{item.get('advice', '')}")
+        for issue in formatting.get("issues") or []:
+            add(f"- {issue}")
         add()
 
     quant = result.get("quantification") or {}

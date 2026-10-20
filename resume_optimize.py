@@ -25,6 +25,7 @@ MAX_REWRITES = 5
 MAX_MISSING = 6
 MAX_KEYWORDS = 12
 MAX_CHECKLIST = 6
+MAX_IDENTITY = 4
 
 SEVERITIES = ("high", "medium", "low")
 
@@ -166,6 +167,181 @@ def quantification(text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 身份匹配：学生 / 实习生写成「团队负责人」
+#
+# 与上面两组一样是启发式，而且**只提示核实、不判真假**：学生确实可能是班长、
+# 社团负责人、竞赛队长，这些是真事实，拦掉就是误伤。真正容易在面试里当场
+# 穿帮的是实习 / 项目里的领导表述——面试官会追问团队多少人、成员各自负责什么、
+# 你具体做了什么，写大了就露。
+# ---------------------------------------------------------------------------
+
+_INTERN_RE = re.compile(r"实习")
+_STUDENT_RE = re.compile(r"在读|应届|本科|硕士|博士|研究生|大[一二三四]|研[一二三]|在校")
+
+# 出现这些，基本等于在说「我是这个团队的组织者」（团队规模 / 职级头衔）
+_TEAM_SIGNAL_RE = re.compile(
+    r"(?:团队|小组|组员|成员|队伍)\s*\d{1,3}\s*[人名位]?"
+    r"|\d{1,3}\s*[人名]\s*(?:的)?(?:团队|小组|队伍)"
+    r"|负责人|组长|队长|项目经理|主管(?!部门)"
+)
+# 只是在团队里，不是带领团队
+_COLLAB_RE = re.compile(r"协作|配合|参与|协助|加入|团队成员|作为.{0,4}成员")
+# 这一行是不是落在「实习 / 项目」的上下文里（只看前后两行）
+_CONTEXT_RE = re.compile(r"实习|公司|集团|科技|银行|券商|事业部|项目|部门|中心|实验室")
+
+_IDENTITY_ADVICE = (
+    "确认这段是否真是你组织的：面试官会追问团队多少人、成员各自负责什么、"
+    "你具体做了什么，写大了当场就露。如果只是参与其中，改成你实际负责的那部分。"
+)
+
+
+def candidate_identity(text: str) -> str:
+    """粗判候选人身份：`intern` / `student` / `""`（看不出来就不猜）。
+
+    只看全文有没有「实习」「在读」这类词，不做任何推断——它唯一的用途是决定
+    「领导表述算不算可疑」，本身不写进报告。
+    """
+    if _INTERN_RE.search(str(text or "")):
+        return "intern"
+    if _STUDENT_RE.search(str(text or "")):
+        return "student"
+    return ""
+
+
+def identity_risks(text: str) -> list[dict[str, str]]:
+    """检出疑似「角色夸大」的表述：学生 / 实习生却写成团队负责人。
+
+    三个条件同时成立才算（宁可漏报）：
+        1. 全文能看出是实习生或在校生；
+        2. 某一行出现团队规模或职级头衔（「5 人小组」「团队负责人」）；
+        3. 那一行不是在说「我只是团队中的一员」。
+
+    实习 / 项目上下文里的这类表述记 `high`（面试几乎必被追问），其余记 `medium`
+    （可能是真实的班长 / 社团负责人，只提示核实）。
+    """
+    identity = candidate_identity(text)
+    if not identity:
+        return []
+
+    lines = _lines(text)
+    out: list[dict[str, str]] = []
+    for index, line in enumerate(lines):
+        if _COLLAB_RE.search(line):
+            continue
+        signal = _TEAM_SIGNAL_RE.search(line)
+        if not signal:
+            continue
+        near_experience = any(
+            _CONTEXT_RE.search(near) for near in lines[max(0, index - 2) : index + 1]
+        )
+        out.append(
+            {
+                "quote": _text(line)[:80],
+                "signal": (
+                    f"{'实习期内' if identity == 'intern' else '学生简历里'}"
+                    f"出现「{signal.group(0)}」"
+                ),
+                "severity": "high" if near_experience else "medium",
+                "advice": _IDENTITY_ADVICE,
+            }
+        )
+        if len(out) >= MAX_IDENTITY:
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 格式规范：日期写法是否统一、时间区间有没有写反、经历是否倒序
+#
+# 同样只用正则。判不出来的就不报——格式问题宁漏勿扰，误报会让人去改
+# 本来没错的地方。
+# ---------------------------------------------------------------------------
+
+# 一种「年月」写法算一种样式。出现两种以上就提示统一。
+_DATE_STYLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("YYYY.MM", re.compile(r"(?<!\d)20\d{2}\.(?:0?[1-9]|1[0-2])(?!\d)")),
+    ("YYYY-MM", re.compile(r"(?<!\d)20\d{2}-(?:0?[1-9]|1[0-2])(?!\d)")),
+    ("YYYY/MM", re.compile(r"(?<!\d)20\d{2}/(?:0?[1-9]|1[0-2])(?!\d)")),
+    ("YYYY年M月", re.compile(r"20\d{2}\s*年\s*(?:0?[1-9]|1[0-2])\s*月")),
+    (
+        "Mon YYYY",
+        re.compile(
+            r"(?i)(?<![A-Za-z])(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+            r"[a-z]*\.?\s*,?\s*20\d{2}(?!\d)"
+        ),
+    ),
+)
+
+# 一段「起 - 止」。月份限定 1~12，避免把 2021-2025 这类纯年份区间当成月份。
+_YM = r"(20\d{2})\s*[.\-/年]\s*(0?[1-9]|1[0-2])\s*月?"
+_SPAN_RE = re.compile(_YM + r"\s*(?:[-–—~～]|至|到|to)\s*" + _YM, re.IGNORECASE)
+
+# 只拿「像一段经历」的行判断排列顺序：有单位 / 场景词，且不是教育那一行
+_EXPERIENCE_RE = re.compile(
+    r"实习|公司|集团|科技|银行|券商|研究院|研究所|实验室|工作室|事务所|"
+    r"事业部|部门|中心|项目|课题|社团|学生会|委员会|学校|学院|大学|机构"
+)
+_EDUCATION_RE = re.compile(r"本科|硕士|博士|研究生|高中|学士|学历|GPA|绩点")
+
+
+def _month_index(year: str, month: str) -> int:
+    """把「年 + 月」压成一个可比较的整数（月从 0 起，便于反解打印）。"""
+    return int(year) * 12 + int(month) - 1
+
+
+def _format_month(value: int) -> str:
+    """把 `_month_index` 的结果还原成 `2024.06` 的写法。"""
+    return f"{value // 12}.{value % 12 + 1:02d}"
+
+
+def formatting_report(text: str) -> dict[str, Any]:
+    """本地格式检查：日期写法一致性、时间区间起止、经历排列顺序。
+
+    返回 `{"styles": {写法: 次数}, "issues": [给人看的提示]}`。三条都只用正则，
+    判不出来的不报；`issues` 为空只代表没发现问题，不代表一定没问题。
+    """
+    raw = str(text or "")
+
+    styles: dict[str, int] = {}
+    for name, pattern in _DATE_STYLE_RULES:
+        count = len(pattern.findall(raw))
+        if count:
+            styles[name] = count
+
+    issues: list[str] = []
+    if len(styles) >= 2:
+        detail = "、".join(f"{name} ×{count}" for name, count in styles.items())
+        issues.append(
+            f"日期写法不统一，出现 {len(styles)} 种：{detail}。统一成一种，全文保持一致。"
+        )
+
+    reversed_spans = [
+        match.group(0)
+        for match in _SPAN_RE.finditer(raw)
+        if _month_index(*match.group(3, 4)) < _month_index(*match.group(1, 2))
+    ]
+    if reversed_spans:
+        issues.append(
+            "时间区间起止颠倒（结束早于开始）：" + "；".join(reversed_spans[:3]) + "。"
+        )
+
+    entries: list[int] = []
+    for line in _lines(raw):
+        if not _EXPERIENCE_RE.search(line) or _EDUCATION_RE.search(line):
+            continue
+        span = _SPAN_RE.search(line)
+        if span:
+            entries.append(_month_index(*span.group(1, 2)))
+    if len(entries) >= 3 and all(a < b for a, b in zip(entries, entries[1:])):
+        sequence = " → ".join(_format_month(value) for value in entries)
+        issues.append(
+            f"经历疑似按正序排列（旧 → 新）：{sequence}。校招简历通常把最近的经历放最前。"
+        )
+
+    return {"styles": styles, "issues": issues}
+
+
+# ---------------------------------------------------------------------------
 # 收敛模型输出（本功能最要紧的一步：改写必须对得上原文）
 # ---------------------------------------------------------------------------
 
@@ -304,4 +480,7 @@ def normalize_report(data: dict[str, Any] | None, resume_text: str) -> dict[str,
             "missing": missing_sections(resume_text),
         },
         "quantification": quantification(resume_text),
+        # 身份与格式同样是本地算的：模型给的同名字段一律不采信
+        "identity": identity_risks(resume_text),
+        "formatting": formatting_report(resume_text),
     }

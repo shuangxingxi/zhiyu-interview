@@ -311,6 +311,17 @@ class TestNormalizeReport(unittest.TestCase):
         self.assertIn("技能", result["sections"]["present"])
         self.assertNotIn("假的", result["sections"]["present"])
 
+    def test_identity_and_formatting_are_computed_not_taken_from_model(self):
+        # 身份与格式同理：模型给的同名字段一律不采信，只信本地结果
+        data = {
+            "identity": [{"quote": "假的", "signal": "假的"}],
+            "formatting": {"issues": ["假的"]},
+        }
+        result = resume_optimize.normalize_report(data, RESUME)
+        self.assertEqual(result["identity"], [])
+        self.assertEqual(result["formatting"]["issues"], [])
+        self.assertIn("styles", result["formatting"])
+
     def test_tolerates_garbage_input(self):
         for value in (None, {}, {"problems": "不是列表"}, {"rewrites": [1, 2]}):
             with self.subTest(value=value):
@@ -323,6 +334,96 @@ class TestNormalizeReport(unittest.TestCase):
             {"missing": ["补项目", "  ", "补项目", "补技能"]}, RESUME
         )
         self.assertEqual(result["missing"], ["补项目", "补技能"])
+
+
+class TestIdentityRisks(unittest.TestCase):
+    """身份匹配：学生 / 实习生写成团队负责人。只提示核实，不判真假。"""
+
+    INTERN_LEAD = """张三
+电话 13800000000 邮箱 zhangsan@example.com
+
+教育背景
+某某大学 计算机科学与技术 本科 2021-2025
+
+实习经历
+2024.06-2024.09 某互联网公司 后端开发实习生
+主导 5 人小组完成推荐系统重构。
+"""
+
+    STUDENT_LEAD = """李四
+某某大学 本科 在读
+
+社团经历
+担任爱心社负责人，组织 3 人小组完成支教活动。
+"""
+
+    def test_intern_leading_a_team_is_flagged_high(self):
+        risks = resume_optimize.identity_risks(self.INTERN_LEAD)
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["severity"], "high")
+        self.assertIn("主导", risks[0]["quote"])
+        self.assertIn("5 人小组", risks[0]["signal"])
+        self.assertIn("面试官", risks[0]["advice"])
+
+    def test_student_leader_is_only_medium(self):
+        # 学生可能是真的班长 / 社团负责人，只提示核实
+        risks = resume_optimize.identity_risks(self.STUDENT_LEAD)
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["severity"], "medium")
+
+    def test_team_member_wording_is_not_flagged(self):
+        text = "实习经历\n参与 5 人团队的后端开发，负责接口联调。"
+        self.assertEqual(resume_optimize.identity_risks(text), [])
+
+    def test_no_identity_signal_means_no_judgement(self):
+        # 看不出学生 / 实习生身份时不做任何判断，避免误伤社招简历
+        text = "工作经历\n某公司 技术负责人 带领 10 人团队。"
+        self.assertEqual(resume_optimize.identity_risks(text), [])
+
+    def test_plain_responsibility_is_not_flagged(self):
+        self.assertEqual(resume_optimize.identity_risks(RESUME), [])
+
+
+class TestFormattingReport(unittest.TestCase):
+    """格式规范：日期写法、时间区间、经历顺序。全是本地启发式。"""
+
+    def test_mixed_date_styles_are_reported(self):
+        text = "实习 2024.06-2024.09 某公司\n项目 2023年3月-2023年6月"
+        report = resume_optimize.formatting_report(text)
+        self.assertEqual(set(report["styles"]), {"YYYY.MM", "YYYY年M月"})
+        self.assertTrue(any("不统一" in issue for issue in report["issues"]))
+
+    def test_uniform_dates_are_not_reported(self):
+        text = "实习 2024.06-2024.09 某公司\n项目 2023.03-2023.06"
+        report = resume_optimize.formatting_report(text)
+        self.assertEqual(report["styles"], {"YYYY.MM": 4})
+        self.assertEqual(report["issues"], [])
+
+    def test_year_only_range_is_not_a_style(self):
+        # 「2021-2025」是学历起止年份，不是月份写法，不该被算成一种样式
+        report = resume_optimize.formatting_report("某某大学 计算机 本科 2021-2025")
+        self.assertEqual(report["styles"], {})
+
+    def test_reversed_span_is_reported(self):
+        report = resume_optimize.formatting_report("实习 2023.09-2023.06 某公司")
+        self.assertTrue(any("起止颠倒" in issue for issue in report["issues"]))
+
+    def test_ascending_experience_order_is_reported(self):
+        text = "某公司 2022.06-2022.09\n某科技 2023.03-2023.06\n某集团 2023.07-2023.09"
+        report = resume_optimize.formatting_report(text)
+        self.assertTrue(any("正序" in issue for issue in report["issues"]))
+
+    def test_descending_experience_order_is_not_reported(self):
+        text = "某公司 2023.07-2023.09\n某科技 2023.03-2023.06\n某集团 2022.06-2022.09"
+        self.assertEqual(resume_optimize.formatting_report(text)["issues"], [])
+
+    def test_real_resume_has_no_format_issue(self):
+        self.assertEqual(resume_optimize.formatting_report(RESUME)["issues"], [])
+
+    def test_empty_text_is_safe(self):
+        self.assertEqual(
+            resume_optimize.formatting_report(""), {"styles": {}, "issues": []}
+        )
 
 
 class TestResumeReview(unittest.TestCase):
