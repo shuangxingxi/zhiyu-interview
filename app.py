@@ -40,6 +40,7 @@ from avatar import avatar_component
 from knowledge import (
     LEVELS,
     MAJORS,
+    MOOD_FRIENDLY,
     MOOD_MODES,
     MOOD_ORDER,
     SCENES,
@@ -1828,6 +1829,45 @@ def _jd_bridge_caption(result: dict) -> None:
     st.caption("这些说法在其他专业库里有相关考点（仅供对照，不算本专业命中）：" + text)
 
 
+def _start_jd_interview(result: dict) -> None:
+    """按 JD 命中的考点直接开一场技术面。
+
+    做法：先用左侧「基础配置」的场景/难度/主问题数编出常规 profile，再把
+    profile["topics"] 换成 JD 命中的考点——面试官提示词里的「考点参考」就是它，
+    所以本场主问题只从这几条里出，评分仍按（专业, 考点原文）取参照，问评同源。
+
+    刻意不带简历：有简历时面试官会被要求「主问题优先针对简历条目」，与
+    「只围绕 JD 考点」直接冲突；定向练习要的就是这份聚焦。
+    情绪固定友善型：一键开场不能替用户勾「随机/高强度模式」的知情同意。
+    真题支线关闭：真题按专业/档位抽，可能抽到与这份 JD 无关的题，把定向题挤掉。
+    """
+    api_key = st.session_state.get("api_key") or ""
+    if not api_key:
+        return
+    core = st.session_state.get("core_config") or {}
+    profile = build_profile(
+        scene=core.get("scene") or SCENES[1],
+        major=result.get("major") or MAJORS[0],
+        level=core.get("level") or "B",
+        interview_type="技术面",
+        total_rounds=int(core.get("total_rounds") or 5),
+        resume="",
+        strict=False,
+        mood=MOOD_FRIENDLY,
+        avoid_topics=recent_asked_topics(),
+        use_real=False,
+    )
+    profile["deep_dive"] = []
+    profile["topics"] = [
+        str(item.get("topic", "")).strip()
+        for item in (result.get("topics") or [])
+        if str(item.get("topic", "")).strip()
+    ]
+    profile["jd_topics"] = list(profile["topics"])
+    start_interview(profile, api_key)
+    st.rerun()
+
+
 def _render_jd_match_section() -> None:
     """岗位 JD 对照：把招聘要求换算成考点与能力维度（纯本地，不调用模型）。
 
@@ -1935,6 +1975,23 @@ def _render_jd_match_section() -> None:
         st.caption("JD 里这些说法考点库没有覆盖：" + "、".join(uncovered))
     _jd_bridge_caption(result)
     st.caption("依据是 JD 原文与考点名称/要点的字面重合，只能说明「可能问到」，不代表一定会问。")
+
+    st.divider()
+    api_key_ready = bool(st.session_state.get("api_key"))
+    st.caption(
+        f"把这 {len(topics)} 条考点设为下一场的目标（技术面）：专业用「{result.get('major', '')}」，"
+        "场景、难度与主问题数沿用左侧「基础配置」。"
+    )
+    if st.button(
+        f"🎯 用这 {len(topics)} 条考点开一场面试",
+        key="jd_start_interview",
+        disabled=not api_key_ready,
+        use_container_width=True,
+    ):
+        with st.spinner("正在为你开场…"):
+            _start_jd_interview(result)
+    if not api_key_ready:
+        st.caption("填入 API Key 后即可从这里直接开场。")
 
 
 def _render_voice_section() -> None:
@@ -2055,6 +2112,9 @@ def render_sidebar() -> None:
 
         with st.expander("🎯 基础配置", expanded=True):
             config = _render_core_config()
+            # 「JD 对照 → 一键开面试」要和左侧用同一套场景/难度/主问题数，
+            # 而配置控件没有 key、值只活在本次 render 的局部变量里，所以存一份。
+            st.session_state.core_config = config
 
         with st.expander("🎭 面试官情绪", expanded=False):
             mood_ok = _render_mood_section(strict=strict)
@@ -2131,6 +2191,10 @@ def render_interview() -> None:
     profile = st.session_state.profile
 
     render_page_header(profile_summary(profile))
+
+    jd_topics = profile.get("jd_topics") or []
+    if jd_topics:
+        st.caption("本场按岗位 JD 定向出题：" + "、".join(jd_topics))
 
     if st.session_state.get("resume_lost_note"):
         st.warning(
