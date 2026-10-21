@@ -143,6 +143,7 @@ def record_label(record: dict[str, Any]) -> str:
         str(profile.get("major") or ""),
         f"{profile.get('level', '')} 级" if profile.get("level") else "",
         f"{record.get('overall_score', '-')} 分",
+        f"JD 定向 {len(profile['jd_topics'])} 条" if profile.get("jd_topics") else "",
         f"情绪 {profile.get('mood_mode')}" if profile.get("mood_mode") else "",
     ]
     return " · ".join(p for p in parts if p and p.strip())

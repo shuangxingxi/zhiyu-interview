@@ -2444,6 +2444,8 @@ def build_report_markdown() -> str:
     add()
     add(f"- 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
     add(f"- 面试配置：{profile_summary(profile)}")
+    if profile.get("jd_topics"):
+        add(f"- JD 定向考点：{'、'.join(profile['jd_topics'])}")
     add(f"- 主问题数量：{profile.get('total_rounds', '-')}")
     if profile.get("mood_mode"):
         add(f"- 面试官情绪模式：{profile['mood_mode']}")
@@ -2926,6 +2928,10 @@ def render_history_tab() -> None:
 def render_report() -> None:
     render_page_header("本场面试已结束 · 复盘报告")
     st.success(f"面试已结束 · {profile_summary(st.session_state.profile)}")
+
+    jd_topics = st.session_state.profile.get("jd_topics") or []
+    if jd_topics:
+        st.caption("本场为 JD 定向场：" + "、".join(jd_topics))
 
     real_items = [
         item

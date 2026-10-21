@@ -287,6 +287,15 @@ class TestRecordLabel(unittest.TestCase):
         self.assertIn("70 分", label)
         self.assertIn("友善型", label)
 
+    def test_label_marks_jd_directed_session(self):
+        label = history_store.record_label(
+            {
+                "time": "x",
+                "profile": {"major": "计算机科学与技术", "jd_topics": ["A", "B", "C"]},
+            }
+        )
+        self.assertIn("JD 定向 3 条", label)
+
     def test_label_tolerates_missing_fields(self):
         label = history_store.record_label({"time": "x", "profile": {}})
         self.assertIsInstance(label, str)  # 不该抛异常
