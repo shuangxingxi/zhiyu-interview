@@ -18,7 +18,12 @@ class TestVetoData(unittest.TestCase):
 
     def test_all_topics_still_load(self):
         topics = [topic for by_topic in self.rubrics.values() for topic in by_topic.values()]
-        self.assertEqual(len(topics), 277)
+        expected = sum(
+            len(level_topics)
+            for major in knowledge.MAJOR_MODEL.values()
+            for level_topics in major["topics"].values()
+        )
+        self.assertEqual(len(topics), expected)
         self.assertEqual(len(self.rubrics), 6)
 
     def test_veto_batch_covers_every_major(self):
