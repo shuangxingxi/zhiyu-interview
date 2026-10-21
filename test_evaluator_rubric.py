@@ -73,7 +73,7 @@ class TestRubricForFiltering(unittest.TestCase):
         self.assertEqual(knowledge.rubric_for(profile, []), [])
 
     def test_unknown_topic_in_asked_is_skipped(self):
-        # 模型自拟的考点（不在 270 条内）会被安静跳过，不影响其它条目
+        # 模型自拟的考点（不在考点库内）会被安静跳过，不影响其它条目
         profile = make_profile("A")
         asked = [profile["topics"][0], "模型自己编的考点"]
         items = knowledge.rubric_for(profile, asked)
