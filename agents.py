@@ -436,11 +436,16 @@ def _build_avoid_block(profile: dict[str, Any], asked_topics: list[str] | None) 
 
     两个来源合并：本场已经问过的（asked_topics，由 app 逐轮累积），
     以及开新场时从最近几场练习记录里带过来的（profile["avoid_topics"]）。
+
+    例外：`profile["jd_topics"]` 是本场明确要练的考点（JD 定向 / 只练没过的），
+    必须从"不要再问"里剔掉——否则刚练过的考点会被最近几场记录带进 avoid 列表，
+    把本场唯一该问的题目全部排除，定向场直接空转。
     """
+    target = {str(t).strip() for t in (profile.get("jd_topics") or [])}
     seen: list[str] = []
     for topic in list(profile.get("avoid_topics") or []) + list(asked_topics or []):
         text = str(topic).strip()
-        if text and text not in seen:
+        if text and text not in seen and text not in target:
             seen.append(text)
     if not seen:
         return ""

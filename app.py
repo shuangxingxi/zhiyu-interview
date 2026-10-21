@@ -46,6 +46,7 @@ from knowledge import (
     SCENES,
     VERDICT_FAIL,
     VERDICT_PARTIAL,
+    VERDICT_UNKNOWN,
     aggregate_rubric_check,
     build_profile,
     level_labels,
@@ -1868,6 +1869,72 @@ def _start_jd_interview(result: dict) -> None:
     st.rerun()
 
 
+def _jd_progress(profile: dict, rubric_check: list[dict]) -> dict:
+    """本场是 JD 定向场时，把 rubric_check 对回本场目标考点；否则返回空字典。"""
+    jd_topics = [str(t).strip() for t in (profile.get("jd_topics") or []) if str(t).strip()]
+    if not jd_topics:
+        return {}
+    return jd_match.session_progress(jd_topics, rubric_check, profile.get("major", ""))
+
+
+def _render_jd_progress_block(profile: dict, rubric_check: list[dict]) -> None:
+    """JD 定向场的收尾：本场目标考点逐条判定 + 「只练没过的」下一跳。
+
+    这一步把单向的「JD → 面试」补成闭环：练完一场立刻能看到哪几条还没过，
+    并且可以直接把没过的那几条设成下一场的目标。判定与报告页考点级判定同源
+    （knowledge.topic_verdict，含 veto），不再叫模型判一次。
+    """
+    progress = _jd_progress(profile, rubric_check)
+    if not progress.get("total"):
+        return
+    counts = progress["counts"]
+    st.subheader("JD 定向场收尾")
+    st.markdown(
+        f"本场目标 {progress['total']} 条：通过 {progress['passed']} 条，"
+        f"部分通过 {counts[VERDICT_PARTIAL]} 条，不通过 {counts[VERDICT_FAIL]} 条，"
+        f"本场未问到 {counts[VERDICT_UNKNOWN]} 条。"
+    )
+    st.dataframe(
+        [
+            {"考点": item["topic"], "判定": item["label"], "原因": item["reason"]}
+            for item in progress["topics"]
+        ],
+        hide_index=True,
+    )
+
+    remaining = progress["remaining"]
+    if not remaining:
+        st.success(
+            "本场目标考点都过了。回到左侧「岗位 JD 对照」重新分析一次，练习情况会跟着更新。"
+        )
+        return
+    unasked = counts[VERDICT_UNKNOWN]
+    if unasked:
+        note = f"（其中 {unasked} 条本场没问到，也算还没证明）"
+    else:
+        note = ""
+    st.caption(
+        f"还剩 {len(remaining)} 条没过或没考到{note}。点下面的按钮，把它们设成下一场的目标"
+        "（专业用本场的，场景、难度与主问题数沿用左侧「基础配置」）。"
+    )
+    api_key_ready = bool(st.session_state.get("api_key"))
+    if st.button(
+        f"🎯 只练这 {len(remaining)} 条",
+        key="jd_retry_weak",
+        disabled=not api_key_ready,
+        use_container_width=True,
+    ):
+        with st.spinner("正在为你开场…"):
+            _start_jd_interview(
+                {
+                    "major": profile.get("major", ""),
+                    "topics": [{"topic": topic} for topic in remaining],
+                }
+            )
+    if not api_key_ready:
+        st.caption("填入 API Key 后即可从这里直接开场。")
+
+
 def _render_jd_match_section() -> None:
     """岗位 JD 对照：把招聘要求换算成考点与能力维度（纯本地，不调用模型）。
 
@@ -1975,6 +2042,10 @@ def _render_jd_match_section() -> None:
         st.caption("JD 里这些说法考点库没有覆盖：" + "、".join(uncovered))
     _jd_bridge_caption(result)
     st.caption("依据是 JD 原文与考点名称/要点的字面重合，只能说明「可能问到」，不代表一定会问。")
+    st.caption(
+        "练完一场 JD 定向面试后，回到这里再点一次「分析这份 JD」，"
+        "「练过几次 / 过没过」会按最新记录重算。"
+    )
 
     st.divider()
     api_key_ready = bool(st.session_state.get("api_key"))
@@ -2515,12 +2586,30 @@ def build_report_markdown() -> str:
             add()
             add(
                 f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
-                f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个。"
+                f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个，"
+                f"本场未问到 {counts[VERDICT_UNKNOWN]} 个。"
             )
             if agg["weak"]:
                 add()
                 for entry in agg["weak"]:
                     add(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
+            progress = _jd_progress(profile, rubric_check)
+            if progress.get("total"):
+                add()
+                add("### JD 定向场收尾")
+                add()
+                table(
+                    ["考点", "判定", "原因"],
+                    [[i["topic"], i["label"], i["reason"]] for i in progress["topics"]],
+                )
+                if progress["remaining"]:
+                    add(
+                        f"**还剩 {len(progress['remaining'])} 条没过或没考到**："
+                        + "、".join(progress["remaining"])
+                    )
+                else:
+                    add("本场目标考点都通过了。")
+                add()
         resume_check = evaluation.get("resume_check")
         if isinstance(resume_check, dict):
             issues = [x for x in (resume_check.get("issues") or []) if isinstance(x, dict)]
@@ -3035,7 +3124,8 @@ def render_report() -> None:
                 counts = agg["counts"]
                 st.markdown(
                     f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
-                    f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个。"
+                    f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个，"
+                    f"本场未问到 {counts[VERDICT_UNKNOWN]} 个。"
                 )
                 if agg["weak"]:
                     for entry in agg["weak"]:
@@ -3058,6 +3148,7 @@ def render_report() -> None:
                         ],
                         hide_index=True,
                     )
+                _render_jd_progress_block(st.session_state.profile or {}, rubric_check)
 
             resume_check = evaluation.get("resume_check")
             if isinstance(resume_check, dict):

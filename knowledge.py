@@ -1144,6 +1144,12 @@ VERDICT_PARTIAL = "partial"
 VERDICT_FAIL = "fail"
 VERDICT_UNKNOWN = "unknown"
 
+# 评估官按提示词规则（agents.EVALUATOR_SCORE_SYSTEM 规则 4）在没问到的考点上留的占位标记：
+# 新版记录写进 missed（`missed == ["本场未问到"]`），旧版记录只写在 comment 里。
+UNASKED = "本场未问到"
+# 这几种 comment 说明该考点没有留下可用的对照记录，而不是"答不上"。
+_NO_RECORD_MARKERS = (UNASKED, "本场未考察", "无法判分")
+
 # 报告与界面共用这一套中文标签，分档名只在这一处定义。
 VERDICT_LABELS: dict[str, str] = {
     VERDICT_PASS: "通过",
@@ -1167,17 +1173,42 @@ def _veto_of(entry: Any) -> list[str]:
     return _clean_list(entry.get("veto"))
 
 
+def is_unasked(row: Any) -> bool:
+    """这条 rubric_check 是不是「本场没问到」的占位行。
+
+    占位行不能走 topic_verdict：它 `missed` 非空、`must_hit` 为空，会被判成
+    「核心要点一条都没答到」——那是把没考过的考点算成候选人的失败，
+    与 DESIGN「本场没被问到的考点不计入遗漏」直接矛盾。
+
+    两种历史形态都要认：
+      - 新版：`missed == ["本场未问到"]`，comment 写「本场未考察该考点」；
+      - 旧版：missed 填了真实要点，只有 comment 写「本场未问到…」。
+    判据取"没有命中也没有误区 + comment 提到没问到/无法判分"，
+    避免把「问到了但答错」的行走成占位。
+    """
+    if not isinstance(row, dict):
+        return False
+    if _clean_list(row.get("missed")) == [UNASKED]:
+        return True
+    if _clean_list(row.get("must_hit")) or _clean_list(row.get("errors")):
+        return False
+    comment = str(row.get("comment") or "")
+    return any(marker in comment for marker in _NO_RECORD_MARKERS)
+
+
 def topic_verdict(row: Any, veto: list[str] | None = None) -> tuple[str, str]:
     """把一条 rubric_check 升成考点级判定，返回 (verdict, reason)。
 
     分档规则自上而下，先命中的先算：
+        unknown —— 本场没问到 / 没留下可用的对照记录（不计入遗漏，也不算失败）；
         fail    —— 踩中一票否决误区 / 核心要点一条都没答到 / 出现概念错误；
         partial —— 至少答到一条要点，但仍有遗漏；
-        pass    —— 要点全覆盖且没有误区；
-        unknown —— 既没命中也没遗漏，没留下可用的对照记录。
+        pass    —— 要点全覆盖且没有误区。
     """
     if not isinstance(row, dict):
         return VERDICT_UNKNOWN, "该考点没有可用的对照记录"
+    if is_unasked(row):
+        return VERDICT_UNKNOWN, "本场未问到（不计入遗漏）"
     hit = _clean_list(row.get("must_hit"))
     missed = _clean_list(row.get("missed"))
     errors = _clean_list(row.get("errors"))

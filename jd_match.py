@@ -9,6 +9,8 @@
    这是近似映射，不是模型判断，所以结果标注「启发式」。
 3. **练习情况**：读历史记录里 `evaluation.rubric_check`，用与复盘报告同一个
    `knowledge.topic_verdict` 升成考点级判定，回答「这个岗位的考点你答得上几条」。
+   `mastery` 跨场聚合（练过几次），`session_progress` 只看本场（这一场过没过），
+   后者是「JD → 面试 → 报告 → 只练没过的」闭环里报告页那一环。
 
 用法：`analyze_jd(jd_text, major, rubrics=load_rubrics(), records=load_records())`。
 """
@@ -27,7 +29,7 @@ MAX_PER_DIMENSION = 2    # 同一维度最多占几个名额，避免一屏全�
 MIN_SCORE = 3.0          # 总分低于这个分不算命中
 MIN_BEST_IDF = 3.0       # 至少有一个「够稀有」的命中词才算命中，挡住只靠「系统/事务」凑分的
 MAX_EVIDENCE = 3         # 每个考点最多展示几句 JD 原文
-UNASKED = "本场未问到"   # rubric_check 里未问到考点的占位标记
+UNASKED = knowledge.UNASKED   # rubric_check 里未问到考点的占位标记（定义在 knowledge，判定同源）
 
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
 _EN = re.compile(r"[A-Za-z][A-Za-z0-9+#.]*")
@@ -254,8 +256,8 @@ def _bridge_hints(
 def mastery(records: list[dict[str, Any]] | None, major: str) -> dict[str, dict[str, Any]]:
     """按考点聚合历史练习情况。
 
-    只统计**真正问到过**的考点；`missed == ["本场未问到"]` 是占位行，跳过，
-    否则 `topic_verdict` 会把它判成"一条要点都没答到"。
+    只统计**真正问到过**的考点：没问到的占位行（`knowledge.is_unasked`，新旧两种形态）
+    直接跳过，否则 `topic_verdict` 会把它判成"一条要点都没答到"，把没考过的算成没过。
     """
     stats: dict[str, dict[str, Any]] = {}
     for record in records or []:
@@ -267,8 +269,7 @@ def mastery(records: list[dict[str, Any]] | None, major: str) -> dict[str, dict[
             if not isinstance(row, dict):
                 continue
             topic = str(row.get("topic") or "").strip()
-            missed = [str(item).strip() for item in (row.get("missed") or [])]
-            if not topic or missed == [UNASKED]:
+            if not topic or knowledge.is_unasked(row):
                 continue
             rubric = knowledge.rubric_for_topic({"major": major}, topic)
             if not isinstance(rubric, dict):
@@ -295,6 +296,82 @@ def mastery(records: list[dict[str, Any]] | None, major: str) -> dict[str, dict[
                 entry["time"] = when
                 entry["latest"] = key
     return stats
+
+
+def session_progress(
+    topics: list[str] | None,
+    rows: Any,
+    major: str,
+    rubrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """本场 JD 定向考点逐条判定：这一场下来过了哪几条、还差哪几条。
+
+    与 mastery 的分工：mastery 跨场次聚合（回答"练过几次"），这里只看**这一场**
+    的 rubric_check（回答"这一场过没过"），是「JD 对照 → 面试 → 报告 → 再练」
+    这条闭环里报告页那一环。
+
+    判定复用 knowledge.topic_verdict（与复盘报告同一套规则，含 veto），
+    不重新叫模型判一次。没问到 / 没有对应行的考点记 unknown 而不是 fail——
+    没考过不等于答不上来。
+
+    返回 `topics`（逐条 {topic, verdict, label, reason}）、`counts`、`total`、
+    `passed`、`asked`（真正考到的条数）、`remaining`（还没通过的考点原文）。
+    """
+    if rubrics is None:
+        rubrics = knowledge.load_rubrics()
+    library = rubrics.get(major) if isinstance(rubrics, dict) else None
+    by_topic = library if isinstance(library, dict) else {}
+
+    by_row: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("topic") or "").strip()
+        if name and name not in by_row:
+            by_row[name] = row
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in topics or []:
+        topic = str(raw or "").strip()
+        if not topic or topic in seen:
+            continue
+        seen.add(topic)
+        row = by_row.get(topic)
+        if row is None:
+            verdict, reason = knowledge.VERDICT_UNKNOWN, "本场没有留下这个考点的判定"
+        else:
+            entry = by_topic.get(topic)
+            veto = entry.get("veto") if isinstance(entry, dict) else None
+            verdict, reason = knowledge.topic_verdict(
+                row, veto if isinstance(veto, list) else None
+            )
+        items.append(
+            {
+                "topic": topic,
+                "verdict": verdict,
+                "label": knowledge.VERDICT_LABELS.get(verdict, verdict),
+                "reason": reason,
+            }
+        )
+
+    counts = {
+        knowledge.VERDICT_PASS: 0,
+        knowledge.VERDICT_PARTIAL: 0,
+        knowledge.VERDICT_FAIL: 0,
+        knowledge.VERDICT_UNKNOWN: 0,
+    }
+    for item in items:
+        counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
+
+    return {
+        "topics": items,
+        "counts": counts,
+        "total": len(items),
+        "passed": counts[knowledge.VERDICT_PASS],
+        "asked": len(items) - counts[knowledge.VERDICT_UNKNOWN],
+        "remaining": [i["topic"] for i in items if i["verdict"] != knowledge.VERDICT_PASS],
+    }
 
 
 def _empty_result(major: str) -> dict[str, Any]:

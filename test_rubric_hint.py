@@ -170,6 +170,27 @@ class TestCurrentTopic(unittest.TestCase):
         self.assertEqual(agents._current_topic(["", "   "]), "")
 
 
+class TestAvoidBlockExemptsJdTopics(unittest.TestCase):
+    """JD 定向场要练的考点不能被「已经考过」段落排除掉。"""
+
+    def test_jd_topic_is_not_in_avoid_block(self):
+        profile = make_profile(
+            avoid_topics=[REAL_TOPIC, "另一个考过的考点"],
+            jd_topics=[REAL_TOPIC],
+        )
+        block = agents._build_avoid_block(profile, [])
+        self.assertNotIn(REAL_TOPIC, block)
+        self.assertIn("另一个考过的考点", block)
+
+    def test_all_avoided_returns_empty(self):
+        profile = make_profile(avoid_topics=[REAL_TOPIC], jd_topics=[REAL_TOPIC])
+        self.assertEqual(agents._build_avoid_block(profile, [REAL_TOPIC]), "")
+
+    def test_regular_session_still_avoids(self):
+        profile = make_profile(avoid_topics=[REAL_TOPIC])
+        self.assertIn(REAL_TOPIC, agents._build_avoid_block(profile, []))
+
+
 class TestInjectionIntoInterviewerPrompt(unittest.TestCase):
     """端到端：参照要真的进到面试官的系统提示词里。"""
 

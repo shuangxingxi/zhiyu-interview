@@ -219,5 +219,80 @@ class TestBridgeHints(unittest.TestCase):
         self.assertEqual(result["bridges"], [])
 
 
+class TestSessionProgress(unittest.TestCase):
+    """JD 定向场收尾：只看本场，没问到不算没过。"""
+
+    def rubric(self):
+        return knowledge.rubric_for_topic({"major": CS}, TXN_TOPIC)
+
+    def pass_row(self):
+        return {
+            "topic": TXN_TOPIC,
+            "must_hit": list(self.rubric()["must_hit"]),
+            "missed": [],
+            "errors": [],
+            "comment": "答到了要点",
+        }
+
+    def test_pass_and_unasked_split(self):
+        progress = jd_match.session_progress(
+            [TXN_TOPIC, "从输入 URL 到页面响应的全链路"],
+            [self.pass_row()],
+            CS,
+            rubrics=RUBRICS,
+        )
+        self.assertEqual(progress["total"], 2)
+        self.assertEqual(progress["passed"], 1)
+        self.assertEqual(progress["asked"], 1)
+        self.assertEqual(progress["counts"][knowledge.VERDICT_UNKNOWN], 1)
+        # 没考过的考点同样进待练清单：JD 说这个岗位会问，而这一场没能证明你会
+        self.assertEqual(progress["remaining"], ["从输入 URL 到页面响应的全链路"])
+
+    def test_unasked_placeholder_is_not_a_failure(self):
+        row = {
+            "topic": TXN_TOPIC,
+            "must_hit": [],
+            "missed": ["本场未问到"],
+            "errors": [],
+            "comment": "本场未考察该考点",
+        }
+        progress = jd_match.session_progress([TXN_TOPIC], [row], CS, rubrics=RUBRICS)
+        self.assertEqual(progress["counts"][knowledge.VERDICT_FAIL], 0)
+        self.assertEqual(progress["counts"][knowledge.VERDICT_UNKNOWN], 1)
+        self.assertEqual(progress["asked"], 0)
+
+    def test_legacy_unasked_row_is_not_a_failure(self):
+        """旧记录把真实要点填进 missed，只在 comment 里写没问到。"""
+        row = {
+            "topic": TXN_TOPIC,
+            "must_hit": [],
+            "missed": list(self.rubric()["must_hit"]),
+            "errors": [],
+            "comment": "本场未问到该考点。",
+        }
+        progress = jd_match.session_progress([TXN_TOPIC], [row], CS, rubrics=RUBRICS)
+        self.assertEqual(progress["counts"][knowledge.VERDICT_FAIL], 0)
+        self.assertEqual(progress["counts"][knowledge.VERDICT_UNKNOWN], 1)
+
+    def test_veto_fails_the_topic(self):
+        veto = self.rubric().get("veto") or []
+        self.assertTrue(veto, "这个考点应当已标 veto")
+        row = {
+            "topic": TXN_TOPIC,
+            "must_hit": list(self.rubric()["must_hit"]),
+            "missed": [],
+            "errors": [veto[0]],
+            "comment": "踩中一票否决误区",
+        }
+        progress = jd_match.session_progress([TXN_TOPIC], [row], CS, rubrics=RUBRICS)
+        self.assertEqual(progress["counts"][knowledge.VERDICT_FAIL], 1)
+        self.assertEqual(progress["remaining"], [TXN_TOPIC])
+
+    def test_empty_targets_return_empty(self):
+        progress = jd_match.session_progress([], [self.pass_row()], CS, rubrics=RUBRICS)
+        self.assertEqual(progress["total"], 0)
+        self.assertEqual(progress["remaining"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

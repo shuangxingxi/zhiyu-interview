@@ -108,5 +108,47 @@ class TestVetoRoundTrip(unittest.TestCase):
         self.assertNotIn("一票否决", agg["topics"][0]["reason"])
 
 
+class TestUnaskedRows(unittest.TestCase):
+    """没问到的考点不能算成「一条要点都没答到」。"""
+
+    def profile(self):
+        return {"major": "计算机科学与技术"}
+
+    def test_new_style_placeholder_is_unknown(self):
+        row = {
+            "topic": "事务隔离级别与 MVCC 的实现原理",
+            "must_hit": [],
+            "missed": ["本场未问到"],
+            "errors": [],
+            "comment": "本场未考察该考点",
+        }
+        agg = knowledge.aggregate_rubric_check(self.profile(), [row])
+        self.assertEqual(agg["topics"][0]["verdict"], knowledge.VERDICT_UNKNOWN)
+        self.assertEqual(agg["counts"][knowledge.VERDICT_FAIL], 0)
+        self.assertEqual(agg["weak"], [])
+
+    def test_legacy_placeholder_is_unknown(self):
+        row = {
+            "topic": "事务隔离级别与 MVCC 的实现原理",
+            "must_hit": [],
+            "missed": ["理解 MVCC 快照读与当前读的区别"],
+            "errors": [],
+            "comment": "本场未问到该考点。",
+        }
+        agg = knowledge.aggregate_rubric_check(self.profile(), [row])
+        self.assertEqual(agg["topics"][0]["verdict"], knowledge.VERDICT_UNKNOWN)
+
+    def test_asked_but_unanswered_stays_fail(self):
+        row = {
+            "topic": "事务隔离级别与 MVCC 的实现原理",
+            "must_hit": [],
+            "missed": ["理解 MVCC 快照读与当前读的区别"],
+            "errors": [],
+            "comment": "候选人没有回答",
+        }
+        agg = knowledge.aggregate_rubric_check(self.profile(), [row])
+        self.assertEqual(agg["topics"][0]["verdict"], knowledge.VERDICT_FAIL)
+
+
 if __name__ == "__main__":
     unittest.main()
