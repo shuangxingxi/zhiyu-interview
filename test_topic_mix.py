@@ -159,5 +159,37 @@ class TestRealQuestionSampling(unittest.TestCase):
             self.assertLessEqual(len(profile["real_questions"]), quota)
 
 
+class TestProbeDepth(unittest.TestCase):
+    """追问深度也归难度档管：A 追到原理层、B 问到关键处、C 问到概念层就换题。
+
+    钉住的是「难度档真的改了追问上限」，而不只是改了提示词里的一句话。
+    """
+
+    def test_caps_differ_by_level(self):
+        self.assertEqual(k.build_profile("应届生校招", CS, "A", "技术面", 5)["max_probes"], 4)
+        self.assertEqual(k.build_profile("应届生校招", CS, "B", "技术面", 5)["max_probes"], 3)
+        self.assertEqual(k.build_profile("应届生校招", CS, "C", "技术面", 5)["max_probes"], 2)
+
+    def test_strict_mode_flattens_every_level_to_two(self):
+        """严格模式要的是每场节奏一致，不能因为选了 A 档就变慢。"""
+        for level in k.LEVELS:
+            with self.subTest(level=level):
+                profile = k.build_profile(
+                    "应届生校招", CS, level, "技术面", 5, strict=True
+                )
+                self.assertEqual(profile["max_probes"], k.MAX_PROBES_STRICT)
+
+    def test_level_style_text_matches_the_cap(self):
+        """提示词里的次数必须和代码里的上限一致，否则模型会按文字多追问。"""
+        for level, cap in k.LEVEL_PROBE_CAP.items():
+            with self.subTest(level=level):
+                self.assertIn(f"最多 {cap} 次", k.LEVEL_STYLE[level]["probe_style"])
+
+    def test_behavior_interview_still_gets_a_cap(self):
+        """行为面没有档位配比，但追问上限仍按难度档走。"""
+        profile = k.build_profile("应届生校招", CS, "A", "行为面", 5)
+        self.assertEqual(profile["max_probes"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()

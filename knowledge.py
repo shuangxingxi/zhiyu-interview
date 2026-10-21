@@ -32,11 +32,18 @@ MAJORS = [
 LEVELS = ["A", "B", "C"]
 
 # 面试官的节奏控制（对应 DESIGN.md 第五节）
-# 追问上限不写死在决策代码里，而是随模式一起编译进配置：
+# 追问上限不写死在决策代码里，而是随配置一起编译进面试官配置：
+#   难度档 —— 决定这道题值得问多深（见 LEVEL_PROBE_CAP）
 #   严格模式 —— 每场节奏一致，录演示视频时可控
 #   真人模式 —— 上限只当"保险丝"，正常情况让模型自己判断该不该继续深挖
 MAX_PROBES_STRICT = 2
 MAX_PROBES_HUMAN = 3
+
+# 难度档决定「这道题值得问多深」——这是硬约束，代码按次数掐断：
+#   A 档追到原理层，B 档问到关键处，C 档问到概念层就换题。
+# LEVEL_STYLE 里的 probe_style 只是给面试官的语气提示，真正落地的是这张表。
+LEVEL_PROBE_CAP: dict[str, int] = {"A": 4, "B": MAX_PROBES_HUMAN, "C": 2}
+
 # 连续几次"不提问回合"（复述确认 / 澄清 / 简短反馈）之后必须重新提问
 MAX_REFLECTS_IN_A_ROW = 2
 
@@ -56,17 +63,17 @@ SCENE_FOCUS: dict[str, str] = {
 LEVEL_STYLE: dict[str, dict[str, str]] = {
     "A": {
         "depth": "底层原理、推导过程、跨知识点拓展",
-        "probe_style": "连续深挖，直到答到原理层",
+        "probe_style": "连续深挖，直到答到原理层（最多 4 次）",
         "strictness": "严格，对「大概」「应该」这类模糊表述不放过",
     },
     "B": {
         "depth": "核心考点 + 少量拓展",
-        "probe_style": "在关键处追问 1-2 次",
+        "probe_style": "在关键处追问（最多 3 次）",
         "strictness": "标准要求，答对主干即可",
     },
     "C": {
         "depth": "教材概念与应用实操",
-        "probe_style": "追问从简，问到概念层即可",
+        "probe_style": "追问从简，问到概念层即可（最多 2 次）",
         "strictness": "对应届生放宽，以鼓励和纠错为主",
     },
 }
@@ -189,6 +196,17 @@ def topic_mix_quotas(level: str, total: int) -> dict[str, int]:
     """
     weights = LEVEL_TOPIC_MIX.get(level, LEVEL_TOPIC_MIX["B"])
     return _largest_remainder(weights, total)
+
+
+def _probe_cap(level: str, strict: bool) -> int:
+    """追问上限：难度档决定问多深，严格模式再收紧。
+
+    两条轴叠在一起时严格模式优先（取 min）：录演示要求每场节奏一致，
+    A 档也不能例外；但真人模式下 A 档该有 4 次就得给 4 次，不能被
+    严格模式的 2 次顺手压掉——那会让 A 档和 B 档的追问深度完全一样。
+    """
+    cap = LEVEL_PROBE_CAP.get(level, MAX_PROBES_HUMAN)
+    return min(cap, MAX_PROBES_STRICT) if strict else cap
 
 
 def topic_pool_size(total_rounds: int) -> int:
@@ -791,7 +809,11 @@ def build_profile(
         # 开新场时从最近几场练习带过来的考点，交给面试官去重（本场已问的在 app 侧累积）
         "avoid_topics": [str(t).strip() for t in (avoid_topics or []) if str(t).strip()],
         "strict": bool(strict),
-        "max_probes": MAX_PROBES_STRICT if strict else MAX_PROBES_HUMAN,
+        # 追问上限 = 难度档给的深度上限（A 4 次 / B 3 次 / C 2 次）。
+        # 严格模式再压到 2 次：录演示要求每场节奏一致，这个前提不能被难度轴破坏；
+        # 所以严格模式取 min，而真人模式直接用档位上限——两者不能混成一个 min，
+        # 否则 A 档在真人模式下也会被压回 3 次，A 档就白设了。
+        "max_probes": _probe_cap(level, strict),
         "allow_reflect": not strict,
         # 情绪这条轴：请求的模式、实际生效的模式、以及开局状态
         "mood_requested": requested,

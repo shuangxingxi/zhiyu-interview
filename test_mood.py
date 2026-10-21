@@ -262,7 +262,33 @@ class TestEffectiveMaxProbes(unittest.TestCase):
             with self.subTest(patience=patience):
                 state = mood.initial(patience=patience)
                 self.assertGreaterEqual(mood.effective_max_probes(low, state), 1)
-                self.assertLessEqual(mood.effective_max_probes(high, state), 4)
+                self.assertLessEqual(mood.effective_max_probes(high, state), mood.PROBES_MAX)
+
+    def test_mood_lifts_by_at_most_one_over_the_level_baseline(self):
+        """难度档已经把基线拉开了，情绪不能把它抹平。
+
+        C 档基线是 2 次（问到概念层就换题），若耐心值高时能追到 4 次，
+        等于 A 档和 C 档的追问深度又一样了——这正是这条天花板要挡住的。
+        """
+        for base in (2, 3, 4):
+            with self.subTest(base=base):
+                profile = make_profile(strict=False, max_probes=base)
+                cap = max(
+                    mood.effective_max_probes(profile, mood.initial(patience=p))
+                    for p in range(0, mood.PATIENCE_MAX + 1)
+                )
+                self.assertLessEqual(cap, min(base + 1, mood.PROBES_MAX))
+
+    def test_a_level_asks_deeper_than_c_level(self):
+        """A 档最耐心时要比 C 档最耐心时问得深，否则难度轴对深度就没影响。"""
+        patience = mood.PATIENCE_MAX
+        deep = mood.effective_max_probes(
+            make_profile(strict=False, max_probes=4), mood.initial(patience=patience)
+        )
+        shallow = mood.effective_max_probes(
+            make_profile(strict=False, max_probes=2), mood.initial(patience=patience)
+        )
+        self.assertGreater(deep, shallow)
 
     def test_missing_max_probes_defaults(self):
         self.assertIsInstance(mood.effective_max_probes({}, mood.initial()), int)

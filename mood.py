@@ -25,6 +25,9 @@ PATIENCE_MAX = 3
 ENERGY_MAX = 2
 PRESSURE_MAX = 2
 
+# 追问上限的绝对天花板（难度档 A 档即取满），情绪最多在档位基线上加一次。
+PROBES_MAX = 4
+
 # 量化信号：出现这些说明候选人在用事实说话，面试官会更耐心。
 # 刻意不收「有个数字就算」，也不收光秃秃的 "QPS" ——「大概是 2019 年」「几百 QPS」
 # 这类没有具体数值的说法不算量化成果，必须数字和单位一起出现。
@@ -155,13 +158,19 @@ def effective_max_probes(profile: dict[str, Any], state: dict[str, Any]) -> int:
     """情绪调制后的追问上限。
 
     不耐烦的面试官会更快放弃这道题，耐心的愿意多给一次机会。
-    但上限的最终裁决权仍在代码手里：夹在 1~4 之间，且严格模式下一律用配置里的固定值，
+    但上限的最终裁决权仍在代码手里：严格模式下一律用配置里的固定值，
     保证"录演示视频时每场节奏一致"这个前提不被情绪轴破坏。
+
+    情绪最多在档位基线上加一次（base + 1），且不超过 PROBES_MAX。
+    加这条天花板是因为难度档已经把基线拉开了（A 4 / B 3 / C 2）：
+    不封顶的话，耐心值高的 C 档也能追到 4 次，等于把「C 档问到概念层就换题」
+    这个设定抹掉，两条轴又绞在一起了。
     """
     base = int(profile.get("max_probes") or 2)
     if profile.get("strict"):
         return base
-    return _clamp(base + int(state.get("patience", 2)) - 1, 1, 4)
+    ceiling = min(PROBES_MAX, base + 1)
+    return _clamp(base + int(state.get("patience", 2)) - 1, 1, ceiling)
 
 
 def summarize(trace: list[dict[str, Any]], mode_label: str = "") -> str:
