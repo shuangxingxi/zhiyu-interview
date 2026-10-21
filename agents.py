@@ -41,6 +41,7 @@ from knowledge import (
     resume_evidence_block,
     rubric_block,
     rubric_hint_block,
+    topic_mix_block,
 )
 from mood import describe as describe_mood, effective_max_probes
 import advice
@@ -342,8 +343,9 @@ INTERVIEWER_SYSTEM = """你叫「知遇」，是一位真实的面试官，正�
 【本场能力维度】（提问要覆盖这些维度，但不要在对话里念出维度名称）
 {dimensions}
 
-【高频考点参考】（只是方向参考，严禁照抄照念）
+【高频考点参考】（只是方向参考，严禁照抄照念；括号里是内部档位）
 {reference}
+{mix_block}
 
 【候选人自述背景】
 {candidate_bg}
@@ -540,6 +542,7 @@ def _build_interviewer_system(
         mood_block=mood_block,
         dimensions="\n".join(f"- {d}" for d in profile.get("dimensions", [])),
         reference=reference_for(profile),
+        mix_block=topic_mix_block(profile),
         candidate_bg=profile.get("candidate_bg", ""),
         context_blocks=context_blocks,
         real_rule=real_rule,

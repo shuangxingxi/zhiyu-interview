@@ -71,6 +71,24 @@ LEVEL_STYLE: dict[str, dict[str, str]] = {
     },
 }
 
+# 难度档决定的是「三档题各占多少」，不是「只出这一档」：
+#   A 档（一线大厂 / 985）以高难题为主，但要掺中档和少量基础题——
+#     整场全是高难题不像面试，像刁难，也测不出基础是否扎实；
+#   B 档（中型公司 / 211）以中档为主，两端各掺一点；
+#   C 档（中小企业 / 双非）以基础题为主、掺中档，不出高难题。
+# 三档权重之和为 1；具体条数由 topic_mix_quotas 用最大余数法分配。
+LEVEL_TOPIC_MIX: dict[str, dict[str, float]] = {
+    "A": {"A": 0.6, "B": 0.3, "C": 0.1},
+    "B": {"A": 0.2, "B": 0.6, "C": 0.2},
+    "C": {"A": 0.0, "B": 0.3, "C": 0.7},
+}
+
+# 三档在提示词里的中文叫法。只给面试官排题用，明令不许对候选人提起。
+TIER_LABELS: dict[str, str] = {"A": "高难", "B": "中等", "C": "基础"}
+
+# 考点池最少条数：池子太小，同一档的每一场都会问到同一批题。
+MIN_TOPIC_POOL = 12
+
 # ---------------------------------------------------------------------------
 # 情绪：决定"用什么态度问"，与难度正交的第二条轴
 #
@@ -141,6 +159,88 @@ _LEVEL_LABELS: dict[str, dict[str, str]] = {
 def level_labels(scene: str) -> dict[str, str]:
     """难度档在不同场景下的叫法。考研看院校，求职看企业梯度。"""
     return _LEVEL_LABELS["考研复试" if scene == "考研复试" else "求职"]
+
+
+def _largest_remainder(weights: dict[str, float], total: int) -> dict[str, int]:
+    """最大余数法：把 total 按权重分成整数份，保证三份之和恰好等于 total。
+
+    先按 floor 取整，剩下的名额按小数部分从大到小补；小数部分相同时按
+    A→B→C 的顺序补，保证同样的输入永远得到同样的配比（可复算、可写测试）。
+    """
+    if total <= 0:
+        return {tier: 0 for tier in LEVELS}
+    exact = {tier: max(0.0, float(weights.get(tier, 0.0))) * total for tier in LEVELS}
+    quotas = {tier: int(exact[tier]) for tier in LEVELS}
+    leftover = int(total) - sum(quotas.values())
+    order = sorted(LEVELS, key=lambda tier: (-(exact[tier] - quotas[tier]), LEVELS.index(tier)))
+    for tier in order:
+        if leftover <= 0:
+            break
+        quotas[tier] += 1
+        leftover -= 1
+    return quotas
+
+
+def topic_mix_quotas(level: str, total: int) -> dict[str, int]:
+    """本场 total 道主问题在 A/B/C 三档上各分几道。
+
+    level 是本次选择的难度档，返回的是「三档题各出几道」的配比，
+    不是「只出这一档」——这正是难度档从"整池切换"改成"权重分布"的落点。
+    """
+    weights = LEVEL_TOPIC_MIX.get(level, LEVEL_TOPIC_MIX["B"])
+    return _largest_remainder(weights, total)
+
+
+def topic_pool_size(total_rounds: int) -> int:
+    """考点池条数：主问题的两倍，且不少于 MIN_TOPIC_POOL。
+
+    池子要明显大于主问题数，面试官才有挑选余地，也才能按配比凑齐三档；
+    但池子又不能太大，否则三档比例会被稀释、提示词也跟着变长。
+    """
+    return max(MIN_TOPIC_POOL, int(total_rounds) * 2)
+
+
+def mixed_topic_pool(
+    model: dict[str, Any], level: str, size: int
+) -> tuple[list[str], dict[str, str]]:
+    """按 LEVEL_TOPIC_MIX 从 A/B/C 三档里混采考点，返回 (考点列表, {考点: 档位})。
+
+    某一档的题不够抽时，缺口按权重从其他档补齐，保证池子条数不缩水；
+    顺序打乱后再交给面试官——若按档位聚堆排列，模型容易只挑最前面那一档。
+    """
+    tiers: dict[str, str] = {}
+    picked: list[str] = []
+    quotas = _largest_remainder(LEVEL_TOPIC_MIX.get(level, LEVEL_TOPIC_MIX["B"]), max(0, int(size)))
+
+    for tier in LEVELS:
+        bucket = [t for t in model["topics"].get(tier, []) if t not in tiers]
+        take = min(int(quotas.get(tier, 0)), len(bucket))
+        if take <= 0:
+            continue
+        chosen = random.sample(bucket, take)
+        picked.extend(chosen)
+        for topic in chosen:
+            tiers[topic] = tier
+
+    # 缺口补齐：某档题不够时，从还有余量的档里按 A→B→C 顺序补足条数
+    if len(picked) < size:
+        rest = [
+            t
+            for tier in LEVELS
+            for t in model["topics"].get(tier, [])
+            if t not in tiers
+        ]
+        need = min(int(size) - len(picked), len(rest))
+        if need > 0:
+            extra = random.sample(rest, need)
+            picked.extend(extra)
+            for topic in extra:
+                tiers[topic] = next(
+                    (tier for tier in LEVELS if topic in model["topics"].get(tier, [])), ""
+                )
+
+    random.shuffle(picked)
+    return picked, tiers
 
 
 # ---------------------------------------------------------------------------
@@ -651,13 +751,15 @@ def build_profile(
     if is_behavior:
         dimensions = list(BEHAVIOR_DIMENSIONS)
         topics = list(BEHAVIOR_TOPICS)
+        topic_tiers: dict[str, str] = {}
+        topic_mix: dict[str, int] = {}
     else:
         model = MAJOR_MODEL.get(major) or MAJOR_MODEL["计算机科学与技术"]
         dimensions = list(model["dimensions"])
-        # 按难度取对应层级的考点；A 档额外带入 B 档，避免问得太悬空
-        topics = list(model["topics"].get(level, model["topics"]["B"]))
-        if level == "A":
-            topics += model["topics"]["B"][:2]
+        # 难度档决定的是三档题的**配比**，不是"只出这一档"：
+        # 池子按 LEVEL_TOPIC_MIX 从高难/中等/基础三档里混采，再交给面试官按配比排题。
+        topics, topic_tiers = mixed_topic_pool(model, level, topic_pool_size(total_rounds))
+        topic_mix = topic_mix_quotas(level, total_rounds)
 
     profile: dict[str, Any] = {
         "scene": scene,
@@ -678,6 +780,11 @@ def build_profile(
         "strictness": style["strictness"],
         "dimensions": dimensions,
         "topics": topics,
+        # 每条考点属于哪一档，以及本场主问题的三档配比：
+        # 前者让面试官知道"这条是高难还是基础"，后者告诉他"各要几道"。
+        # 两者都只用于内部排题，提示词里另有规则禁止向候选人提及档位。
+        "topic_tiers": topic_tiers,
+        "topic_mix": topic_mix,
         # 没有简历时，用通用「经历深挖方向」补足取材：让面试官仍能围绕候选人
         # 自述的岗位目标 / 项目经历 / 技能栈把经历问深，而不是干念专业考点。
         "deep_dive": [] if is_behavior or resume.strip() else list(PROJECT_DEEP_DIVE),
@@ -714,8 +821,44 @@ def build_profile(
 
 
 def reference_for(profile: dict[str, Any]) -> str:
-    """给面试官看的考点参考（严禁照抄照念）。"""
-    return "\n".join(f"- {t}" for t in profile.get("topics", []))
+    """给面试官看的考点参考（严禁照抄照念）。
+
+    每条后面标出它属于哪一档，面试官据此把本场主问题铺成「高难 + 中等 + 基础」
+    的配比，而不是整场死磕同一档。JD 定向场直接覆盖了 topics、没有档位信息，
+    这时退化成纯列表，不会凭空给 JD 考点编档位。
+    """
+    tiers = profile.get("topic_tiers") or {}
+    lines: list[str] = []
+    for topic in profile.get("topics", []):
+        label = TIER_LABELS.get(tiers.get(topic, ""), "")
+        lines.append(f"- {topic}" + (f"（{label}）" if label else ""))
+    return "\n".join(lines)
+
+
+def topic_mix_block(profile: dict[str, Any]) -> str:
+    """把本场三档配比渲染成提示词里的一行；行为面 / JD 定向场返回空串。"""
+    mix = profile.get("topic_mix") or {}
+    total = sum(int(v) for v in mix.values())
+    if total <= 0:
+        return ""
+    parts = [f"{TIER_LABELS[tier]} {int(mix[tier])} 道" for tier in LEVELS if int(mix.get(tier, 0)) > 0]
+    return (
+        f"本场 {total} 道主问题的难度配比：{'、'.join(parts)}（按上面的括号档位挑题）。\n"
+        "档位只是内部排题依据：不要说「这是一道高难题」，也不要提档位、难度等级这些词。"
+    )
+
+
+def topic_tier(major: str, topic: str) -> str:
+    """考点在考点库里属于哪一档（A/B/C）；查不到返回空串。
+
+    报告的「本场实际档位分布」要按**问过的考点**现算，而不是回读 profile 里
+    抽池时的 topic_tiers——问过的那几条才代表这场真正考了什么。
+    """
+    model = MAJOR_MODEL.get(major) or {}
+    for tier in LEVELS:
+        if topic in (model.get("topics", {}).get(tier) or []):
+            return tier
+    return ""
 
 
 _RESUME_HEAD = (
@@ -885,6 +1028,10 @@ def _sample_real_questions(profile: dict[str, Any], quota: int) -> list[dict[str
     """从对应真题池里随机抽定本场素材。
 
     配额再受两个上限约束：池子大小、主问题总数（真题也得占一道主问题）。
+
+    题池带档位信息时（自建真题），按本场难度配比抽——否则 C 档场也会抽到
+    高难题，难度档就只作用在考点池、被真题支线稀释掉。外部真题没有档位字段，
+    不猜它的难度，整体均匀抽，行为与改动前一致。
     """
     if quota <= 0:
         return []
@@ -894,7 +1041,29 @@ def _sample_real_questions(profile: dict[str, Any], quota: int) -> list[dict[str
     size = min(quota, len(pool), int(profile.get("total_rounds", 5)))
     if size <= 0:
         return []
-    return random.sample(pool, size)
+
+    leveled = [item for item in pool if str(item.get("level", "")).strip() in LEVELS]
+    if len(leveled) < len(pool):
+        return random.sample(pool, size)
+
+    weights = LEVEL_TOPIC_MIX.get(str(profile.get("level", "")), LEVEL_TOPIC_MIX["B"])
+    quotas = _largest_remainder(weights, size)
+    picked: list[dict[str, Any]] = []
+    for tier in LEVELS:
+        bucket = [
+            item
+            for item in leveled
+            if str(item.get("level", "")).strip() == tier and item not in picked
+        ]
+        take = min(int(quotas.get(tier, 0)), len(bucket))
+        if take > 0:
+            picked.extend(random.sample(bucket, take))
+
+    # 某档题不够时用剩下的题补齐，保证条数不缩水
+    if len(picked) < size:
+        rest = [item for item in leveled if item not in picked]
+        picked.extend(random.sample(rest, min(size - len(picked), len(rest))))
+    return picked
 
 
 def real_question_block(profile: dict[str, Any]) -> str:

@@ -14,6 +14,7 @@ import hashlib
 import os
 import sys
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from knowledge import (
     MOOD_MODES,
     MOOD_ORDER,
     SCENES,
+    TIER_LABELS,
     VERDICT_FAIL,
     VERDICT_PARTIAL,
     VERDICT_UNKNOWN,
@@ -51,6 +53,8 @@ from knowledge import (
     build_profile,
     level_labels,
     profile_summary,
+    topic_mix_quotas,
+    topic_tier,
 )
 from resume import ACCEPTED_TYPES, extract_text
 from voice import (
@@ -1534,6 +1538,22 @@ def _render_core_config() -> dict:
     interview_type = st.radio("面试类型", ["技术面", "行为面"], horizontal=True)
     total_rounds = st.slider("主问题数量", 3, 10, 5)
 
+    # 难度档决定的是三档题的配比，不是「整场只出这一档」：
+    # 这一行把配比摆出来，用户才能看出 A 档不是「全是高难题」。
+    if interview_type == "技术面":
+        mix = topic_mix_quotas(level, total_rounds)
+        parts = [
+            f"{TIER_LABELS[tier]} {mix[tier]} 道"
+            for tier in LEVELS
+            if mix.get(tier, 0) > 0
+        ]
+        st.caption(
+            f"这 {total_rounds} 道主问题的难度配比：{'、'.join(parts)}。"
+            "难度档调的是三档题的权重，不是整场只问同一档。"
+        )
+    else:
+        st.caption("行为面按 STAR 结构出题，难度只影响追问的深度，不改考点。")
+
     return {
         "scene": scene,
         "major": major,
@@ -1865,6 +1885,10 @@ def _start_jd_interview(result: dict) -> None:
         if str(item.get("topic", "")).strip()
     ]
     profile["jd_topics"] = list(profile["topics"])
+    # 本场考点是 JD 命中的原文，不是按难度配比抽的：档位与配比都要清掉，
+    # 否则提示词会给出「高难 3 道、中等 2 道」这种与本场考点对不上的排题指令。
+    profile["topic_tiers"] = {}
+    profile["topic_mix"] = {}
     start_interview(profile, api_key)
     st.rerun()
 
@@ -1875,6 +1899,37 @@ def _jd_progress(profile: dict, rubric_check: list[dict]) -> dict:
     if not jd_topics:
         return {}
     return jd_match.session_progress(jd_topics, rubric_check, profile.get("major", ""))
+
+
+def _tier_distribution_caption(profile: dict, rubric_check: list[dict]) -> str:
+    """本场**实际问到**的考点在 A/B/C 三档上怎么分布，拼成一行 markdown。
+
+    为什么不回读 profile["topic_tiers"]：那是抽池时的构成，不等于这场真问了什么。
+    用问过的考点现算，才能回答「这场到底考了几道高难题」。
+    行为面 / JD 定向场 / 查不到档位时不输出（不编一个「未知」出来凑数）。
+    """
+    asked = [
+        str(row.get("topic", "")).strip()
+        for row in (rubric_check or [])
+        if str(row.get("topic", "")).strip()
+    ]
+    if not asked:
+        return ""
+    major = str(profile.get("major", ""))
+    tiers = [topic_tier(major, topic) for topic in asked]
+    if not any(tiers):
+        return ""
+    counts = Counter(tier for tier in tiers if tier)
+    parts = [
+        f"{TIER_LABELS[tier]} {counts[tier]} 道"
+        for tier in LEVELS
+        if counts.get(tier, 0) > 0
+    ]
+    unknown = len([tier for tier in tiers if not tier])
+    line = f"**本场实际档位分布**：{'、'.join(parts)}"
+    if unknown:
+        line += f"（另有 {unknown} 条考点不在档位表里，未计入）"
+    return line + "。"
 
 
 def _render_jd_progress_block(profile: dict, rubric_check: list[dict]) -> None:
@@ -2593,6 +2648,10 @@ def build_report_markdown() -> str:
                 add()
                 for entry in agg["weak"]:
                     add(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
+            tier_line = _tier_distribution_caption(profile, rubric_check)
+            if tier_line:
+                add()
+                add(tier_line)
             progress = _jd_progress(profile, rubric_check)
             if progress.get("total"):
                 add()
@@ -3130,6 +3189,11 @@ def render_report() -> None:
                 if agg["weak"]:
                     for entry in agg["weak"]:
                         st.markdown(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
+                tier_line = _tier_distribution_caption(
+                    st.session_state.profile or {}, rubric_check
+                )
+                if tier_line:
+                    st.markdown(tier_line)
                 with st.expander("考点命中情况（评委判分时对照的要点清单）"):
                     st.caption(
                         "参照是底线不是天花板：清单之外的正确答案同样算分，没命中不等于答错。"
