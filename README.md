@@ -68,19 +68,22 @@ py -3.12 -m unittest test_calibration -v
 py -3.12 -m unittest test_jd_match -v
 py -3.12 -m unittest test_rubric_veto -v
 py -3.12 -m unittest test_topic_mix -v
+py -3.12 -m unittest test_behavior_rubric -v
+py -3.12 -m unittest test_topic_anchor -v
 ```
 
-16 套共 **487 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
+18 套共 **554 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
 **检索用真件**（真简历、真切片、真跑本地 BM25）。
 
 > 注：`test_session_store` 与 `test_history_store` 依赖 `tempfile` 的清理权限。
 > 在受限沙箱下这两套可能报 `PermissionError`，那是**环境问题**、与代码无关；
-> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 487 例应全部通过。
+> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 554 例应全部通过。
 
 ## 文档导航
 
 | 文档 | 内容 |
 |---|---|
+| [`项目说明.md`](项目说明.md) | **使用与部署说明**：项目介绍、功能一览、**运行环境要求**、安装启动、常见问题（另有同源的 `项目说明.docx`） |
 | [`DESIGN.md`](DESIGN.md) | **权威设计文档**：定位、三级自适应、决策状态机、评估体系、风险与应对 |
 | [`变更清单-v7.md`](变更清单-v7.md) | v7–v16 的逐项改动与**实测验证结论**（含实测发现的缺陷修复；v12 / v13 见 `DESIGN.md` 路线图） |
 | [`知识库考点溯源表.md`](知识库考点溯源表.md) | 318 条考点逐条映射到本科教材章节（v17 新增 48 条见文末附录） |
@@ -105,7 +108,8 @@ AIagent/
 ├── session_store.py    # 会话快照存储（一场一文件 + 原子写）
 ├── history_store.py    # 历史记录存储与统计（趋势 / 维度对比 / 结局回填 / 删除）
 ├── calibration.py      # 评分校准：把「评分」与「真实结局」对照（纯函数，只读不改分）
-├── rubrics.json        # 评分参照库（318 条，与代码分离便于校订）
+├── rubrics.json        # 评分参照库（技术面 6 专业 318 条，与代码分离便于校订）
+├── rubric_behavior.json # 行为面参照库（15 条，不按专业分、单独一个文件）
 ├── real_questions.json # 真实企业真题素材库（含来源署名与许可证）
 ├── real_questions_builtin.json  # 自建真题（补齐 4 个专业）
 ├── notion_sync.py      # 知识库归档到 Notion（干跑 / 推送，非运行时依赖）
@@ -114,13 +118,15 @@ AIagent/
 ├── 知遇AI面试.lnk       # Windows 快捷方式（指向上面的 .bat）
 ├── _build_builtin_questions.py  # 一次性生成器（自建真题库）
 ├── _build_design_docx.py        # 一次性生成器（DESIGN.md → DESIGN.docx）
+├── _build_project_docx.py       # 一次性生成器（项目说明.md → 项目说明.docx）
 ├── vendor/             # 第三方前端库（glasatarjs，MIT；来源与改动见 vendor/README.md）
 ├── requirements.txt    # 运行依赖（streamlit / openai / httpx / PyMuPDF / python-docx / edge-tts）
 ├── .trae/documents/    # v2–v3 的原始实施方案（历史记录，保留原样）
-├── test_*.py           # 16 套离线单测（共 487 个用例）
+├── test_*.py           # 18 套离线单测（共 554 个用例）
+├── 项目说明.md          # 使用与部署说明（运行环境要求 / 安装启动 / 常见问题；另有同源的 .docx）
 ├── DESIGN.md           # 权威设计文档（另有同源的 DESIGN.docx）
 ├── 变更清单-v7.md       # v7–v16 逐文件改动清单
-├── 知识库考点溯源表.md   # 270 条考点 → 教材章节的逐条溯源
+├── 知识库考点溯源表.md   # 318 条考点 → 教材章节的逐条溯源
 └── 真题抽检清单.md      # 外部真题的覆盖范围与人工抽检清单
 ```
 

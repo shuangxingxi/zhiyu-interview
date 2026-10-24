@@ -258,6 +258,12 @@ def mastery(records: list[dict[str, Any]] | None, major: str) -> dict[str, dict[
 
     只统计**真正问到过**的考点：没问到的占位行（`knowledge.is_unasked`，新旧两种形态）
     直接跳过，否则 `topic_verdict` 会把它判成"一条要点都没答到"，把没考过的算成没过。
+
+    另外跳过 `source == "generated"` 的行（v17 起评估官可以为无参照的题现场现拟要点）：
+    那种判定是模型按题面临时写的，没有经过人工核对，不能算"你在这个考点上的历史水平"。
+    现拟行的 topic 本来就不该出现在库里（`knowledge.unanchored_topics` 只返回库外考点），
+    下面 `rubric_for_topic` 查不到也会跳过——但那是**间接**保证，这里显式再挡一道。
+    旧记录没有 `source` 字段，一律按库参照处理。
     """
     stats: dict[str, dict[str, Any]] = {}
     for record in records or []:
@@ -270,6 +276,8 @@ def mastery(records: list[dict[str, Any]] | None, major: str) -> dict[str, dict[
                 continue
             topic = str(row.get("topic") or "").strip()
             if not topic or knowledge.is_unasked(row):
+                continue
+            if str(row.get("source") or "").strip() == "generated":
                 continue
             rubric = knowledge.rubric_for_topic({"major": major}, topic)
             if not isinstance(rubric, dict):

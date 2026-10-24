@@ -37,7 +37,19 @@ ASR_CORRECT_MODEL = "deepseek-flash"
 
 # 单次网络调用的超时（秒）。SDK 默认 600 秒，语音是交互场景，
 # 卡住十分钟不如快速失败——调用方一律有回退路径（回退文字输入 / 原文）。
+#
+# v17 修正：这里原先把「转写」「纠错」「合成」三类调用压成同一个 60 秒，
+# 而 SDK 默认还会自己重试 2 次（max_retries=2），于是一次失败实际要等
+# 3 × 60 = 180 秒。实测（2026-10-24，edge-tts 已被上游 403 封禁）：
+# `voice.synthesize()` 整整卡了 184.6 秒才抛出「两条通道都失败」——
+# 面试官每说一句，界面就冻三分钟。三类调用必须分开给：
+#   · 合成（TTS）—— 说完一句就要出声，25 秒没回来就等于不可用；
+#   · 转写（ASR）—— 用户说完一段话，60 秒可以接受；
+#   · 纠错 —— 交互路径，20 秒，失败由调用方回退原文。
+# 三者一律 `max_retries=0`：重试在这里是负收益，把「失败」变成「长时间卡住」。
 REQUEST_TIMEOUT = 60.0
+TTS_TIMEOUT = 25.0
+CORRECT_TIMEOUT = 20.0
 
 # 音色表：界面下拉显示中文名，底层是 edge-tts 的 voice id
 VOICES: dict[str, str] = {
@@ -160,7 +172,7 @@ def transcribe(audio_bytes: bytes, api_key: str) -> str:
 
     录音由 st.audio_input 产出，本身就是 PCM WAV，和这个接口天然匹配，不需要转码。
     """
-    client = OpenAI(api_key=api_key, base_url=SILICONFLOW_BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=SILICONFLOW_BASE_URL, max_retries=0)
     result = client.audio.transcriptions.create(
         model=ASR_MODEL,
         file=("answer.wav", audio_bytes, "audio/wav"),
@@ -176,7 +188,7 @@ def correct_asr(raw_text: str, question: str, api_key: str) -> str:
     这里借项目已经接入的 DeepSeek 做一次轻量纠错。纠错失败由调用方回退原文，
     因此本函数不负责兜底，出错就抛异常。
     """
-    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL, max_retries=0)
     messages = [
         {
             "role": "system",
@@ -194,7 +206,7 @@ def correct_asr(raw_text: str, question: str, api_key: str) -> str:
         messages=messages,
         temperature=0.0,
         max_tokens=1500,
-        timeout=REQUEST_TIMEOUT,
+        timeout=CORRECT_TIMEOUT,
     )
     corrected = (resp.choices[0].message.content or "").strip()
     return corrected or raw_text
@@ -385,7 +397,9 @@ def _synth_siliconflow(text: str, voice: str, rate: str, api_key: str) -> bytes:
     音色要写成 "模型名:音色名" 的形式（官方要求带模型前缀）；
     语速用 speed 近似 edge-tts 的 rate 百分比（1.0 = 原速）。
     """
-    client = OpenAI(api_key=api_key, base_url=SILICONFLOW_BASE_URL)
+    client = OpenAI(
+        api_key=api_key, base_url=SILICONFLOW_BASE_URL, max_retries=0
+    )
     speed = min(max(1.0 + int(rate.rstrip("%")) / 100.0, 0.25), 4.0)
     result = client.audio.speech.create(
         model=SF_TTS_MODEL,
@@ -393,7 +407,7 @@ def _synth_siliconflow(text: str, voice: str, rate: str, api_key: str) -> bytes:
         input=text,
         response_format="mp3",
         speed=round(speed, 2),
-        timeout=REQUEST_TIMEOUT,
+        timeout=TTS_TIMEOUT,
     )
     return result.content
 

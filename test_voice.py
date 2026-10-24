@@ -4,6 +4,7 @@
 真机合成需要网络，属于 `_verify_live` 那类手动验证的范围。
 """
 
+import types
 import unittest
 
 import voice
@@ -155,6 +156,84 @@ class TestPermanentEdgeError(unittest.TestCase):
     def test_500_is_transient(self):
         # 服务端 5xx 是瞬时故障，值得重试
         self.assertFalse(voice._is_permanent_edge_error(Exception("Invalid response status: 500")))
+
+
+class TestCallTimeouts(unittest.TestCase):
+    """三类语音调用的超时必须分开，且都不许让 SDK 偷偷重试。
+
+    背景（实测 2026-10-24）：三个调用点原先共用 `REQUEST_TIMEOUT = 60`，
+    而 OpenAI SDK 默认 `max_retries=2`，于是一次失败要等 3 × 60 = 180 秒——
+    `voice.synthesize()` 实测卡了 184.6 秒才抛「两条通道都失败」，
+    面试官每说一句界面就冻三分钟。这里把契约钉死。
+    """
+
+    def setUp(self):
+        self._orig = voice.OpenAI
+        self.sink = {}
+
+    def tearDown(self):
+        voice.OpenAI = self._orig
+
+    def _install_fake(self):
+        sink = self.sink
+
+        class _Speech:
+            def create(self, **kwargs):
+                sink["speech"] = kwargs
+                return types.SimpleNamespace(content=b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\x00" * 32)
+
+        class _Transcriptions:
+            def create(self, **kwargs):
+                sink["transcribe"] = kwargs
+                return types.SimpleNamespace(text="转写结果")
+
+        class _Completions:
+            def create(self, **kwargs):
+                sink["chat"] = kwargs
+                return types.SimpleNamespace(
+                    choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="修正后"))]
+                )
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Audio:
+            speech = _Speech()
+            transcriptions = _Transcriptions()
+
+        class _Client:
+            def __init__(self, **kwargs):
+                sink["client"] = kwargs
+                self.audio = _Audio()
+                self.chat = _Chat()
+
+        voice.OpenAI = _Client
+
+    def test_tts_timeout_is_interactive_speed(self):
+        # 合成是「说完一句要出声」，必须明显短于转写，也不能大于 30 秒
+        self.assertLessEqual(voice.TTS_TIMEOUT, 30.0)
+        self.assertLess(voice.TTS_TIMEOUT, voice.REQUEST_TIMEOUT)
+
+    def test_correct_timeout_is_interactive_speed(self):
+        self.assertLessEqual(voice.CORRECT_TIMEOUT, voice.REQUEST_TIMEOUT)
+
+    def test_synth_passes_tts_timeout_and_no_retries(self):
+        self._install_fake()
+        voice._synth_siliconflow("你好", voice.DEFAULT_VOICE, "+0%", "sk-test")
+        self.assertEqual(self.sink["client"].get("max_retries"), 0, "SDK 会自己重试 2 次，必须显式关掉")
+        self.assertEqual(self.sink["speech"]["timeout"], voice.TTS_TIMEOUT)
+
+    def test_transcribe_does_not_retry(self):
+        self._install_fake()
+        voice.transcribe(b"RIFF....WAVE", "sk-test")
+        self.assertEqual(self.sink["client"].get("max_retries"), 0)
+        self.assertEqual(self.sink["transcribe"]["timeout"], voice.REQUEST_TIMEOUT)
+
+    def test_correct_asr_uses_shorter_timeout(self):
+        self._install_fake()
+        voice.correct_asr("负节点是红色的", "红黑树插入", "sk-test")
+        self.assertEqual(self.sink["client"].get("max_retries"), 0)
+        self.assertEqual(self.sink["chat"]["timeout"], voice.CORRECT_TIMEOUT)
 
 
 class TestToneArgs(unittest.TestCase):

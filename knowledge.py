@@ -1147,6 +1147,15 @@ def real_question_block(profile: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 RUBRIC_FILE = Path(__file__).with_name("rubrics.json")
 
+# 行为面参照单独一个文件，**不并进 rubrics.json**，原因有三：
+# 1. rubrics.json 的不变式是「顶层键 = 专业名」，rubric_for / rubric_for_topic /
+#    aggregate_rubric_check / jd_match.analyze_jd 都依赖它（analyze_jd 里
+#    `majors = set(rubrics)`，多出一个非专业键会污染 JD 的合法性判断）；
+# 2. 行为面不按专业分，15 条考点考的是 STAR 结构，与专业无关，
+#    放进六个专业桶里的任何一个都错；
+# 3. 文档口径「6 专业 × 318 条」维持不变，答辩时数字对得上。
+BEHAVIOR_RUBRIC_FILE = Path(__file__).with_name("rubric_behavior.json")
+
 
 def load_rubrics() -> dict[str, Any]:
     """读取评分参照库；文件缺失或损坏都返回空字典，绝不抛异常。"""
@@ -1159,6 +1168,78 @@ def load_rubrics() -> dict[str, Any]:
         print(f"[rubrics] 参照库读取失败，已降级为无参照：{exc}", file=sys.stderr, flush=True)
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def load_behavior_rubrics() -> dict[str, Any]:
+    """读取行为面参照库；同样静默降级，绝不抛异常。
+
+    返回 {考点原文: {must_hit, bonus, common_errors, veto?}}，与 rubrics.json
+    里单个专业桶的结构一致，所以下游（rubric_block / topic_verdict /
+    aggregate_rubric_check）拿到的条目形状完全相同，不需要分支。
+    """
+    try:
+        with BEHAVIOR_RUBRIC_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"[rubrics] 行为面参照库读取失败，已降级为无参照：{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rubric_table(profile: dict[str, Any]) -> dict[str, Any]:
+    """按本场面试类型取对应的参照表（专业桶 or 行为面桶）。
+
+    行为面不按专业检索：15 条考点全部通用，与 profile["major"] 无关。
+    这也是行为面此前**必然零参照**的根因——旧代码一律用
+    `load_rubrics()[major]` 查，而行为面那 15 条从来不在任何专业桶里。
+    """
+    if profile.get("interview_type") == "行为面":
+        return load_behavior_rubrics()
+    table = load_rubrics().get(profile.get("major", ""))
+    return table if isinstance(table, dict) else {}
+
+
+def topic_anchored(profile: dict[str, Any], topic: str) -> bool:
+    """这道题的考点是否真的锚在参照库上（能拿来判分）。
+
+    两个条件**同时**成立才算锚定：
+        ① 在本场考点池里逐字出现 —— 排除模型自拟的名字；
+        ② 参照库里确实有这一条 —— 排除"池里有但库缺"的配置错误。
+
+    为什么必须有第①条：模型自拟的名字偶尔会和库里某条撞上近似形态
+    （例如自拟"索引"，库里是"索引原理与索引失效的常见场景"），按名字查
+    查得到、但对应的是另一道题的要点——这种"错参照"会让报告显示一个
+    看起来正常、实际判错的结论，比没有参照更危险。
+    只认池内逐字出现的名字，模型就没有机会把题硬挂到沾边的考点上。
+    """
+    text = str(topic or "").strip()
+    if not text:
+        return False
+    pool = {str(t).strip() for t in (profile.get("topics") or []) if str(t).strip()}
+    if text not in pool:
+        return False
+    return text in rubric_table(profile)
+
+
+def unanchored_topics(profile: dict[str, Any], asked_topics: list[str] | None) -> list[str]:
+    """本场问到、但没有参照可对照的考点（模型自拟题的主要来源）。
+
+    去重去空，保持首次出现顺序——报告里要按"问的先后"列给候选人看。
+    """
+    result: list[str] = []
+    for topic in asked_topics or []:
+        text = str(topic or "").strip()
+        if not text or text in result:
+            continue
+        if not topic_anchored(profile, text):
+            result.append(text)
+    return result
 
 
 def rubric_for(
@@ -1178,9 +1259,12 @@ def rubric_for(
     传 None 时保留旧行为（返回 profile 全部考点），仅供不掌握逐轮信息的调用方
     使用；传空列表表示"本场确实一个考点都没记录"，此时返回空列表——宁可让
     评估官退回通用标准，也不要凭空塞给它一批没问过的参照。
+
+    行为面走 rubric_table 单独取表：那 15 条不按专业分，此前一律用
+    `load_rubrics()[major]` 查，结果**每一场行为面都必然零参照**。
     """
-    by_topic = load_rubrics().get(profile.get("major", ""))
-    if not isinstance(by_topic, dict):
+    by_topic = rubric_table(profile)
+    if not by_topic:
         return []
 
     if asked_topics is None:
@@ -1213,12 +1297,15 @@ def rubric_for_topic(profile: dict[str, Any], topic: str) -> dict[str, Any] | No
 
     注意这里**不做难度过滤**，与 rubric_for 同理：A 档会带入 B 档的前 2 条考点，
     按难度过滤会漏。
+
+    行为面同样走 rubric_table，否则面试官那一侧也拿不到任何行为面参照，
+    「问的人不知道评的人在看什么」在行为面上会一直成立。
     """
     text = str(topic or "").strip()
     if not text:
         return None
-    by_topic = load_rubrics().get(profile.get("major", ""))
-    if not isinstance(by_topic, dict):
+    by_topic = rubric_table(profile)
+    if not by_topic:
         return None
     entry = by_topic.get(text)
     if not isinstance(entry, dict):
@@ -1311,6 +1398,28 @@ def rubric_block(
             )
         chunks.append("\n".join(lines))
     return "\n\n".join(chunks)
+
+
+def unanchored_block(profile: dict[str, Any], asked_topics: list[str] | None) -> str:
+    """把「本场有、但库里没有参照」的考点单独列给评估官，并交代现拟要求。
+
+    这段是缺陷 2 的第四块。此前遇到这类考点只有两种结局：
+        ① 直接丢弃 —— 报告里考点级判定整段消失，用户不知道为什么；
+        ② 拿锚定考点的参照去套 —— 更糟，报告显示一个看起来正常、实际判错的结论。
+
+    现在的做法是显式点名这些题，让评估官按题面现场现拟 3~5 条要点再判，
+    并在 rubric_check 里用 source 标注来源（现拟的绝不冒充核对过的）。
+    没有任何无参照考点时返回空串，提示词里不留痕迹。
+    """
+    topics = unanchored_topics(profile, asked_topics)
+    if not topics:
+        return ""
+    bullets = "\n".join(f"- {topic}" for topic in topics)
+    return (
+        "【没有参照的题】下面这些考点本场问到了，但参照库里没有对应条目"
+        "（多为面试官结合你的经历临时自拟的题）：\n"
+        f"{bullets}\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1425,20 +1534,26 @@ def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]
     因此参照缺失时聚合照常工作，只是不启用"显式否决"那一档。
 
     返回结构（报告与界面共用）：
-        topics  —— 每个考点的 {topic, verdict, label, reason, missed, errors}
+        topics  —— 每个考点的 {topic, verdict, label, reason, missed, errors, source}
         counts  —— 各判定档的条数（键为 VERDICT_*）
         total / passed / weak —— 考点数、通过数、薄弱考点（不通过 + 部分通过）
+        library / generated —— 判定依据来自库参照 / 现场现拟的条数
+
+    `source` 字段：库里查得到的标 "library"，查不到的标 "generated"。
+    现场现拟的参照由评估官产出（见 EVALUATOR_SCORE_SYSTEM 的现拟规则），
+    判定逻辑与库参照一样（topic_verdict 一视同仁），但报告里必须分区显示——
+    否则答辩时说不清"这条判定依据是你 318 条人工核对过的，还是模型当场编的"。
     """
-    by_topic = load_rubrics().get(profile.get("major", ""))
-    if not isinstance(by_topic, dict):
-        by_topic = {}
+    by_topic = rubric_table(profile)
 
     topics: list[dict[str, Any]] = []
     for row in rows or []:
         if not isinstance(row, dict):
             continue
         topic = str(row.get("topic") or "").strip()
-        verdict, reason = topic_verdict(row, _veto_of(by_topic.get(topic)))
+        entry = by_topic.get(topic)
+        source = "library" if isinstance(entry, dict) else "generated"
+        verdict, reason = topic_verdict(row, _veto_of(entry))
         topics.append(
             {
                 "topic": topic,
@@ -1447,6 +1562,7 @@ def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]
                 "reason": reason,
                 "missed": _clean_list(row.get("missed")),
                 "errors": _clean_list(row.get("errors")),
+                "source": source,
             }
         )
 
@@ -1454,10 +1570,13 @@ def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]
     for item in topics:
         counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
 
+    library = sum(1 for t in topics if t["source"] == "library")
     return {
         "topics": topics,
         "counts": counts,
         "total": len(topics),
         "passed": counts[VERDICT_PASS],
         "weak": [t for t in topics if t["verdict"] in (VERDICT_FAIL, VERDICT_PARTIAL)],
+        "library": library,
+        "generated": len(topics) - library,
     }

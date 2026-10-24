@@ -42,6 +42,7 @@ from knowledge import (
     rubric_block,
     rubric_hint_block,
     topic_mix_block,
+    unanchored_block,
 )
 from mood import describe as describe_mood, effective_max_probes
 import advice
@@ -56,9 +57,22 @@ DEFAULT_MODEL = "deepseek-flash"
 # 会被放大成数倍等待（实测挂过 540 多秒）；这里把 read 超时压到 15 秒。
 # 面试是交互场景，宁可快速失败让用户重试，也不要页面长时间毫无反应。
 FIRST_RESPONSE_TIMEOUT = 15.0
-MODEL_TIMEOUT = httpx.Timeout(
-    connect=10.0, read=FIRST_RESPONSE_TIMEOUT, write=10.0, pool=10.0
-)
+
+# 报告类角色（评估官 / 复盘教练 / 提升建议 / 简历优化）单独放宽。
+# 它们的共同点是"面试结束或点完按钮后一次性跑完"，用户本来就在等结果，
+# 而输出长度是面试官那轮决策的数倍——实测 coach 23.0s、advisor 22.8s、
+# 简历优化 27.5s，用交互路径的 15 秒去卡，等于这三个功能在当前网络下必然失败
+# （连试 6 次 6 次超时）。所以超时必须按角色分，不能一张网卡到底。
+REPORT_RESPONSE_TIMEOUT = 90.0
+
+
+def _timeout(read: float) -> httpx.Timeout:
+    """连接/写入超时统一，只有 read（等模型出字）按角色区分。"""
+    return httpx.Timeout(connect=10.0, read=read, write=10.0, pool=10.0)
+
+
+MODEL_TIMEOUT = _timeout(FIRST_RESPONSE_TIMEOUT)
+REPORT_TIMEOUT = _timeout(REPORT_RESPONSE_TIMEOUT)
 
 # 面试官唯一可用的"工具"：主动查阅简历原文。
 # 刻意用结构化 JSON 字段模拟 tool call，而不切换到 DeepSeek 的 function calling：
@@ -86,13 +100,13 @@ _RECAP_ANSWER_CHARS = 80  # 候选人回答，压缩后保留多少字
 # ---------------------------------------------------------------------------
 
 
-def _client(api_key: str) -> OpenAI:
-    # max_retries=0：超时意味着"服务器没响应"，重试只会让用户的干等再加 15 秒，
+def _client(api_key: str, timeout: httpx.Timeout | None = None) -> OpenAI:
+    # max_retries=0：超时意味着"服务器没响应"，重试只会让用户的干等再加一轮，
     # 不如直接把可读的报错抛给上层。
     return OpenAI(
         api_key=api_key,
         base_url=DEEPSEEK_BASE_URL,
-        timeout=MODEL_TIMEOUT,
+        timeout=timeout or MODEL_TIMEOUT,
         max_retries=0,
     )
 
@@ -167,18 +181,23 @@ def chat_json(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.3,
     attempts: int = 3,
+    timeout: httpx.Timeout | None = None,
 ) -> dict[str, Any]:
     """调用 DeepSeek，要求返回 JSON 并解析成字典。
 
     DeepSeek 偶尔会返回空白内容（finish_reason='stop'，content 全是空格），
     对话轮数变多后更容易出现。这是服务端偶发行为，重试即可恢复，
     所以这里做有限次重试；重试时降低温度让它更"守规矩"。
+
+    `timeout` 缺省走交互路径的 MODEL_TIMEOUT（15 秒）；报告类角色传
+    REPORT_TIMEOUT（90 秒）——它们的输出长度是面试官那轮的数倍。
     """
     last_error: Exception | None = None
+    limit = timeout or MODEL_TIMEOUT
 
     for attempt in range(1, attempts + 1):
         try:
-            response = _client(api_key).chat.completions.create(
+            response = _client(api_key, limit).chat.completions.create(
                 model=model,
                 messages=messages,
                 response_format={"type": "json_object"},
@@ -187,7 +206,7 @@ def chat_json(
         except APITimeoutError as exc:
             # 超时不重试：服务器没响应时再等一轮只是把干等翻倍。
             raise RuntimeError(
-                f"DeepSeek 在 {FIRST_RESPONSE_TIMEOUT:.0f} 秒内没有响应（服务器过载或链路不通）。"
+                f"DeepSeek 在 {limit.read:.0f} 秒内没有响应（服务器过载或链路不通）。"
                 "请稍后重试；若持续如此，可先确认 API 服务是否正常。"
             ) from exc
         choice = response.choices[0]
@@ -237,12 +256,42 @@ def test_connection(api_key: str, model: str = DEFAULT_MODEL) -> str:
     return reply
 
 
-def format_transcript(history: list[dict[str, str]]) -> str:
-    """把对话历史转成「面试官：… / 候选人：…」的纯文本，供评估官和教练阅读。"""
+def format_transcript(
+    history: list[dict[str, Any]], *, tag_topics: bool = False
+) -> str:
+    """把对话历史转成「面试官：… / 候选人：…」的纯文本，供评估官和教练阅读。
+
+    `tag_topics=True` 时每轮面试官发言前会带上**这一轮的考点**（`topic` 字段，
+    由 app 在落历史时写进 assistant 消息）。
+
+    为什么评估官必须带：它此前只拿到一串不带考点的问答，加上一份"本场问到
+    哪些考点"的参照清单，无法知道哪句话属于哪一道题。当本场既有锚定考点、
+    又有自拟题时，它会把自拟题的表现也硬判到锚定考点的要点上——判出来的
+    结论在报告上看不出任何异常。把轮次与考点的对应关系显式交给它，是
+    「现拟参照」能成立的前提。
+
+    为什么教练 / 建议官**不**带（默认 False）：`【考点：…】` 是内部标记，
+    只有评估官的提示词里解释过它。教练和建议官拿到的是给候选人看的建议，
+    看到一堆无解释的标签，轻则当噪音，重则把标签原文抄进建议里
+    （"你在【考点：X】那道题上…"）。这个参数就是为了把两者分开。
+    """
     lines: list[str] = []
     for msg in history:
-        speaker = "面试官" if msg.get("role") == "assistant" else "候选人"
-        lines.append(f"{speaker}：{msg.get('content', '')}")
+        if msg.get("role") == "assistant":
+            head = ""
+            if tag_topics:
+                # 考点优先读消息上的顶层 topic（渲染/导出时可以补写），
+                # 否则回落到决策体里的 topic —— app 落历史时把整份决策存在 decision，
+                # 绝大多数记录只有这一个来源。
+                topic = str(msg.get("topic") or "").strip()
+                if not topic:
+                    decision = msg.get("decision")
+                    if isinstance(decision, dict):
+                        topic = str(decision.get("topic") or "").strip()
+                head = f"【考点：{topic}】" if topic else "【考点：（未标注）】"
+            lines.append(f"{head}面试官：{msg.get('content', '')}")
+        else:
+            lines.append(f"候选人：{msg.get('content', '')}")
     return "\n".join(lines)
 
 
@@ -387,7 +436,7 @@ INTERVIEWER_SYSTEM = """你叫「知遇」，是一位真实的面试官，正�
   "reply": "你要对候选人说的话（纯口播文本）",
   "action": "ask 或 probe 或 reflect 或 end",
   "question_no": 当前主问题编号（整数）,
-  "topic": "这一轮所处的考点：action 为 ask 时填新主问题对应的考点（优先从上面考点参考里选，逐字一致；若是结合候选人经历自拟的题，就用不超过 12 字的短语概括）；probe / reflect 时填当前正在问的那个考点；end 时填空字符串",
+  "topic": "这一轮所处的考点，必须在下面两种里选一种：① 上面「考点参考」里有贴切的，就填它的原文，逐字一致，不许缩写、改写、合并；② 确实没有贴切的，填一个不超过 12 字的短语概括这道题考什么。绝不要为了让这个字段非空，把题目硬挂到一个「沾边」的考点上——挂错会让评分参照对到别的题上去，比留空危害大得多。probe / reflect 时填当前正在问的那个考点；end 时填空字符串",
   "focus": "这一题考察的能力点（短语）",
   "gap": "action 为 probe 时填：还缺什么（缺量化结果 / 缺「我」本人做了什么 / 缺技术原理 / 缺反思），其它情况填空字符串",
   "tool": "none 或 resume_lookup：需要查看简历原文才能问准时才填 resume_lookup，否则一律填 none",
@@ -974,14 +1023,24 @@ EVALUATOR_SCORE_SYSTEM = """你是一位资深面试评委。请根据这场{int
 
 【考点评分参照】本场面试官问到了下面这些考点，请对照要点清单判分。
 {rubric_block}
-
+{unanchored_block}
 {resume_block}
 参照使用规则：
 1. must_hit 是核心要点，候选人没讲到就要扣，并写明漏了哪条。
 2. 候选人给出参照之外但同样正确的答法，照常算分——参照是底线不是天花板，禁止因为「和参照不一样」而扣分。
 3. common_errors 里踩中的概念错误，写进该考点的 errors；若属于「一票否决的误区」，必须原样照抄到 errors，并在 risks 里概括。
 4. 某个考点如果本场根本没被问到，就在 comment 里写明「本场未问到」，missed 留空；不要把没问过的考点算成候选人的遗漏。
-5. 本场题目若不在此参照范围内（标注为「未提供考点参照」），按通用标准正常评，不要生造要点。
+5. 面试记录里每轮面试官发言前都标了【考点：…】。判分时必须**按轮次归属**：只把属于某个考点的那几轮对话拿去对照该考点的要点，不要把这个考点的标准套到别的题上。
+6. 对【没有参照的题】那一组（见上），按下面的现拟规则处理。
+
+【没有参照的题：请现场现拟参照，再判分】
+上面「考点评分参照」里没有的考点，就是本场面试官自拟的题。它们同样要判，规则如下：
+1. 先回到面试记录里，找出标着这个【考点：…】的那几轮对话，看清这道题究竟在问什么。
+2. 替这道题现拟 3~5 条 must_hit：一个合格应届生答这道题必须讲到的核心要点，只写这道题本身要求的，不要把别的考点的要点拼进来。
+3. 再逐条判断候选人讲到了哪几条、漏了哪几条、有没有明显讲错的地方，照常写进 must_hit / missed / errors。
+4. **现拟参照不许写「一票否决」**。库里带否决权的误区是人工逐条核对过的，现场现拟的要点没有这个资格；即便候选人答得很差，也只按普通扣分处理。
+5. 现拟参照的可靠性低于库参照，判分时宁可保守：拿不准算不算漏，就不要算漏。
+6. 所有 rubric_check 条目都要如实填 source 字段：对照库里既定参照判的填 "library"，用你现场现拟的要点判的填 "generated"。这个字段会直接显示给候选人，填错等于把现拟的结论冒充成核对过的结论。
 
 【评分要求】
 1. 每个维度 0-100 分。评语必须引用候选人在面试记录里的原话或具体表现，不许写「感觉不错」这类空话。
@@ -992,7 +1051,7 @@ EVALUATOR_SCORE_SYSTEM = """你是一位资深面试评委。请根据这场{int
 本次调用**只提供候选人自身的表现材料，不含面试官状态信息**。面试官状态对表现的影响
 由另一次独立调用单独归因，所以你不要考虑它，也不要替面试官的行为开脱或加重。
 
-rubric_check 是可选字段：本场有参照就逐条给出（每个考点一条）。若本场未提供参照，可省略该字段。
+rubric_check 是可选字段：本场只要问到过考点就要逐条给出（每个考点一条，包括没有库参照、由你现场现拟的）。若本场一个考点都没记录，可省略该字段。
 resume_check 同样是可选字段：只有在本场提供了「候选人简历」时才填。没有提供简历就省略该字段。
 
 只输出 JSON，不要输出任何其他文字，格式如下：
@@ -1003,7 +1062,7 @@ resume_check 同样是可选字段：只有在本场提供了「候选人简历�
     {{"name": "维度名称", "score": 0 到 100 的整数, "comment": "评语，必须引用候选人原话或具体表现"}}
   ],
   "rubric_check": [
-    {{"topic": "考点原文", "must_hit": ["候选人讲到的核心要点"], "missed": ["没讲到的核心要点"],
+    {{"topic": "考点原文", "source": "library 或 generated", "must_hit": ["候选人讲到的核心要点"], "missed": ["没讲到的核心要点"],
      "errors": ["踩中的常见误区"], "comment": "一句话说明"}}
   ],
   "resume_check": {{
@@ -1056,6 +1115,10 @@ _STAR_EXTRA = """4. 本场是行为面，请额外检查每个回答是否符合
 _TECH_EXTRA = """4. 本场是技术面，请额外关注：概念是否说清、有没有真实的项目或实习细节、
 遇到不会的问题时是硬编还是坦诚说明思路。"""
 
+# format_transcript 给"没有考点"的轮次打的占位符。评估官偶尔会把它当成一个
+# 真实考点补出一行 rubric_check，这里统一认这几个字面量。
+_UNTOPICED = {"（未标注）", "(未标注)", "未标注", "（未标注考点）", "-", "—"}
+
 
 def evaluate_interview(
     history: list[dict[str, str]],
@@ -1076,7 +1139,7 @@ def evaluate_interview(
     evidence_query = " ".join(
         str(m.get("content") or "") for m in history if m.get("role") == "user"
     )[:1200] + " " + " ".join(str(t) for t in (profile.get("topics") or []))
-    transcript = format_transcript(history)
+    transcript = format_transcript(history, tag_topics=True)
 
     # 第一次调用：只评分。系统提示词里没有状态轨迹，评委看到的就是候选人自己的表现。
     score = chat_json(
@@ -1090,6 +1153,7 @@ def evaluate_interview(
                     strictness=profile.get("strictness", ""),
                     dimensions="\n".join(f"- {d}" for d in profile.get("dimensions", [])),
                     rubric_block=rubric_block(profile, asked_topics),
+                    unanchored_block=unanchored_block(profile, asked_topics),
                     resume_block=resume_evidence_block(profile, evidence_query),
                     extra=_STAR_EXTRA
                     if profile.get("interview_type") == "行为面"
@@ -1101,10 +1165,38 @@ def evaluate_interview(
         api_key,
         model,
         temperature=0.2,
+        timeout=REPORT_TIMEOUT,
     )
     if not isinstance(score, dict):
         score = {}
+    score = _normalize_rubric_check(score)
     return _merge_attribution(score, transcript, profile, api_key, mood_trace, model)
+
+
+def _normalize_rubric_check(score: dict[str, Any]) -> dict[str, Any]:
+    """把 rubric_check 里那些**不对应任何考点**的行剔掉。
+
+    来历：`format_transcript` 会给每轮面试官发言标【考点：…】，收尾那一轮
+    （action=end）本来就是一句「今天先到这里」，没有考点，于是被标成
+    【考点：（未标注）】。实测评估官会照着这个标记补一行
+    `{"topic": "（未标注）", "source": "generated", ...}`，报告里就多出一条
+    既没有参照、也没有任何内容的判定。
+
+    这里按字面量剔除，不做模糊判断：只认那几个明确的占位符。
+    """
+    rows = score.get("rubric_check")
+    if not isinstance(rows, list):
+        return score
+    kept = [
+        item
+        for item in rows
+        if isinstance(item, dict)
+        and str(item.get("topic") or "").strip()
+        and str(item.get("topic") or "").strip() not in _UNTOPICED
+    ]
+    if len(kept) != len(rows):
+        score = {**score, "rubric_check": kept}
+    return score
 
 
 def _score_brief(score: dict[str, Any]) -> str:
@@ -1175,6 +1267,7 @@ def _merge_attribution(
             api_key,
             model,
             temperature=0.2,
+            timeout=REPORT_TIMEOUT,
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -1307,6 +1400,7 @@ def coach_review(
         api_key,
         model,
         temperature=0.4,
+        timeout=REPORT_TIMEOUT,
     )
 
 
@@ -1409,6 +1503,7 @@ def advisor_review(
         api_key,
         model,
         temperature=0.4,
+        timeout=REPORT_TIMEOUT,
     )
     return advice.normalize(data, evaluation)
 
@@ -1542,5 +1637,6 @@ def resume_review(
         api_key,
         model,
         temperature=0.4,
+        timeout=REPORT_TIMEOUT,
     )
     return resume_optimize.normalize_report(data, text)

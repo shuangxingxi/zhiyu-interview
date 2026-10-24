@@ -118,7 +118,9 @@ class TestChatJsonRetry(unittest.TestCase):
         agents.reset_usage()
 
     def _patch(self, client):
-        return mock.patch.object(agents, "_client", lambda api_key: client)
+        # _client 现在带 timeout 参数（报告类角色放宽 read 超时），
+        # 假客户端不关心它，用 *args 吞掉即可。
+        return mock.patch.object(agents, "_client", lambda *args, **kwargs: client)
 
     def test_first_attempt_success_calls_model_once(self):
         client = FakeClient(FakeResponse('{"ok": true}'))
@@ -216,6 +218,75 @@ class TestChatJsonRetry(unittest.TestCase):
         self.assertEqual(len(client.calls), 1, "超时不该重试")
 
 
+class TestRoleTimeouts(unittest.TestCase):
+    """超时要按角色分：交互路径等 15 秒，报告类角色等 90 秒。
+
+    这是一个真实缺陷的回归钉：原先所有角色共用 15 秒 read 超时，而
+    coach_review 实测 23.0s、advisor_review 22.8s、resume_review 27.5s，
+    连试 6 次 6 次超时——三个功能在当前网络下等于必然失败。
+    """
+
+    def setUp(self):
+        agents.reset_usage()
+
+    def tearDown(self):
+        agents.reset_usage()
+
+    def test_interaction_path_keeps_the_short_timeout(self):
+        client = agents._client("key")
+        self.assertEqual(client.timeout.read, agents.FIRST_RESPONSE_TIMEOUT)
+        self.assertEqual(client.max_retries, 0, "超时不该被 SDK 重试放大")
+
+    def test_report_path_gets_a_much_longer_read_timeout(self):
+        client = agents._client("key", agents.REPORT_TIMEOUT)
+        self.assertEqual(client.timeout.read, agents.REPORT_RESPONSE_TIMEOUT)
+        self.assertGreater(
+            agents.REPORT_RESPONSE_TIMEOUT,
+            agents.FIRST_RESPONSE_TIMEOUT * 3,
+            "报告类角色的输出是面试官决策的数倍，余量要给足",
+        )
+        self.assertEqual(client.max_retries, 0)
+
+    def test_connect_timeout_is_shared(self):
+        # 只有 read 按角色分；连接阶段的超时对两者都该是同一个短值。
+        self.assertEqual(agents.MODEL_TIMEOUT.connect, agents.REPORT_TIMEOUT.connect)
+        self.assertEqual(agents.REPORT_TIMEOUT.connect, 10.0)
+
+    def test_chat_json_passes_the_timeout_to_the_client(self):
+        seen: list = []
+        client = FakeClient(FakeResponse('{"ok": true}'), FakeResponse('{"ok": true}'))
+
+        def fake_client(api_key, timeout=None):
+            seen.append(timeout)
+            return client
+
+        with mock.patch.object(agents, "_client", fake_client):
+            agents.chat_json([{"role": "user", "content": "hi"}], "key")
+            agents.chat_json(
+                [{"role": "user", "content": "hi"}], "key", timeout=agents.REPORT_TIMEOUT
+            )
+
+        self.assertIs(seen[0], agents.MODEL_TIMEOUT, "不传就用交互路径的默认值")
+        self.assertIs(seen[1], agents.REPORT_TIMEOUT)
+
+    def test_timeout_error_reports_the_limit_that_was_used(self):
+        """报错里的秒数必须是实际生效的那个，否则用户会以为卡了 15 秒。"""
+        from openai import APITimeoutError
+
+        client = FakeClient(APITimeoutError(request=mock.Mock()))
+        with mock.patch.object(agents, "_client", lambda *a, **k: client):
+            with quiet_stderr():
+                with self.assertRaises(RuntimeError) as ctx:
+                    agents.chat_json(
+                        [{"role": "user", "content": "hi"}],
+                        "key",
+                        timeout=agents.REPORT_TIMEOUT,
+                    )
+        message = str(ctx.exception)
+        self.assertIn("90 秒", message)
+        self.assertNotIn("15 秒", message)
+
+
 class TestChatJsonUsage(unittest.TestCase):
     """计量：每次尝试都要计入，否则成本统计会漏。"""
 
@@ -226,7 +297,7 @@ class TestChatJsonUsage(unittest.TestCase):
         agents.reset_usage()
 
     def _patch(self, client):
-        return mock.patch.object(agents, "_client", lambda api_key: client)
+        return mock.patch.object(agents, "_client", lambda *args, **kwargs: client)
 
     def test_successful_call_is_counted(self):
         client = FakeClient(FakeResponse('{"ok": true}', usage=FakeUsage(100, 20)))

@@ -1210,10 +1210,12 @@ def start_interview(profile: dict, api_key: str) -> None:
     advance()
 
 
-# 语音合成连续失败到这个次数就停用本会话的语音。
-# 2 次足够确认"不是偶发抖动"（voice.py 里 403 已被判定为永久故障），
-# 又不至于让用户只因为一次网络抖动就失去整场语音。
-TTS_FAILURE_LIMIT = 2
+# 语音合成失败到这个次数就停用本会话的语音。
+# 阈值取 1：`voice.synthesize()` 只有在**两条通道都失败**时才抛异常
+# （edge-tts 已被上游 403 封禁、硅基流动超时或返回坏音频），这已经不是网络抖动，
+# 而是本机确实没有可用的合成通道。此前是 2，代价是头两轮各白等一次超时——
+# 按 v17 的 25 秒 TTS 超时算，两轮就是 50 秒的冷冻，用户只会觉得页面卡死。
+TTS_FAILURE_LIMIT = 1
 
 
 def _note_tts_failure(reason: str) -> None:
@@ -1224,9 +1226,11 @@ def _note_tts_failure(reason: str) -> None:
     if st.session_state.get("tts_note"):
         return
     st.session_state.tts_note = (
-        f"语音合成连续 {TTS_FAILURE_LIMIT} 次失败，已自动停用本场语音，"
-        "文字面试照常进行（不影响出题与评分）。\n\n"
-        f"失败原因：{reason[:300]}"
+        "语音合成失败，已自动停用本场语音，文字面试照常进行（不影响出题与评分）。\n\n"
+        "已知原因：edge-tts 自 2026-10 起被上游拒绝握手（WSS 403），这条通道"
+        "只能靠硅基流动兜底；若兜底也没返回音频，本机当前就没有可用的合成通道。\n\n"
+        f"失败原因：{reason[:300]}\n\n"
+        "处理后可在左侧「🎙️ 语音与动效」点「重试语音合成」恢复，不必重开页面。"
     )
 
 
@@ -1932,6 +1936,68 @@ def _tier_distribution_caption(profile: dict, rubric_check: list[dict]) -> str:
     return line + "。"
 
 
+def _render_rubric_check_block(rubric_check: list[dict], asked_topics: list[str]) -> dict:
+    """渲染报告页的「考点级判定」，并按判定依据的来源分区。
+
+    为什么要分区：库里 318 条参照是人工逐条核对过的，评估官为自拟题现场
+    现拟的要点不是。两类结论放在同一张表里、用同一个「通过 / 不通过」的说法
+    呈现，等于把现拟的结论冒充成核对过的结论——答辩时被问「这条判定依据是
+    哪来的」就答不上来。所以分两段显示，并如实写出各几条。
+
+    返回 aggregate 结果，供调用方继续用（JD 收尾块另外算，不复用）。
+    """
+    profile = st.session_state.profile or {}
+    agg = aggregate_rubric_check(profile, rubric_check)
+    labels = {t["topic"]: t["label"] for t in agg["topics"]}
+    sources = {t["topic"]: t["source"] for t in agg["topics"]}
+    counts = agg["counts"]
+    st.markdown(
+        f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
+        f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个，"
+        f"本场未问到 {counts[VERDICT_UNKNOWN]} 个。"
+    )
+    if agg["generated"]:
+        st.caption(
+            f"其中 {agg['library']} 条的判定依据来自自建考点库（人工核对过），"
+            f"{agg['generated']} 条是评委按题面现场现拟的要点（仅供参考）。"
+        )
+
+    # 问到了、却连一行判定都没回来的考点——用户有权知道漏了哪几道。
+    judged = {str(item.get("topic", "")).strip() for item in rubric_check}
+    missing = [topic for topic in asked_topics if topic not in judged]
+    if missing:
+        st.caption("以下几个考点本场没拿到判定：" + "、".join(missing))
+
+    if agg["weak"]:
+        for entry in agg["weak"]:
+            tag = "" if entry["source"] == "library" else "（现拟）"
+            st.markdown(f"- {entry['label']}｜{entry['topic']}{tag}：{entry['reason']}")
+    tier_line = _tier_distribution_caption(profile, rubric_check)
+    if tier_line:
+        st.markdown(tier_line)
+    with st.expander("考点命中情况（评委判分时对照的要点清单）"):
+        st.caption(
+            "参照是底线不是天花板：清单之外的正确答案同样算分，没命中不等于答错。"
+            "「来源」一列写明这条判定是查库得来的，还是评委现场现拟的。"
+        )
+        st.dataframe(
+            [
+                {
+                    "考点": item.get("topic", ""),
+                    "来源": "考点库" if sources.get(item.get("topic", "")) == "library" else "现拟",
+                    "判定": labels.get(item.get("topic", ""), ""),
+                    "已命中": "；".join(str(x) for x in (item.get("must_hit") or [])),
+                    "遗漏": "；".join(str(x) for x in (item.get("missed") or [])),
+                    "误区": "；".join(str(x) for x in (item.get("errors") or [])),
+                    "说明": item.get("comment", ""),
+                }
+                for item in rubric_check
+            ],
+            hide_index=True,
+        )
+    return agg
+
+
 def _render_jd_progress_block(profile: dict, rubric_check: list[dict]) -> None:
     """JD 定向场的收尾：本场目标考点逐条判定 + 「只练没过的」下一跳。
 
@@ -2621,15 +2687,25 @@ def build_report_markdown() -> str:
             # 不额外叫模型判一次——同一份记录每次得到同一个结论。
             agg = aggregate_rubric_check(profile, rubric_check)
             labels = {t["topic"]: t["label"] for t in agg["topics"]}
+            sources = {t["topic"]: t["source"] for t in agg["topics"]}
             add("### 考点命中情况")
             add()
             add("> 参照是底线不是天花板：清单之外的正确答案同样算分，没命中不等于答错。")
             add()
+            if agg["generated"]:
+                add(
+                    f"> 来源：「考点库」= 自建考点库里人工核对过的参照（{agg['library']} 条）；"
+                    f"「现拟」= 评委按题面现场现拟的要点，仅供参考（{agg['generated']} 条）。"
+                )
+                add()
             table(
-                ["考点", "判定", "已命中", "遗漏", "误区"],
+                ["考点", "来源", "判定", "已命中", "遗漏", "误区"],
                 [
                     [
                         item.get("topic", ""),
+                        "考点库"
+                        if sources.get(item.get("topic", "")) == "library"
+                        else "现拟",
                         labels.get(item.get("topic", ""), ""),
                         "；".join(str(x) for x in (item.get("must_hit") or [])) or "—",
                         "；".join(str(x) for x in (item.get("missed") or [])) or "—",
@@ -2648,7 +2724,8 @@ def build_report_markdown() -> str:
             if agg["weak"]:
                 add()
                 for entry in agg["weak"]:
-                    add(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
+                    tag = "" if entry["source"] == "library" else "（现拟）"
+                    add(f"- {entry['label']}｜{entry['topic']}{tag}：{entry['reason']}")
             tier_line = _tier_distribution_caption(profile, rubric_check)
             if tier_line:
                 add()
@@ -2670,6 +2747,39 @@ def build_report_markdown() -> str:
                 else:
                     add("本场目标考点都通过了。")
                 add()
+        else:
+            asked_topics = [
+                str(t).strip()
+                for t in (st.session_state.get("asked_topics") or [])
+                if str(t).strip()
+            ]
+            if asked_topics:
+                # 导出件与页面同口径：问过考点却一条判定都没有，就如实写在这里，
+                # 而不是让读者以为「报告中本来就没有这一节」。
+                add("### 考点级判定")
+                add()
+                add(
+                    f"> 本场未能生成考点级判定。这场问到了 {len(asked_topics)} 个考点"
+                    f"（{'、'.join(asked_topics)}），但评委没有给出可用的对照结论。"
+                )
+                add()
+                # 与页面同源：JD 定向场即使判定缺失，也要写清「还剩哪几条、下一场练什么」。
+                progress = _jd_progress(profile, [])
+                if progress.get("total"):
+                    add("### JD 定向场收尾")
+                    add()
+                    table(
+                        ["考点", "判定", "原因"],
+                        [[i["topic"], i["label"], i["reason"]] for i in progress["topics"]],
+                    )
+                    if progress["remaining"]:
+                        add(
+                            f"**还剩 {len(progress['remaining'])} 条没过或没考到**："
+                            + "、".join(progress["remaining"])
+                        )
+                    else:
+                        add("本场目标考点都通过了。")
+                    add()
         resume_check = evaluation.get("resume_check")
         if isinstance(resume_check, dict):
             issues = [x for x in (resume_check.get("issues") or []) if isinstance(x, dict)]
@@ -3178,41 +3288,28 @@ def render_report() -> None:
             rubric_check = [
                 item for item in (evaluation.get("rubric_check") or []) if isinstance(item, dict)
             ]
+            asked_topics = [
+                str(t).strip()
+                for t in (st.session_state.get("asked_topics") or [])
+                if str(t).strip()
+            ]
             if rubric_check:
-                agg = aggregate_rubric_check(st.session_state.profile or {}, rubric_check)
-                labels = {t["topic"]: t["label"] for t in agg["topics"]}
-                counts = agg["counts"]
-                st.markdown(
-                    f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
-                    f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个，"
-                    f"本场未问到 {counts[VERDICT_UNKNOWN]} 个。"
+                agg = _render_rubric_check_block(rubric_check, asked_topics)
+                _render_jd_progress_block(st.session_state.profile or {}, rubric_check)
+            elif asked_topics:
+                # 三态里的第三态：问过考点、却一条判定都没有。
+                # 以前这里是 `if rubric_check:` 直接跳过，用户只看到报告少了半页，
+                # 不知道是没判、判了没存、还是根本没参照。
+                st.markdown("**考点级判定**：本场未能生成。")
+                st.caption(
+                    f"这场问到了 {len(asked_topics)} 个考点（{'、'.join(asked_topics)}），"
+                    "但评委没有给出可用的对照结论。常见原因是模型这一轮输出被截断或格式不合规，"
+                    "重跑一遍通常就能恢复；如果反复出现，请把这份记录反馈给开发者。"
                 )
-                if agg["weak"]:
-                    for entry in agg["weak"]:
-                        st.markdown(f"- {entry['label']}｜{entry['topic']}：{entry['reason']}")
-                tier_line = _tier_distribution_caption(
-                    st.session_state.profile or {}, rubric_check
-                )
-                if tier_line:
-                    st.markdown(tier_line)
-                with st.expander("考点命中情况（评委判分时对照的要点清单）"):
-                    st.caption(
-                        "参照是底线不是天花板：清单之外的正确答案同样算分，没命中不等于答错。"
-                    )
-                    st.dataframe(
-                        [
-                            {
-                                "考点": item.get("topic", ""),
-                                "判定": labels.get(item.get("topic", ""), ""),
-                                "已命中": "；".join(str(x) for x in (item.get("must_hit") or [])),
-                                "遗漏": "；".join(str(x) for x in (item.get("missed") or [])),
-                                "误区": "；".join(str(x) for x in (item.get("errors") or [])),
-                                "说明": item.get("comment", ""),
-                            }
-                            for item in rubric_check
-                        ],
-                        hide_index=True,
-                    )
+                # JD 定向场的收尾块不能因为 rubric_check 为空就消失：
+                # 它带着「只练没过的 K 条」按钮，是闭环的下一跳。判定缺失时
+                # session_progress 会把每条都算成 unknown，按钮照样给出——
+                # 这正是「这场没判出来」时用户最需要的出口。
                 _render_jd_progress_block(st.session_state.profile or {}, rubric_check)
 
             resume_check = evaluation.get("resume_check")
