@@ -105,7 +105,7 @@ class TestBehaviorRubricWiring(unittest.TestCase):
             use_real=False,
             real_quota=0,
         )
-        cls.asked = list(knowledge.BEHAVIOR_TOPICS[:3])
+        cls.asked = knowledge.behavior_topics("B")[:3]
 
     def test_rubric_for_returns_every_asked_behavior_topic(self):
         items = knowledge.rubric_for(self.profile, self.asked)
@@ -173,6 +173,66 @@ class TestBehaviorRubricDegrades(unittest.TestCase):
             self.assertIn(
                 "未提供考点参照", knowledge.rubric_block(profile, knowledge.BEHAVIOR_TOPICS[:2])
             )
+
+
+class TestBehaviorTiering(unittest.TestCase):
+    """行为面按难度档分池（v17）：A 考复杂局面、C 考校园场景。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tiers = knowledge.BEHAVIOR_TOPIC_TIERS
+
+    def test_three_tiers_have_fifteen_topics_each(self):
+        self.assertEqual(sorted(self.tiers), ["A", "B", "C"])
+        for level, topics in self.tiers.items():
+            self.assertEqual(len(topics), 15, f"{level} 档应 15 条")
+
+    def test_tiers_do_not_overlap(self):
+        sets = {level: set(topics) for level, topics in self.tiers.items()}
+        self.assertEqual(len(sets["A"] & sets["B"]), 0)
+        self.assertEqual(len(sets["A"] & sets["C"]), 0)
+        self.assertEqual(len(sets["B"] & sets["C"]), 0)
+
+    def test_union_matches_behavior_topics(self):
+        self.assertEqual(len(knowledge.BEHAVIOR_TOPICS), 45)
+        self.assertEqual(set(knowledge.BEHAVIOR_TOPICS), set().union(*self.tiers.values()))
+
+    def test_every_rubric_level_matches_its_tier(self):
+        rubrics = knowledge.load_behavior_rubrics()
+        for level, topics in self.tiers.items():
+            for topic in topics:
+                self.assertEqual(rubrics[topic].get("level"), level, topic)
+
+    def test_behavior_topics_returns_the_pool_of_that_level(self):
+        for level in ("A", "B", "C"):
+            self.assertEqual(knowledge.behavior_topics(level), list(self.tiers[level]))
+
+    def test_unknown_level_falls_back_to_b(self):
+        self.assertEqual(knowledge.behavior_topics("Z"), list(self.tiers["B"]))
+        self.assertEqual(knowledge.behavior_topics(""), list(self.tiers["B"]))
+
+    def test_behavior_topics_is_a_copy(self):
+        pool = knowledge.behavior_topics("A")
+        pool.clear()
+        self.assertEqual(len(knowledge.behavior_topics("A")), 15)
+
+    def test_profile_topics_follow_the_level(self):
+        pools = {}
+        for level in ("A", "B", "C"):
+            profile = knowledge.build_profile(
+                scene="应届生校招",
+                major="计算机科学与技术",
+                level=level,
+                interview_type="行为面",
+                total_rounds=5,
+                use_real=False,
+                real_quota=0,
+            )
+            self.assertEqual(len(profile["topics"]), 15)
+            self.assertEqual(profile["topic_mix"], {})
+            self.assertEqual(profile["topic_tiers"], {})
+            pools[level] = frozenset(profile["topics"])
+        self.assertEqual(len(set(pools.values())), 3, "三档不应拿到同一批题")
 
 
 if __name__ == "__main__":

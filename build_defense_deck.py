@@ -331,7 +331,7 @@ cw = (CONTENT_W - 0.3 * 3) / 4
 for i, (num, unit, label, detail) in enumerate([
     ("72", "种", "配置组合", "4 场景 × 6 专业 × 3 难度\n全部由同一套代码编译而成"),
     ("318", "条", "考点 + 判分参照", "6 专业 × 3 档，每档 ≥15 条\n考点与参照一对一"),
-    ("554", "项", "离线单元测试", "18 套，不联网、不花 token\n检索用真简历真切片"),
+    ("620", "项", "离线单元测试", "21 套，不联网、不花 token\n检索用真简历真切片"),
     ("21", "个", "版本迭代", "v1 → v17，每个版本\n解决一个具体问题"),
 ]):
     kpi(s, LEFT + i * (cw + 0.3), y + 0.1, cw, 2.35, num, unit, label, detail)
@@ -705,7 +705,7 @@ y = head(s, "VOICE", "语音链路与「去掉人脸」的决策",
 
 card(s, LEFT, y + 0.05, 6.1, 3.3)
 tx(s, LEFT + 0.32, y + 0.24, 5.5, 0.3, "合成链：三级降级", size=12, color=ACCENT, bold=True)
-chain = ["edge-tts（免费、音色自然）", "硅基流动 CosyVoice2（复用识别同一把 Key）", "静默降级回文字模式"]
+chain = ["智谱 GLM-TTS（2~3 秒出声、音色可指定）", "硅基流动 MOSS-TTSD（复用识别同一把 Key）", "CosyVoice2 / edge-tts 兜底", "静默降级回文字模式"]
 for i, c in enumerate(chain):
     chip(s, LEFT + 0.32, y + 0.62 + i * 0.52, 3.4, 0.4, c, size=10,
          fill=WHITE if i else ACCENT_SOFT, color=INK if i else ACCENT)
@@ -765,22 +765,22 @@ footer(s)
 # 16 验证
 # =====================================================================
 s = new_slide()
-y = head(s, "VERIFICATION", "怎么证明它work：554 项离线单测 + 可量化的指标",
+y = head(s, "VERIFICATION", "怎么证明它work：620 项离线单测 + 可量化的指标",
          "两条原则贯穿全部测试：不联网（把模型换成假件）、检索用真件（真简历、真切片、真跑 BM25）。")
 card(s, LEFT, y + 0.05, 5.3, 3.2)
-tx(s, LEFT + 0.32, y + 0.22, 4.7, 0.3, "18 套单元测试 · 554 项", size=12, color=ACCENT, bold=True)
+tx(s, LEFT + 0.32, y + 0.22, 4.7, 0.3, "21 套单元测试 · 620 项", size=12, color=ACCENT, bold=True)
 suite = [
     ("test_advice / optimize", "建议与改写不编造", "89"),
     ("test_tool_call", "工具调用四条回落路径", "46"),
-    ("test_voice", "Markdown 剥离 / 错误分流", "48"),
+    ("test_voice", "Markdown 剥离 / 错误分流", "65"),
     ("test_history_store", "越界不误删 / 跨专业不混比", "39"),
     ("test_evaluator_rubric", "参照不越界（v11 回归）", "36"),
     ("test_mood", "情绪状态机边界与调制", "36"),
     ("test_calibration", "结局回填与准确率分母", "35"),
     ("test_topic_anchor", "考点锚定 / 现拟参照契约", "40"),
     ("test_session_store", "快照读写与容错", "22"),
-    ("test_behavior_rubric", "行为面参照库 15 条", "17"),
-    ("其余 7 套", "状态机 / 参照 / 真题 / JSON", "146"),
+    ("test_behavior_rubric", "行为面分档 45 条 / 回写 8 例", "33"),
+    ("其余 8 套", "状态机 / 参照 / 答题框架 / 回写", "161"),
 ]
 tx(s, LEFT + 0.32, y + 0.60, 4.7, 2.45,
    "\n".join("· %-23s %3s  %s" % (a, c, b) for a, b, c in suite),
@@ -820,7 +820,7 @@ phases = [
     ("能交付", "v12 – v15",
      "撤数字人换声波球；仓库瘦身\n10.4 → 1.7 GB；真题补到 4 专业；\n建议官 + 简历优化官；\n口播链路加固。", 5.856),
     ("可校准", "v16 – v17",
-     "结局回填 + 评分校准；\n考点级判定，判分引用原话；\nv17 JD 对照 + 定向开面试；\nveto 135 条生效（含行为面）。", 8.784),
+     "结局回填 + 评分校准；\n考点级判定，判分引用原话；\nv17 JD 对照 + 定向开面试；\nveto 277 条生效（含行为面）。", 8.784),
 ]
 CARD_W = 2.648
 for name, span, desc, x in phases:

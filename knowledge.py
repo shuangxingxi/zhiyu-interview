@@ -696,23 +696,72 @@ BEHAVIOR_DIMENSIONS = [
     "反思与成长",
     "表达结构与感染力",
 ]
-BEHAVIOR_TOPICS = [
-    "一次你推动团队完成目标的经历",
-    "一次你与他人产生分歧并解决的经历",
-    "一次在时间压力下赶进度的经历",
-    "一次你主动发现并解决问题的经历",
-    "一次失败或受挫的经历",
-    "一次你快速学会新东西并用上的经历",
-    "一次你说服他人接受你方案的经历",
-    "一次你承担超出职责范围任务的经历",
-    "一次你面对信息不全仍要做决策的经历",
-    "一次你被别人指出错误并改正的经历",
-    "一次你协调多方资源推进事情的经历",
-    "一次你坚持原则拒绝不合理要求的经历",
-    "一次你把一件小事做到极致带来改变的经历",
-    "一次你帮助同事或同学成长进步的经历",
-    "一次你对结果不满意并复盘改进的经历",
-]
+BEHAVIOR_TOPIC_TIERS: dict[str, list[str]] = {
+    "A": [
+        "一次你推动跨团队协作打破僵局的经历",
+        "一次你向上管理、说服上级改变决定的经历",
+        "一次资源被砍后你重新排期的经历",
+        "一次线上故障中你负责处置的经历",
+        "一次你拒绝不合理需求并给出替代方案的经历",
+        "一次你发现流程缺陷并推动改动的经历",
+        "一次你带新人从不会到独立交付的经历",
+        "一次你给同事做负面反馈的经历",
+        "一次信息不足下你做出高代价决策的经历",
+        "一次你为长期收益放弃短期指标的经历",
+        "一次你处理数据隐私或合规红线的经历",
+        "一次你主导技术选型并为后果负责的经历",
+        "一次你因判断失误造成实际损失并补救的经历",
+        "一次多方利益冲突中你做取舍的经历",
+        "一次你建立机制让同类问题不再发生的经历",
+    ],
+    "B": [
+        "一次你推动团队完成目标的经历",
+        "一次你与他人产生分歧并解决的经历",
+        "一次在时间压力下赶进度的经历",
+        "一次你主动发现并解决问题的经历",
+        "一次失败或受挫的经历",
+        "一次你快速学会新东西并用上的经历",
+        "一次你说服他人接受你方案的经历",
+        "一次你承担超出职责范围任务的经历",
+        "一次你面对信息不全仍要做决策的经历",
+        "一次你被别人指出错误并改正的经历",
+        "一次你协调多方资源推进事情的经历",
+        "一次你坚持原则拒绝不合理要求的经历",
+        "一次你把一件小事做到极致带来改变的经历",
+        "一次你帮助同事或同学成长进步的经历",
+        "一次你对结果不满意并复盘改进的经历",
+    ],
+    "C": [
+        "一次你在社团活动里协调分工的经历",
+        "一次你和室友或同学产生矛盾并解决的经历",
+        "一次小组作业有人拖进度的经历",
+        "一次你第一次做项目汇报的经历",
+        "一次你负责的模块临时被换掉的经历",
+        "一次你在兼职或实习中学会一项操作规范的经历",
+        "一次你在课堂上主动提问或发言的经历",
+        "一次你参加比赛时间不够用的经历",
+        "一次你申请加入项目被拒的经历",
+        "一次你被老师或同学指出错误并改正的经历",
+        "一次你把一件小事做到位的经历",
+        "一次两件事时间冲突需要取舍的经历",
+        "一次你主动找老师或学长请教的经历",
+        "一次团队里没人愿意做的活你接下的经历",
+        "一次你第一次独立负责一件事的经历",
+    ],
+}
+# 全量 45 条（三档并集）：给「这条考点属于行为面吗」这类判断用。
+# 具体某一场用哪 15 条，看 behavior_topics(level)。
+BEHAVIOR_TOPICS = [t for _level in LEVELS for t in BEHAVIOR_TOPIC_TIERS[_level]]
+
+
+def behavior_topics(level: str) -> list[str]:
+    """某一难度档的行为面考点池（15 条）。
+
+    行为面此前 15 条三档共用，与技术面「档位决定问什么」的设计不一致：
+    校招实习和资深社招会拿到同一批题。现在按档分开，A 考复杂局面下的判断，
+    C 考校园与入门场景。
+    """
+    return list(BEHAVIOR_TOPIC_TIERS.get(level, BEHAVIOR_TOPIC_TIERS["B"]))
 
 # 无简历时用来"挖经历"的通用方向：不属于任何专业，任何专业都能用。
 # 候选人不上传简历时，面试官若只念专业考点就会显得很干；有了这组方向，
@@ -768,7 +817,9 @@ def build_profile(
 
     if is_behavior:
         dimensions = list(BEHAVIOR_DIMENSIONS)
-        topics = list(BEHAVIOR_TOPICS)
+        # 行为面按档取池：A 考复杂局面下的判断，C 考校园与入门场景。
+        # 档位不参与「配比」（整池就同一档），所以 topic_tiers / topic_mix 仍为空。
+        topics = behavior_topics(level)
         topic_tiers: dict[str, str] = {}
         topic_mix: dict[str, int] = {}
     else:
@@ -1192,6 +1243,48 @@ def load_behavior_rubrics() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# 答题框架：给**考生**看的结构提示，与给评委看的 must_hit 是两套东西。
+# 单独一个文件，理由同样是「别混进判分数据」：
+# rubrics.json 会整段注入评估官提示词，把考生视角的话混进去既污染判分上下文，
+# 也可能顺着提示词漏给模型、间接泄题。
+ANSWER_OUTLINE_FILE = Path(__file__).with_name("answer_outline.json")
+
+
+def load_answer_outlines() -> dict[str, Any]:
+    """读取答题框架库；缺失或损坏返回空字典，只是不显示，绝不抛异常。"""
+    try:
+        with ANSWER_OUTLINE_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"[rubrics] 答题框架读取失败，已降级为不显示：{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def answer_outline(major: str, topic: str) -> dict[str, Any] | None:
+    """取某个考点的答题框架：{outline: [步骤...], avoid: "别这么说"}。
+
+    只按（专业, 考点原文）精确匹配——与 rubric_for 用同一把钥匙，
+    所以框架与判分参照天然一一对应，不会出现"提示讲的是另一道题"。
+    """
+    by_major = load_answer_outlines().get(str(major or ""))
+    if not isinstance(by_major, dict):
+        return None
+    entry = by_major.get(str(topic or "").strip())
+    if not isinstance(entry, dict):
+        return None
+    steps = [str(s).strip() for s in (entry.get("outline") or []) if str(s).strip()]
+    if not steps:
+        return None
+    return {"outline": steps, "avoid": str(entry.get("avoid") or "").strip()}
+
+
 def rubric_table(profile: dict[str, Any]) -> dict[str, Any]:
     """按本场面试类型取对应的参照表（专业桶 or 行为面桶）。
 
@@ -1554,15 +1647,29 @@ def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]
         entry = by_topic.get(topic)
         source = "library" if isinstance(entry, dict) else "generated"
         verdict, reason = topic_verdict(row, _veto_of(entry))
+        hit = _clean_list(row.get("must_hit"))
+        missed = _clean_list(row.get("missed"))
+        covered = len(hit)
+        planned = covered + len(missed)
+        # 占位行（missed == ["本场未问到"]）的 1 条"要点"其实是个标记，不是真要点；
+        # 直接按 planned 算会得出「0/1 = 0%」，把"没考"显示成"全错"。所以先归零。
+        if is_unasked(row):
+            planned = 0
         topics.append(
             {
                 "topic": topic,
                 "verdict": verdict,
                 "label": VERDICT_LABELS.get(verdict, verdict),
                 "reason": reason,
-                "missed": _clean_list(row.get("missed")),
+                "hit": hit,
+                "missed": missed,
                 "errors": _clean_list(row.get("errors")),
                 "source": source,
+                # 命中率 = 答到的要点 / 本场该考点考到的要点总数。
+                # 四态判定回答"过没过"，命中率回答"差多少"——同样是 partial，
+                # 5 条答到 4 条和 5 条答到 1 条，报告里应该长得不一样。
+                # 未问到（没有要点可比）给 None，避免把"没考"算成"全错"。
+                "rate": round(covered / planned, 3) if planned else None,
             }
         )
 
@@ -1571,6 +1678,12 @@ def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]
         counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
 
     library = sum(1 for t in topics if t["source"] == "library")
+    # 整场命中率：只把「真的判过」的考点算进分母（未问到的不算），按要点数加权，
+    # 而不是把每个考点的百分比再平均一遍——后者会让只考了 2 条要点的考点
+    # 和考了 6 条的考点权重相同。
+    judged = [t for t in topics if t["verdict"] != VERDICT_UNKNOWN]
+    hit_sum = sum(len(t["hit"]) for t in judged)
+    planned_sum = sum(len(t["hit"]) + len(t["missed"]) for t in judged)
     return {
         "topics": topics,
         "counts": counts,
@@ -1579,4 +1692,7 @@ def aggregate_rubric_check(profile: dict[str, Any], rows: Any) -> dict[str, Any]
         "weak": [t for t in topics if t["verdict"] in (VERDICT_FAIL, VERDICT_PARTIAL)],
         "library": library,
         "generated": len(topics) - library,
+        "hit_total": hit_sum,
+        "planned_total": planned_sum,
+        "hit_rate": round(hit_sum / planned_sum, 3) if planned_sum else None,
     }

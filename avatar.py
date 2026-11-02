@@ -83,19 +83,28 @@ _BARS = 7
 _BINS = [1, 2, 3, 5, 8, 13, 21]
 
 
+def _audio_mime(audio: bytes) -> str:
+    """按容器判 MIME：智谱给 WAV，硅基流动/edge 给 MP3。
+
+    WebAudio 的 decodeAudioData 其实不看 MIME，但 <audio> 的 data URI 会看，
+    写死 audio/mpeg 播 WAV 有的浏览器会静默不出声。
+    """
+    return "audio/wav" if bytes(audio[:4]) == b"RIFF" else "audio/mpeg"
+
+
 def _audio_attr(audio: bytes | None) -> str:
-    """把 mp3 字节编成 data URI；没有音频时返回空串（不影响 DOM 合法性）。"""
+    """把音频字节编成 data URI；没有音频时返回空串（不影响 DOM 合法性）。"""
     if not audio:
         return ""
     encoded = base64.b64encode(audio).decode("ascii")
-    return f'src="data:audio/mpeg;base64,{encoded}"'
+    return f'src="data:{_audio_mime(audio)};base64,{encoded}"'
 
 
 def _audio_src(audio: bytes | None) -> str:
     """只返回 data URI 字符串（WebAudio 的 fetch 需要它）。"""
     if not audio:
         return ""
-    return "data:audio/mpeg;base64," + base64.b64encode(audio).decode("ascii")
+    return f"data:{_audio_mime(audio)};base64," + base64.b64encode(audio).decode("ascii")
 
 
 @lru_cache(maxsize=1)

@@ -29,7 +29,25 @@ from openai import OpenAI
 
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
-SF_TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
+
+# 硅基流动的 TTS 模型，**按顺序试**，第一个成功就返回。
+#
+# v17 实测（2026-10-24，同一把 Key、同一个端点）：
+#   · `FunAudioLLM/CosyVoice2-0.5B`：参数校验正常（换假 voice 0.4 秒返 400
+#     `Invalid voice`、换假 model 0.3 秒返 400 `Model does not exist`），
+#     但请求合法时**一个字节都不返回**——Alex / Claire / Diana / Benjamin /
+#     Charles 五个音色全部在 25~180 秒处读超时；
+#   · 同一把 Key 调 `/v1/chat/completions` 0.5 秒 200、调
+#     `/v1/audio/transcriptions` 25 秒转写成功 —— 网关、鉴权、网络都没问题，
+#     卡的是这个模型的推理服务；
+#   · `fnlp/MOSS-TTSD-v0.5`：1.2 秒出声，五个音色全部可用且互不相同。
+# 所以把能用的排第一，坏的那个留作兜底（服务端状态会变，哪天可能反过来）。
+SF_TTS_MODELS: tuple[str, ...] = (
+    "fnlp/MOSS-TTSD-v0.5",
+    "FunAudioLLM/CosyVoice2-0.5B",
+)
+# 兼作默认值，保留旧名字以免外部引用断掉
+SF_TTS_MODEL = SF_TTS_MODELS[0]
 
 # 识别后纠错用的模型：复用项目已经接入的 DeepSeek，不新增依赖
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -51,13 +69,19 @@ REQUEST_TIMEOUT = 60.0
 TTS_TIMEOUT = 25.0
 CORRECT_TIMEOUT = 20.0
 
+# 单个 TTS 模型给多久。用模型链兜底时，不能给每个都 25 秒——两个都挂就是 50 秒，
+# 比整体 TTS_TIMEOUT 还长就失去意义了。10 秒够正常模型出声（实测 1.2 秒）。
+SF_TTS_ATTEMPT_TIMEOUT = 10.0
+
 # 音色表：界面下拉显示中文名，底层是 edge-tts 的 voice id
+# （这套 id 现在只是「音色的内部标识」，edge 自己已经 403 用不上了，
+#  智谱与硅基流动都靠下面的映射表把它们翻成各自的音色名。
+#  「云扬（播报腔）」2026-10-24 按用户要求下线，四个音色已够用。）
 VOICES: dict[str, str] = {
     "女声 · 晓晓（亲和自然）": "zh-CN-XiaoxiaoNeural",
     "男声 · 云希（沉稳）": "zh-CN-YunxiNeural",
     "女声 · 晓伊（年轻）": "zh-CN-XiaoyiNeural",
     "男声 · 云健（浑厚）": "zh-CN-YunjianNeural",
-    "男声 · 云扬（播报腔）": "zh-CN-YunyangNeural",
 }
 
 DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
@@ -68,8 +92,40 @@ SF_VOICES: dict[str, str] = {
     "zh-CN-YunxiNeural": "alex",  # 沉稳男声
     "zh-CN-XiaoyiNeural": "diana",  # 欢快女声（年轻感）
     "zh-CN-YunjianNeural": "benjamin",  # 低沉男声（浑厚）
-    "zh-CN-YunyangNeural": "charles",  # 磁性男声（播报腔）
 }
+
+# 智谱 GLM-TTS。它是目前**唯一稳定出声**的通道（edge-tts 403、硅基流动的
+# CosyVoice2 会卡在推理阶段），所以排在链首。
+ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+ZHIPU_TTS_MODEL = "glm-tts"
+
+# edge voice id -> 智谱音色名（2026-10-24 由用户试听后指定：
+# 晓晓=tongtong、云希=xiaochen、晓伊=female、云健=male）。
+# 智谱**会校验音色名**（乱填返回 400 {"code":"1214","message":"音色不存在"}），
+# 所以这张表就是白名单；下面 `_synth_zhipu` 还留了一层兜底，
+# 防的是哪天官方把音色改名导致整场没声音。
+ZHIPU_VOICES: dict[str, str] = {
+    "zh-CN-XiaoxiaoNeural": "tongtong",  # 亲和自然
+    "zh-CN-YunxiNeural": "xiaochen",  # 沉稳
+    "zh-CN-XiaoyiNeural": "female",  # 年轻
+    "zh-CN-YunjianNeural": "male",  # 浑厚
+}
+
+# 智谱只接受 wav 或 pcm（mp3/flac/opus 一律 400 1214）。
+# 实测同一句 34 字：返回耗时中位数约 2.9 秒，最慢见过 41 秒（冷启动/排队）。
+# 12 秒 = 中位数的 4 倍，慢到这份上就不值得让候选人干等了，直接换下一条通道。
+ZHIPU_TTS_TIMEOUT = 12.0
+
+# 智谱熔断：余额不足（429 / code 1113）是账号级问题，长熔断；
+# 超时、5xx 算瞬时。
+_ZHIPU_RETRY_AFTER_HARD = 600
+_ZHIPU_RETRY_AFTER_SOFT = 60
+_zhipu_down_until = 0.0
+# 瞬时失败连续两次才熔断。实测 8 连发全部 1.7~3.1 秒，但偶发一次 12 秒超时
+# （接线测试里真遇到过）。如果一次超时就熔断 60 秒，接下来一分钟里每轮
+# 都只能靠下一条通道——用户听到的是"这一分钟都没声音"，比偶发慢一轮更糟。
+_zhipu_fail_streak = 0
+_ZHIPU_FAIL_LIMIT = 2
 
 # edge-tts 熔断时长（秒）。分两档：永久性故障（403 拒绝第三方客户端）长熔断，
 # 瞬时故障（超时、连接重置、空音频）短熔断——只抖一下不该停掉十分钟。
@@ -97,6 +153,10 @@ _MP3_HEADER_MIN = 4
 # TXXX 水印帧），这种文件首字节是 "ID3" 而不是 0xFF，同样是可以播的音频。
 _ID3_MAGIC = b"ID3"
 _ID3_HEADER_LEN = 10
+# 智谱 GLM-TTS 只给 WAV（RIFF 容器）。44 字节是标准 PCM 头的长度，
+# 比它还短说明只有头没有音频数据。
+_WAV_MAGIC = b"RIFF"
+_WAV_HEADER_MIN = 44
 
 # 语气由两条正交的轴叠加：难度档给基线，情绪状态给偏移。
 # 值是 (语速偏移 %, 音调偏移 Hz)。每句再叠一点随机抖动，
@@ -218,11 +278,18 @@ def synthesize(
     level: str = "B",
     mood: str = "",
     fallback_key: str = "",
+    zhipu_key: str = "",
 ) -> bytes:
-    """把文字合成成 mp3 字节：edge-tts 优先，失败自动换硅基流动（需传 fallback_key）。
+    """把文字合成成音频：智谱 → 硅基流动 → edge-tts，逐级降级。
+
+    顺序是实测定的（2026-10-24）：
+    - **智谱 GLM-TTS**（`zhipu_key`）：唯一稳定出声的通道，34 字约 2.9 秒；
+    - **硅基流动 MOSS-TTSD**（`fallback_key`）：CosyVoice2 的推理服务会卡死
+      （校验 0.3 秒过、合成 120 秒无字节），MOSS 正常，1.2 秒出声；
+    - **edge-tts**：自 2026-10 起对第三方客户端 403，放在最后只是留个念想。
 
     edge-tts 是异步接口，而 Streamlit 的脚本线程里没有事件循环，
-    所以这里用 asyncio.run 起一个临时循环收完整个音频流。
+    所以那一条用 asyncio.run 起临时循环收流。
 
     传进来的文本先过一遍 `tts_text` 清掉 markdown 记号：提示词要求面试官
     不要用 Markdown，但模型不总照做，漏出来的星号会被逐字念出来。
@@ -231,11 +298,50 @@ def synthesize(
     if not text:
         return b""
     rate, pitch = _tone_args(level, mood)
+    errors: list[str] = []
 
-    edge_error: Exception | None = None
+    # —— 通道一：智谱 ——
+    if zhipu_key:
+        if time.time() >= _zhipu_down_until:
+            try:
+                audio = _synth_zhipu(text, voice, rate, zhipu_key)
+                if is_valid_audio(audio):
+                    _reset_zhipu_streak()
+                    return audio
+                errors.append("智谱返回空音频或非 WAV 数据")
+                # 接口说成功却给不出能播的音频，多半是账号/模型侧问题，长熔断
+                _mark_zhipu_down(permanent=True)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"智谱={exc}")
+                _mark_zhipu_down(
+                    permanent=_is_permanent_zhipu_error(exc),
+                    transient_is_fatal=False,
+                )
+        else:
+            errors.append("智谱处于熔断期")
+
+    # —— 通道二：硅基流动 ——
+    if fallback_key and time.time() >= _sf_down_until:
+        try:
+            audio = _synth_siliconflow(text, voice, rate, fallback_key)
+            if is_valid_audio(audio):
+                return audio
+            errors.append("硅基流动返回空音频或非 MP3 数据")
+            _mark_sf_down(permanent=True)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"硅基流动={exc}")
+            unusable_output = "空音频" in str(exc)
+            _mark_sf_down(
+                permanent=unusable_output or _is_permanent_edge_error(exc)
+            )
+    elif fallback_key:
+        errors.append("硅基流动处于熔断期")
+
+    # —— 通道三：edge-tts（目前必然 403，留在最后） ——
     if time.time() >= _edge_down_until:
         # 瞬时故障重试、永久故障立刻放弃：把两类错误分开处理，
         # 否则一次网络抖动就会和"403 永久拒绝"一样把 edge 停用十分钟。
+        edge_error: Exception | None = None
         for attempt in range(_EDGE_MAX_ATTEMPTS):
             try:
                 audio = asyncio.run(_synth(text, voice, rate, pitch))
@@ -252,34 +358,52 @@ def synthesize(
                 time.sleep(0.4 * (attempt + 1))
         else:
             _mark_edge_down(permanent=False)
+        if edge_error is not None:
+            errors.append(f"edge-tts={edge_error}")
+    else:
+        errors.append("edge-tts 处于熔断期")
 
-    if fallback_key and time.time() >= _sf_down_until:
-        ok = False
-        sf_error: Exception | None = None
-        try:
-            audio = _synth_siliconflow(text, voice, rate, fallback_key)
-            ok = is_valid_audio(audio)
-            if not ok:
-                sf_error = RuntimeError("硅基流动返回空音频或非 MP3 数据")
-        except Exception as exc:  # noqa: BLE001
-            sf_error = exc
-        if ok:
-            return audio
-        # 「返回了不可用的音频」按永久故障处理：接口说成功但给不出能播的 MP3，
-        # 多半是这个音色在这把 Key 下根本不可用，不必每分钟再去白等五秒。
-        unusable_output = sf_error is None or "空音频" in str(sf_error)
-        _mark_sf_down(
-            permanent=unusable_output or _is_permanent_edge_error(sf_error)
-        )
-        raise RuntimeError(
-            f"edge-tts 与硅基流动均合成失败：edge={edge_error}; sf={sf_error}"
-        ) from sf_error
+    if not errors:
+        raise RuntimeError("没有可用的语音通道：先在「🎙️ 语音与动效」里填一个 API Key")
+    raise RuntimeError("所有语音通道均失败：" + "；".join(errors))
 
-    if edge_error is not None:
-        raise edge_error
-    if fallback_key:
-        raise RuntimeError("edge-tts 与硅基流动都处于熔断期，暂时无法合成语音")
-    raise RuntimeError("edge-tts 暂不可用（熔断期内），且未配置硅基流动 Key")
+
+def _is_permanent_zhipu_error(exc: Exception) -> bool:
+    """智谱这个错误是永久性的吗？
+
+    余额不足（429 / code 1113）与鉴权失败（401/403）是账号级问题，
+    重试和换音色都没用，长熔断；超时、5xx 只算瞬时。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "1113" in text or "余额不足" in text:
+        return True
+    for marker in ("401", "403", "unauthorized", "forbidden", "authentication"):
+        if marker in text:
+            return True
+    return False
+
+
+def _mark_zhipu_down(permanent: bool, *, transient_is_fatal: bool = True) -> None:
+    """记一次智谱失败。永久性错误立刻长熔断；瞬时错误要连续两次才熔断。
+
+    `transient_is_fatal=False` 是 synthesize 里用的：偶发一次超时不该让
+    接下来一分钟全都放弃合成，下一轮再试一次的成本（最多 12 秒）比
+    "一分钟没声音"小得多。
+    """
+    global _zhipu_down_until, _zhipu_fail_streak
+    if permanent:
+        _zhipu_fail_streak = 0
+        _zhipu_down_until = time.time() + _ZHIPU_RETRY_AFTER_HARD
+        return
+    _zhipu_fail_streak += 1
+    if transient_is_fatal or _zhipu_fail_streak >= _ZHIPU_FAIL_LIMIT:
+        _zhipu_fail_streak = 0
+        _zhipu_down_until = time.time() + _ZHIPU_RETRY_AFTER_SOFT
+
+
+def _reset_zhipu_streak() -> None:
+    global _zhipu_fail_streak
+    _zhipu_fail_streak = 0
 
 
 def _id3_tag_end(data: bytes) -> int:
@@ -312,12 +436,26 @@ def is_valid_audio(data: bytes) -> bool:
     """
     if not bool(data) or len(data) < _MP3_HEADER_MIN:
         return False
+    if data.startswith(_WAV_MAGIC):
+        # 智谱返回的是 WAV：RIFF 头之后要有真实 PCM 数据，否则是空壳
+        return len(data) > _WAV_HEADER_MIN
     if data.startswith(_ID3_MAGIC):
         # 标签之后必须还有音频数据：只有标签、或标签长度本身超出整段数据，
         # 都说明拿到的不是可播音频
         end = _id3_tag_end(data)
         return end > 0 and len(data) > end
     return data[0] == _MP3_MAGIC
+
+
+def audio_format(data: bytes) -> str:
+    """音频字节的 MIME 类型，给 st.audio / 头像动效用。
+
+    不能让界面写死 "audio/mp3"：智谱给 WAV，写错格式有的浏览器不放。
+    判不出来时回落到 mp3——历史上唯一的来源就是 MP3。
+    """
+    if isinstance(data, (bytes, bytearray)) and bytes(data[:4]) == _WAV_MAGIC:
+        return "audio/wav"
+    return "audio/mp3"
 
 
 def _is_permanent_edge_error(exc: Exception) -> bool:
@@ -353,15 +491,17 @@ def _parse_status_codes(text: str) -> tuple[int, ...]:
 
 
 def reset_edge_breaker() -> None:
-    """手动解除 edge-tts 与硅基流动的熔断。
+    """手动解除三条语音通道的熔断。
 
     熔断本来是为了避免每轮都去撞一个已经不可用的接口；但用户在侧边栏
     点「重试语音合成」时必须真的重新试一次，否则点了也还是走兜底/直接跳过，
     看起来就像按钮坏了。
     """
-    global _edge_down_until, _sf_down_until
+    global _edge_down_until, _sf_down_until, _zhipu_down_until, _zhipu_fail_streak
     _edge_down_until = 0.0
     _sf_down_until = 0.0
+    _zhipu_down_until = 0.0
+    _zhipu_fail_streak = 0
 
 
 def _mark_sf_down(permanent: bool) -> None:
@@ -391,25 +531,91 @@ def _mark_edge_down(permanent: bool) -> None:
     )
 
 
-def _synth_siliconflow(text: str, voice: str, rate: str, api_key: str) -> bytes:
-    """硅基流动 CosyVoice2 合成。
+def _is_unknown_voice_error(exc: Exception) -> bool:
+    """智谱是否在说「音色不存在」（400 / code 1214）？
 
-    音色要写成 "模型名:音色名" 的形式（官方要求带模型前缀）；
-    语速用 speed 近似 edge-tts 的 rate 百分比（1.0 = 原速）。
+    实测：`voice="anna"`、`voice="zzz_definitely_not_a_voice"` 都返回
+    `{"code":"1214","message":"音色不存在"}`；而 1214 同时被用在
+    「不支持当前response_format值」上，所以还要看措辞里有「音色」。
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    return "1214" in text and "音色" in text
+
+
+def _synth_zhipu(text: str, voice: str, rate: str, api_key: str) -> bytes:
+    """智谱 GLM-TTS 合成，返回 WAV 字节。
+
+    两个实测出来的坑：
+    1. **只接受 wav / pcm**——mp3 / flac / opus 一律 400 1214「不支持当前response_format值」；
+    2. **会校验音色名**——错名字 400 1214「音色不存在」（我一开始误判成
+       「乱填也能过」，实测推翻：female / male 能过是因为它们本身就是官方音色）。
+       所以映射表兜一层，真报了这个错就换默认音色再试一次，
+       别让一个拼写错误让整场没声音。
+
+    `rate` 是 edge-tts 那套「+8% / -6%」格式，换算成智谱的 speed 倍数：
+    难度档与情绪本来就是这个项目区分快慢的唯一手段，丢掉它 A 档和 C 档
+    在语音上就没区别了。`speed=1.2` 实测被接受，换算区间 0.85~1.22 也在安全范围内。
+    """
+    client = OpenAI(api_key=api_key, base_url=ZHIPU_BASE_URL, max_retries=0)
+    speed = min(max(1.0 + int(rate.rstrip("%")) / 100.0, 0.5), 2.0)
+
+    def _call(tone: str) -> bytes:
+        result = client.audio.speech.create(
+            model=ZHIPU_TTS_MODEL,
+            voice=tone,
+            input=text,
+            response_format="wav",
+            speed=round(speed, 2),
+            timeout=ZHIPU_TTS_TIMEOUT,
+        )
+        return result.content
+
+    tone = ZHIPU_VOICES.get(voice, ZHIPU_VOICES[DEFAULT_VOICE])
+    try:
+        return _call(tone)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_unknown_voice_error(exc) or tone == ZHIPU_VOICES[DEFAULT_VOICE]:
+            raise
+        return _call(ZHIPU_VOICES[DEFAULT_VOICE])
+
+
+def _synth_siliconflow(text: str, voice: str, rate: str, api_key: str) -> bytes:
+    """硅基流动 TTS 合成：按 `SF_TTS_MODELS` 顺序试，第一个拿到能播的 MP3 就返回。
+
+    音色要写成 "模型名:音色名" 的形式（官方要求带模型前缀，缺前缀会 400
+    `Invalid voice`）。语速用 speed 近似 edge-tts 的 rate 百分比（1.0 = 原速）。
+
+    为什么要模型链：2026-10-24 实测 CosyVoice2 的推理服务卡死（参数校验正常、
+    合法请求零响应），换 MOSS-TTSD 1.2 秒就出声。把「哪个模型能用」写死成
+    单点，等于上游一抖整个语音功能就没了。
     """
     client = OpenAI(
         api_key=api_key, base_url=SILICONFLOW_BASE_URL, max_retries=0
     )
     speed = min(max(1.0 + int(rate.rstrip("%")) / 100.0, 0.25), 4.0)
-    result = client.audio.speech.create(
-        model=SF_TTS_MODEL,
-        voice=f"{SF_TTS_MODEL}:{SF_VOICES.get(voice, SF_VOICES[DEFAULT_VOICE])}",
-        input=text,
-        response_format="mp3",
-        speed=round(speed, 2),
-        timeout=TTS_TIMEOUT,
-    )
-    return result.content
+    per_model_timeout = min(TTS_TIMEOUT, SF_TTS_ATTEMPT_TIMEOUT)
+    tone = SF_VOICES.get(voice, SF_VOICES[DEFAULT_VOICE])
+
+    failures: list[str] = []
+    for model in SF_TTS_MODELS:
+        try:
+            result = client.audio.speech.create(
+                model=model,
+                voice=f"{model}:{tone}",
+                input=text,
+                response_format="mp3",
+                speed=round(speed, 2),
+                timeout=per_model_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{model}: {type(exc).__name__}: {exc}")
+            continue
+        audio = result.content
+        if is_valid_audio(audio):
+            return audio
+        failures.append(f"{model}: 返回空音频或非 MP3 数据")
+
+    raise RuntimeError("硅基流动 TTS 各模型均失败：" + "；".join(failures))
 
 
 async def _synth(text: str, voice: str, rate: str, pitch: str) -> bytes:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import time
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -21,6 +22,7 @@ from pathlib import Path
 import streamlit as st
 
 import calibration
+import delivery
 import history_store
 import interview_state
 import jd_match
@@ -50,6 +52,7 @@ from knowledge import (
     VERDICT_PARTIAL,
     VERDICT_UNKNOWN,
     aggregate_rubric_check,
+    answer_outline,
     build_profile,
     level_labels,
     profile_summary,
@@ -60,6 +63,7 @@ from resume import ACCEPTED_TYPES, extract_text
 from voice import (
     DEFAULT_VOICE,
     VOICES,
+    audio_format,
     correct_asr,
     is_valid_audio,
     reset_edge_breaker,
@@ -74,6 +78,7 @@ ACTION_LABELS = {"ask": "换新题", "probe": "追问", "reflect": "反馈", "en
 
 DEEPSEEK_KEY_ENV = "DEEPSEEK_API_KEY"
 SILICONFLOW_KEY_ENV = "SILICONFLOW_API_KEY"
+ZHIPU_KEY_ENV = "ZHIPU_API_KEY"
 
 
 def load_api_key(env_name: str) -> str:
@@ -100,6 +105,11 @@ def load_api_key(env_name: str) -> str:
 def siliconflow_key() -> str:
     """硅基流动 Key：环境变量优先，其次是侧边栏手填的那个输入框。"""
     return st.session_state.sf_key or st.session_state.get("sf_key_input", "")
+
+
+def zhipu_key() -> str:
+    """智谱 Key：同样环境变量优先，其次侧边栏手填。语音合成目前主要靠它。"""
+    return st.session_state.zhipu_key or st.session_state.get("zhipu_key_input", "")
 
 
 def _last_question() -> str:
@@ -1139,6 +1149,7 @@ def init_state() -> None:
         # checkbox 自己管理。两边都设会让 Streamlit 报"默认值与 Session State 冲突"。
         "api_key": load_api_key(DEEPSEEK_KEY_ENV),
         "sf_key": load_api_key(SILICONFLOW_KEY_ENV),
+        "zhipu_key": load_api_key(ZHIPU_KEY_ENV),
         "error": "",
         # 简历只存在于内存：不落盘、不进历史记录，面试结束即清空
         "resume_text": "",
@@ -1173,6 +1184,11 @@ def init_state() -> None:
         # 的语音合成（文字面试照常），侧边栏给出可一键恢复的说明。
         "tts_failures": 0,
         "tts_note": "",
+        # 表达指标用的计时：面试官问完的时刻（time.time()）与本轮语音识别耗时。
+        # 记在本会话状态里而不是写进消息，是因为它只对本轮有意义；
+        # 提交回答时把差值写进 user 消息的 elapsed 字段，才随逐字稿落盘。
+        "answer_started_at": 0.0,
+        "asr_seconds": 0.0,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1253,6 +1269,7 @@ def speak(text: str) -> None:
             level,
             current_mood,
             fallback_key=siliconflow_key(),
+            zhipu_key=zhipu_key(),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[TTS 失败] {exc}", file=sys.stderr, flush=True)
@@ -1348,6 +1365,9 @@ def advance() -> None:
     st.session_state.history.append(
         {"role": "assistant", "content": data["reply"], "decision": data}
     )
+    # 表达指标：记下"面试官问完"的时刻，候选人提交时算差值就是答题时长。
+    # 放在 append 之后、TTS 之前——TTS 是同步阻塞的，合成几秒不该算进答题时间。
+    st.session_state.answer_started_at = time.time()
     # TTS 是同步阻塞的，合成一幕可能要好几秒；只在真的要合成时才挂进度提示。
     if st.session_state.voice_on and not st.session_state.get("tts_note"):
         with st.spinner("面试官正在开口…"):
@@ -1936,6 +1956,16 @@ def _tier_distribution_caption(profile: dict, rubric_check: list[dict]) -> str:
     return line + "。"
 
 
+def _rate_text(hit: Any, missed: Any) -> str:
+    """要点命中率的一格文本：`3/5（60%）`；没有可比要点时给「—」。"""
+    got = len([x for x in (hit or []) if str(x).strip()])
+    lost = len([x for x in (missed or []) if str(x).strip()])
+    total = got + lost
+    if not total:
+        return "—"
+    return f"{got}/{total}（{got * 100 // total}%）"
+
+
 def _render_rubric_check_block(rubric_check: list[dict], asked_topics: list[str]) -> dict:
     """渲染报告页的「考点级判定」，并按判定依据的来源分区。
 
@@ -1951,11 +1981,18 @@ def _render_rubric_check_block(rubric_check: list[dict], asked_topics: list[str]
     labels = {t["topic"]: t["label"] for t in agg["topics"]}
     sources = {t["topic"]: t["source"] for t in agg["topics"]}
     counts = agg["counts"]
-    st.markdown(
+    summary = (
         f"**考点级判定**：共 {agg['total']} 个考点，通过 {agg['passed']} 个，"
         f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个，"
         f"本场未问到 {counts[VERDICT_UNKNOWN]} 个。"
     )
+    # 命中率回答"差多少"：同样是部分通过，5 条答到 4 条和 5 条答到 1 条不一样。
+    if agg.get("hit_rate") is not None:
+        summary += (
+            f"\n\n**要点命中率**：{agg['hit_total']} / {agg['planned_total']}"
+            f"（{agg['hit_rate'] * 100:.0f}%），只统计本场真的判过的考点。"
+        )
+    st.markdown(summary)
     if agg["generated"]:
         st.caption(
             f"其中 {agg['library']} 条的判定依据来自自建考点库（人工核对过），"
@@ -1971,7 +2008,13 @@ def _render_rubric_check_block(rubric_check: list[dict], asked_topics: list[str]
     if agg["weak"]:
         for entry in agg["weak"]:
             tag = "" if entry["source"] == "library" else "（现拟）"
-            st.markdown(f"- {entry['label']}｜{entry['topic']}{tag}：{entry['reason']}")
+            rate = (
+                f"（要点 {len(entry['hit'])}/{len(entry['hit']) + len(entry['missed'])}）"
+                if entry.get("rate") is not None
+                else ""
+            )
+            st.markdown(f"- {entry['label']}{rate}｜{entry['topic']}{tag}：{entry['reason']}")
+        _render_answer_outline(agg["weak"], (st.session_state.profile or {}).get("major", ""))
     tier_line = _tier_distribution_caption(profile, rubric_check)
     if tier_line:
         st.markdown(tier_line)
@@ -1986,6 +2029,7 @@ def _render_rubric_check_block(rubric_check: list[dict], asked_topics: list[str]
                     "考点": item.get("topic", ""),
                     "来源": "考点库" if sources.get(item.get("topic", "")) == "library" else "现拟",
                     "判定": labels.get(item.get("topic", ""), ""),
+                    "命中率": _rate_text(item.get("must_hit"), item.get("missed")),
                     "已命中": "；".join(str(x) for x in (item.get("must_hit") or [])),
                     "遗漏": "；".join(str(x) for x in (item.get("missed") or [])),
                     "误区": "；".join(str(x) for x in (item.get("errors") or [])),
@@ -1996,6 +2040,56 @@ def _render_rubric_check_block(rubric_check: list[dict], asked_topics: list[str]
             hide_index=True,
         )
     return agg
+
+
+def _answer_outline_lines(entries: list[dict], major: str) -> list[str]:
+    """把「这类题该怎么答」渲染成 Markdown 行，导出与页面共用同一份判断。
+
+    做成纯函数是为了可测：导出路径在 AppTest 里拿不到 download_button 的载荷，
+    所以把"该输出什么"与"怎么塞进 Streamlit"分开。
+    """
+    lines = [
+        "### 这类题该怎么答",
+        "",
+        "> 只给结构，不给标准答案：照着念不会加分，评分看的是你自己讲出的要点。",
+    ]
+    for entry in entries:
+        outline = answer_outline(major, str(entry.get("topic", "")))
+        if not outline:
+            continue
+        lines += ["", f"**{entry['topic']}**", ""]
+        for idx, step in enumerate(outline["outline"], 1):
+            lines.append(f"{idx}. {step}")
+        if outline["avoid"]:
+            lines += ["", f"别这么说：{outline['avoid']}"]
+    return lines if len(lines) > 3 else []
+
+
+def _render_answer_outline(entries: list[dict], major: str) -> None:
+    """给没过/部分过的考点配一段「这类题该怎么答」。
+
+    数据来自 answer_outline.json，与 must_hit 是两套东西：这里是**答题动作**
+    （先说什么、再说什么、别踩哪句），不是判分要点本身，也不给标准话术。
+    刻意只在报告页出现、面试前不给——先看提纲再开口，练的是背不是答。
+    """
+    hits = []
+    for entry in entries:
+        outline = answer_outline(major, str(entry.get("topic", "")))
+        if outline:
+            hits.append((entry, outline))
+    if not hits:
+        return
+    with st.expander(f"这类题该怎么答（{len(hits)} 条有框架）"):
+        st.caption(
+            "只给结构，不给标准答案：照着念不会加分，评分看的是你自己讲出的要点。"
+            "这些框架按「专业 + 考点原文」一一对应，所以不会给你看错题。"
+        )
+        for entry, outline in hits:
+            st.markdown(f"**{entry['topic']}**")
+            for idx, step in enumerate(outline["outline"], 1):
+                st.markdown(f"{idx}. {step}")
+            if outline["avoid"]:
+                st.caption(f"别这么说：{outline['avoid']}")
 
 
 def _render_jd_progress_block(profile: dict, rubric_check: list[dict]) -> None:
@@ -2229,9 +2323,21 @@ def _render_voice_section() -> None:
             help="在 siliconflow.cn 申请，用于语音识别；不填仍然可以用文字作答。",
         )
 
+    st.divider()
+    if st.session_state.zhipu_key:
+        st.caption("🔊 智谱 API Key 已从环境变量读取")
+    else:
+        st.text_input(
+            "智谱 API Key（面试官朗读）",
+            type="password",
+            key="zhipu_key_input",
+            help="在 bigmodel.cn 申请，用于把面试官的问题读出来。"
+            "不填则退回硅基流动合成；两个都没有就只显示文字。",
+        )
+
     st.caption(
-        "录音会上传到硅基流动做识别，不做保存；面试官的声音默认由 edge-tts 合成，"
-        "如不可用会自动改用硅基流动（复用同一把 Key）。识别失败会自动退回文字输入。"
+        "录音会上传到硅基流动做识别，不做保存；面试官的声音优先用智谱 GLM-TTS 合成，"
+        "失败时依次退回硅基流动（复用上面的 Key）与 edge-tts。识别失败会自动退回文字输入。"
     )
 
 
@@ -2380,6 +2486,21 @@ def render_page_header(meta: str) -> None:
     )
 
 
+def _answer_seconds() -> float:
+    """本轮答题时长（秒）：从面试官问完到候选人提交，扣掉语音识别耗时。
+
+    没有起点（旧快照恢复、开场就答）时返回 0，调用方按"无计时"处理——
+    把 0 当真实时长会让语速变成无穷大，所以宁可缺数据。
+    """
+    started = float(st.session_state.get("answer_started_at") or 0.0)
+    if started <= 0:
+        return 0.0
+    seconds = time.time() - started - float(st.session_state.get("asr_seconds") or 0.0)
+    st.session_state.asr_seconds = 0.0
+    # 上限 15 分钟：中途接电话、切窗口再回来，不该变成一条"语速极慢"的记录
+    return round(max(0.0, min(seconds, 900.0)), 1)
+
+
 def render_interview() -> None:
     profile = st.session_state.profile
 
@@ -2419,7 +2540,7 @@ def render_interview() -> None:
                 # 动效组件接管自动播放时，这里的播放器只留手动回听，避免双重出声
                 st.audio(
                     audio,
-                    format="audio/mp3",
+                    format=audio_format(audio),
                     autoplay=(index == st.session_state.autoplay_index)
                     and not avatar_html,
                 )
@@ -2476,19 +2597,25 @@ def render_interview() -> None:
                 # 失败就在异常分支里 rerun，两种结局都让控件恢复干净）
                 st.session_state.voice_widget_gen += 1
                 with st.spinner("正在识别语音…"):
+                    asr_started = time.time()
                     try:
                         answer = transcribe(clip.getvalue(), sfc_key)
                         answer = _correct_voice(answer)
                     except Exception as exc:  # noqa: BLE001
                         st.session_state.error = f"语音识别失败：{exc}"
                         st.rerun()
+                    finally:
+                        # 识别是机器时间，不该算进候选人的答题时长（实测 25 秒左右）
+                        st.session_state.asr_seconds = time.time() - asr_started
                 if not answer:
                     st.rerun()
     elif st.session_state.voice_on and not answer and not sfc_key:
         st.caption("想用语音作答？在左侧填入硅基流动 API Key 后即可录音。")
 
     if answer:
-        st.session_state.history.append({"role": "user", "content": answer})
+        st.session_state.history.append(
+            {"role": "user", "content": answer, "elapsed": _answer_seconds()}
+        )
         # 先把回答存进快照，再调用模型：万一本轮模型报错，刷新后至少不会丢掉这句回答
         save_snapshot()
         with st.chat_message("user", avatar="🙋"):
@@ -2699,7 +2826,7 @@ def build_report_markdown() -> str:
                 )
                 add()
             table(
-                ["考点", "来源", "判定", "已命中", "遗漏", "误区"],
+                ["考点", "来源", "判定", "命中率", "已命中", "遗漏", "误区"],
                 [
                     [
                         item.get("topic", ""),
@@ -2707,6 +2834,7 @@ def build_report_markdown() -> str:
                         if sources.get(item.get("topic", "")) == "library"
                         else "现拟",
                         labels.get(item.get("topic", ""), ""),
+                        _rate_text(item.get("must_hit"), item.get("missed")),
                         "；".join(str(x) for x in (item.get("must_hit") or [])) or "—",
                         "；".join(str(x) for x in (item.get("missed") or [])) or "—",
                         "；".join(str(x) for x in (item.get("errors") or [])) or "—",
@@ -2721,11 +2849,20 @@ def build_report_markdown() -> str:
                 f"部分通过 {counts[VERDICT_PARTIAL]} 个，不通过 {counts[VERDICT_FAIL]} 个，"
                 f"本场未问到 {counts[VERDICT_UNKNOWN]} 个。"
             )
+            if agg.get("hit_rate") is not None:
+                add(
+                    f"**要点命中率**：{agg['hit_total']} / {agg['planned_total']}"
+                    f"（{agg['hit_rate'] * 100:.0f}%），只统计本场真的判过的考点。"
+                )
             if agg["weak"]:
                 add()
                 for entry in agg["weak"]:
                     tag = "" if entry["source"] == "library" else "（现拟）"
                     add(f"- {entry['label']}｜{entry['topic']}{tag}：{entry['reason']}")
+                add()
+                for line in _answer_outline_lines(agg["weak"], profile.get("major", "")):
+                    if line:
+                        add(line)
             tier_line = _tier_distribution_caption(profile, rubric_check)
             if tier_line:
                 add()
@@ -2780,6 +2917,31 @@ def build_report_markdown() -> str:
                     else:
                         add("本场目标考点都通过了。")
                     add()
+
+        delivery_metrics = delivery.session_metrics(
+            [m for m in (st.session_state.get("history") or []) if isinstance(m, dict)]
+        )
+        if delivery_metrics["count"]:
+            add("### 表达节奏")
+            add()
+            add("> 本机计时，不经过模型；时长从面试官问完算到提交回答，已扣掉语音识别耗时。")
+            add()
+            add(delivery.summary_line(delivery_metrics, str(profile.get("level") or "B")))
+            add()
+            table(
+                ["轮次", "字数", "答题时长（秒）", "语速（字/秒）", "填充词"],
+                [
+                    [
+                        row["index"],
+                        row["chars"],
+                        row["seconds"],
+                        row["chars_per_second"],
+                        row["fillers"],
+                    ]
+                    for row in delivery_metrics["rows"]
+                ],
+            )
+
         resume_check = evaluation.get("resume_check")
         if isinstance(resume_check, dict):
             issues = [x for x in (resume_check.get("issues") or []) if isinstance(x, dict)]
@@ -3184,6 +3346,82 @@ def render_history_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _delta(value: float, unit: str) -> str:
+    """把差值写成 `+12 字` / `-3 字` / `持平`。"""
+    if abs(value) < 0.5:
+        return "持平"
+    return f"{'+' if value > 0 else ''}{round(value)}{unit}"
+
+
+def _previous_transcript() -> list[dict]:
+    """上一场的逐字稿：按时间取最近一条，排除当前这场。"""
+    current = str(st.session_state.get("record_time") or "")
+    prior = [
+        record
+        for record in load_records()
+        if isinstance(record, dict) and str(record.get("time") or "") != current
+    ]
+    if not prior:
+        return []
+    newest = max(prior, key=lambda record: str(record.get("time") or ""))
+    return [item for item in (newest.get("transcript") or []) if isinstance(item, dict)]
+
+
+def _render_delivery_block(profile: dict, transcript: list[dict]) -> None:
+    """表达节奏：字数、答题时长、语速、语气填充词。
+
+    全在本机算，不调模型——这是报告里唯一不随模型心情变化的量化段落。
+    旧记录没有 elapsed 字段，只会少统计、不会算错（见 delivery.session_metrics）。
+    """
+    metrics = delivery.session_metrics(transcript)
+    if not metrics["count"]:
+        if metrics["skipped"]:
+            st.caption("表达节奏：本场没有可用的计时数据（旧记录或回答过短），无法统计语速。")
+        return
+    st.markdown("**表达节奏**（本机计时，不经过模型）")
+    line = delivery.summary_line(metrics, str(profile.get("level") or "B"))
+    if line:
+        st.markdown(line)
+    if metrics["skipped"]:
+        st.caption(f"另有 {metrics['skipped']} 条回答没有计时或不足 8 字，未计入统计。")
+
+    previous = delivery.session_metrics(_previous_transcript())
+    if previous["count"]:
+        current_avg = metrics["chars"] / metrics["count"]
+        previous_avg = previous["chars"] / previous["count"]
+        bits = [
+            f"平均每题 {round(current_avg)} 字"
+            f"（上一场 {round(previous_avg)} 字，{_delta(current_avg - previous_avg, ' 字')}）"
+        ]
+        if metrics["chars_per_second"] and previous["chars_per_second"]:
+            bits.append(
+                f"语速 {metrics['chars_per_second']:g} 字/秒（上一场 {previous['chars_per_second']:g}）"
+            )
+        bits.append(
+            f"填充词 {metrics['filler_per_100']:g} 个/百字（上一场 {previous['filler_per_100']:g}）"
+        )
+        st.caption("和上一场比：" + "；".join(bits))
+
+    with st.expander("每题的字数与语速"):
+        st.caption(
+            "时长从面试官问完算到提交回答，已扣掉语音识别耗时；"
+            "语速是参考带不是评分标准，紧张时会自然加快。"
+        )
+        st.dataframe(
+            [
+                {
+                    "轮次": row["index"],
+                    "字数": row["chars"],
+                    "答题时长（秒）": row["seconds"],
+                    "语速（字/秒）": row["chars_per_second"],
+                    "填充词": row["fillers"],
+                }
+                for row in metrics["rows"]
+            ],
+            hide_index=True,
+        )
+
+
 def render_report() -> None:
     render_page_header("本场面试已结束 · 复盘报告")
     st.success(f"面试已结束 · {profile_summary(st.session_state.profile)}")
@@ -3311,6 +3549,13 @@ def render_report() -> None:
                 # session_progress 会把每条都算成 unknown，按钮照样给出——
                 # 这正是「这场没判出来」时用户最需要的出口。
                 _render_jd_progress_block(st.session_state.profile or {}, rubric_check)
+
+            # 表达节奏与会话判定无关：即便这场的 rubric_check 是空的，
+            # 逐字稿里的字数与时长照样算得出来，不该跟着一起消失。
+            _render_delivery_block(
+                st.session_state.profile or {},
+                [m for m in (st.session_state.get("history") or []) if isinstance(m, dict)],
+            )
 
             resume_check = evaluation.get("resume_check")
             if isinstance(resume_check, dict):

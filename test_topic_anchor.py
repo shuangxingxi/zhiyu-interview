@@ -124,8 +124,9 @@ class TestUnanchoredTopics(unittest.TestCase):
 
     def test_behavior_session_anchors_all_of_its_topics(self):
         profile = make_profile("行为面")
+        # 行为面按难度档分池（v17），取本档自己的池，不能用三档并集切片。
         self.assertEqual(
-            knowledge.unanchored_topics(profile, knowledge.BEHAVIOR_TOPICS[:3]), []
+            knowledge.unanchored_topics(profile, knowledge.behavior_topics("B")[:3]), []
         )
 
 

@@ -4,6 +4,7 @@
 真机合成需要网络，属于 `_verify_live` 那类手动验证的范围。
 """
 
+import time
 import types
 import unittest
 
@@ -221,7 +222,49 @@ class TestCallTimeouts(unittest.TestCase):
         self._install_fake()
         voice._synth_siliconflow("你好", voice.DEFAULT_VOICE, "+0%", "sk-test")
         self.assertEqual(self.sink["client"].get("max_retries"), 0, "SDK 会自己重试 2 次，必须显式关掉")
-        self.assertEqual(self.sink["speech"]["timeout"], voice.TTS_TIMEOUT)
+        # 单个模型的上限必须短于整体 TTS_TIMEOUT，否则模型链兜底就失去意义
+        self.assertEqual(self.sink["speech"]["timeout"], voice.SF_TTS_ATTEMPT_TIMEOUT)
+        self.assertLessEqual(voice.SF_TTS_ATTEMPT_TIMEOUT, voice.TTS_TIMEOUT)
+
+    def test_usable_model_is_tried_first(self):
+        # 2026-10-24 实测：CosyVoice2 合法请求零响应，MOSS-TTSD 1.2 秒出声。
+        # 把能用的排在前面，坏了的那次等才花得值。
+        self.assertEqual(voice.SF_TTS_MODELS[0], "fnlp/MOSS-TTSD-v0.5")
+        self.assertIn("FunAudioLLM/CosyVoice2-0.5B", voice.SF_TTS_MODELS)
+
+    def test_falls_through_to_the_next_model(self):
+        # 第一个模型抛异常时必须换下一个，而不是直接失败
+        self._install_fake()
+        calls = []
+
+        class _Flaky:
+            def create(self, **kwargs):
+                calls.append(kwargs["model"])
+                if len(calls) == 1:
+                    raise TimeoutError("模拟上游挂起")
+                return types.SimpleNamespace(
+                    content=b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\x00" * 32
+                )
+
+        voice.OpenAI = lambda **kwargs: types.SimpleNamespace(
+            audio=types.SimpleNamespace(speech=_Flaky())
+        )
+        audio = voice._synth_siliconflow("你好", voice.DEFAULT_VOICE, "+0%", "sk-test")
+        self.assertTrue(voice.is_valid_audio(audio))
+        self.assertEqual(calls, list(voice.SF_TTS_MODELS[:2]))
+
+    def test_raises_with_each_model_when_all_fail(self):
+        def _boom(**kwargs):
+            raise TimeoutError("都挂了")
+
+        voice.OpenAI = lambda **kwargs: types.SimpleNamespace(
+            audio=types.SimpleNamespace(speech=types.SimpleNamespace(create=_boom))
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            voice._synth_siliconflow("你好", voice.DEFAULT_VOICE, "+0%", "sk-test")
+        message = str(ctx.exception)
+        for model in voice.SF_TTS_MODELS:
+            self.assertIn(model, message)
 
     def test_transcribe_does_not_retry(self):
         self._install_fake()
@@ -278,5 +321,207 @@ class TestToneArgs(unittest.TestCase):
                     self.assertLessEqual(p, 50)
 
 
+class TestZhipuTts(unittest.TestCase):
+    """智谱 GLM-TTS：音色映射、未知音色的兜底、WAV 校验、通道优先级。
+
+    背景（2026-10-24 实测）：edge-tts 403、硅基流动 CosyVoice2 卡在推理阶段，
+    智谱成了唯一稳定出声的通道（34 字约 2.9 秒）。两个坑记在这里：
+    ① 只接受 wav / pcm，mp3 会 400 1214；
+    ② **会校验音色名**，乱填返回 400 1214「音色不存在」——我一开始误判成
+       「乱填也能过」，实测用 `anna` 推翻了自己的结论。
+    """
+
+    # 实测可用、且被服务端接受过的音色名（白名单的唯一来源）
+    MEASURED = {
+        "tongtong",
+        "chuichui",
+        "xiaochen",
+        "jam",
+        "kazi",
+        "douji",
+        "luodo",
+        "female",
+        "male",
+    }
+
+    def setUp(self):
+        self._orig_openai = voice.OpenAI
+        self._state = (
+            voice._zhipu_down_until,
+            voice._zhipu_fail_streak,
+            voice._edge_down_until,
+            voice._sf_down_until,
+        )
+        voice._zhipu_down_until = 0.0
+        voice._zhipu_fail_streak = 0
+        voice._edge_down_until = time.time() + 3600  # 别让测试真去连 edge
+        voice._sf_down_until = 0.0
+
+    def tearDown(self):
+        voice.OpenAI = self._orig_openai
+        (
+            voice._zhipu_down_until,
+            voice._zhipu_fail_streak,
+            voice._edge_down_until,
+            voice._sf_down_until,
+        ) = self._state
+
+    def _install(self, sink, content=None):
+        payload = content if content is not None else (
+            b"RIFF\x24\x08\x00\x00WAVEfmt " + b"\x00" * 32
+        )
+
+        class _Speech:
+            def create(self, **kwargs):
+                sink.append(kwargs)
+                return types.SimpleNamespace(content=payload)
+
+        voice.OpenAI = lambda **kwargs: types.SimpleNamespace(
+            audio=types.SimpleNamespace(speech=_Speech())
+        )
+
+    def test_yunyang_is_gone_everywhere(self):
+        # 用户 2026-10-24 决定砍掉「播报腔」，三张表都不能残留
+        self.assertNotIn("zh-CN-YunyangNeural", voice.VOICES.values())
+        self.assertNotIn("zh-CN-YunyangNeural", voice.SF_VOICES)
+        self.assertNotIn("zh-CN-YunyangNeural", voice.ZHIPU_VOICES)
+        self.assertNotIn("charles", voice.SF_VOICES.values())
+
+    def test_every_selectable_voice_has_a_zhipu_tone(self):
+        # 界面上能选几个，映射表就得覆盖几个，否则选到某个就没声音
+        self.assertEqual(set(voice.ZHIPU_VOICES), set(voice.VOICES.values()))
+
+    def test_zhipu_tones_are_whitelisted(self):
+        self.assertTrue(set(voice.ZHIPU_VOICES.values()) <= self.MEASURED)
+
+    def test_unknown_voice_falls_back_to_default(self):
+        sink = []
+        self._install(sink)
+        audio = voice._synth_zhipu("测试", "zh-CN-UnknownNeural", "+0%", "k")
+        self.assertTrue(voice.is_valid_audio(audio))
+        self.assertEqual(sink[0]["voice"], voice.ZHIPU_VOICES[voice.DEFAULT_VOICE])
+
+    def test_unknown_voice_error_retries_with_default(self):
+        calls = []
+
+        def _create(**kwargs):
+            calls.append(kwargs["voice"])
+            if len(calls) == 1:
+                raise RuntimeError('400: {"code":"1214","message":"音色不存在"}')
+            return types.SimpleNamespace(content=b"RIFF\x24\x08\x00\x00WAVEfmt " + b"\x00" * 32)
+
+        # 必须用**非默认**音色：默认音色再回落到默认就是原地打转，代码会直接抛
+        voice.OpenAI = lambda **kwargs: types.SimpleNamespace(
+            audio=types.SimpleNamespace(speech=types.SimpleNamespace(create=_create))
+        )
+        audio = voice._synth_zhipu("测试", "zh-CN-YunxiNeural", "+0%", "k")
+        self.assertTrue(voice.is_valid_audio(audio))
+        self.assertEqual(len(calls), 2, "音色不存在应当换默认音色再试一次")
+        self.assertEqual(calls[1], voice.ZHIPU_VOICES[voice.DEFAULT_VOICE])
+
+    def test_other_errors_are_not_retried(self):
+        calls = []
+
+        def _create(**kwargs):
+            calls.append(kwargs)
+            raise TimeoutError("Request timed out.")
+
+        voice.OpenAI = lambda **kwargs: types.SimpleNamespace(
+            audio=types.SimpleNamespace(speech=types.SimpleNamespace(create=_create))
+        )
+        with self.assertRaises(TimeoutError):
+            voice._synth_zhipu("测试", voice.DEFAULT_VOICE, "+0%", "k")
+        self.assertEqual(len(calls), 1, "超时不该拿默认音色再撞一次")
+
+    def test_request_shape(self):
+        sink = []
+        self._install(sink)
+        voice._synth_zhipu("测试", voice.DEFAULT_VOICE, "+0%", "k")
+        self.assertEqual(sink[0]["model"], voice.ZHIPU_TTS_MODEL)
+        # 智谱不接受 mp3，写错格式整条通道就废了
+        self.assertEqual(sink[0]["response_format"], "wav")
+        self.assertEqual(sink[0]["timeout"], voice.ZHIPU_TTS_TIMEOUT)
+        # 语速必须跟着难度档/情绪走，否则 A 档和 C 档在语音上没区别
+        self.assertEqual(sink[0]["speed"], 1.0)
+
+    def test_rate_becomes_speed(self):
+        sink = []
+        self._install(sink)
+        voice._synth_zhipu("测试", voice.DEFAULT_VOICE, "+8%", "k")
+        voice._synth_zhipu("测试", voice.DEFAULT_VOICE, "-6%", "k")
+        self.assertEqual(sink[0]["speed"], 1.08)
+        self.assertEqual(sink[1]["speed"], 0.94)
+
+    def test_wav_is_valid_audio(self):
+        wav = b"RIFF\x24\x08\x00\x00WAVEfmt " + b"\x00" * 64
+        self.assertTrue(voice.is_valid_audio(wav))
+        # 只有 44 字节头、没有 PCM 数据的不算
+        self.assertFalse(voice.is_valid_audio(b"RIFF" + b"\x00" * 40))
+
+    def test_audio_format_routes_by_container(self):
+        wav = b"RIFF\x24\x08\x00\x00WAVEfmt " + b"\x00" * 64
+        mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\xff" * 64
+        self.assertEqual(voice.audio_format(wav), "audio/wav")
+        self.assertEqual(voice.audio_format(mp3), "audio/mp3")
+        self.assertEqual(voice.audio_format(None), "audio/mp3")
+
+    def test_synthesize_prefers_zhipu(self):
+        called = []
+
+        def _fake(text, voice_id, rate, key):
+            called.append(voice_id)
+            return b"RIFF\x24\x08\x00\x00WAVEfmt " + b"\x00" * 64
+
+        orig = voice._synth_zhipu
+        voice._synth_zhipu = _fake
+        try:
+            audio = voice.synthesize("你好", voice.DEFAULT_VOICE, zhipu_key="k")
+        finally:
+            voice._synth_zhipu = orig
+        self.assertTrue(voice.is_valid_audio(audio))
+        self.assertEqual(called, [voice.DEFAULT_VOICE])
+
+    def test_one_transient_failure_does_not_trip_the_breaker(self):
+        # 偶发一次超时不该让接下来一分钟全都放弃合成
+        def _boom(*_a, **_k):
+            raise TimeoutError("Request timed out.")
+
+        orig = voice._synth_zhipu
+        voice._synth_zhipu = _boom
+        try:
+            with self.assertRaises(RuntimeError):
+                voice.synthesize("你好", zhipu_key="k")
+        finally:
+            voice._synth_zhipu = orig
+        self.assertEqual(voice._zhipu_down_until, 0.0, "第一次瞬时失败不该熔断")
+        self.assertEqual(voice._zhipu_fail_streak, 1)
+
+    def test_two_transient_failures_trip_the_breaker(self):
+        def _boom(*_a, **_k):
+            raise TimeoutError("Request timed out.")
+
+        orig = voice._synth_zhipu
+        voice._synth_zhipu = _boom
+        try:
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    voice.synthesize("你好", zhipu_key="k")
+        finally:
+            voice._synth_zhipu = orig
+        self.assertGreater(voice._zhipu_down_until, time.time())
+        # 熔断期内不再尝试，报错要说明是熔断而不是又失败一次
+        with self.assertRaises(RuntimeError) as ctx:
+            voice.synthesize("你好", zhipu_key="k")
+        self.assertIn("熔断", str(ctx.exception))
+
+    def test_reset_clears_zhipu_breaker(self):
+        voice._mark_zhipu_down(permanent=True)
+        self.assertGreater(voice._zhipu_down_until, time.time())
+        voice.reset_edge_breaker()
+        self.assertEqual(voice._zhipu_down_until, 0.0)
+        self.assertEqual(voice._zhipu_fail_streak, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

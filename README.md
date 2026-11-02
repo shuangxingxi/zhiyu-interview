@@ -70,14 +70,17 @@ py -3.12 -m unittest test_rubric_veto -v
 py -3.12 -m unittest test_topic_mix -v
 py -3.12 -m unittest test_behavior_rubric -v
 py -3.12 -m unittest test_topic_anchor -v
+py -3.12 -m unittest test_answer_outline test_delivery
+test_harvest_generated_rubrics -v
+py -3.12 -m unittest test_harvest_generated_rubrics -v
 ```
 
-18 套共 **554 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
+21 套共 **620 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
 **检索用真件**（真简历、真切片、真跑本地 BM25）。
 
 > 注：`test_session_store` 与 `test_history_store` 依赖 `tempfile` 的清理权限。
 > 在受限沙箱下这两套可能报 `PermissionError`，那是**环境问题**、与代码无关；
-> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 554 例应全部通过。
+> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 620 例应全部通过。
 
 ## 文档导航
 
@@ -98,18 +101,20 @@ AIagent/
 ├── knowledge.py        # 场景 × 专业 × 难度 策略库 + 能力模型 + 参照库加载
 ├── mood.py             # 面试官情绪纯函数状态机
 ├── interview_state.py  # 计数器状态机（纯函数）
+├── delivery.py         # 表达指标（字数/时长/语速/填充词，纯本地）
 ├── advice.py           # 提升建议：维度短板识别 + 建议收敛（纯函数）
 ├── resume.py           # 简历解析（PDF / Word / TXT → 纯文本，仅内存）
 ├── resume_rag.py       # 简历 RAG（切片 + 本地字符 n-gram BM25）
 ├── resume_optimize.py  # 简历优化：结构诊断 + 量化密度 + 改写防编造核对（纯函数）
 ├── jd_match.py         # 岗位 JD 对照 + JD 定向场收尾（纯本地，不调模型）
-├── voice.py            # 语音识别（SenseVoice）与合成（edge-tts + 兜底）
+├── voice.py            # 语音识别（SenseVoice）与合成（智谱 GLM-TTS 优先，硅基流动/edge-tts 兜底）
 ├── avatar.py           # 语音动效组件（glasatarjs 磨砂玻璃，CSS 声波球兜底）
 ├── session_store.py    # 会话快照存储（一场一文件 + 原子写）
 ├── history_store.py    # 历史记录存储与统计（趋势 / 维度对比 / 结局回填 / 删除）
 ├── calibration.py      # 评分校准：把「评分」与「真实结局」对照（纯函数，只读不改分）
 ├── rubrics.json        # 评分参照库（技术面 6 专业 318 条，与代码分离便于校订）
-├── rubric_behavior.json # 行为面参照库（15 条，不按专业分、单独一个文件）
+├── rubric_behavior.json # 行为面参照库（45 条 = A/B/C 各 15，不按专业分、单独一个文件）
+├── answer_outline.json # 答题框架（30 条试点，只给考生看，不进判分提示词）
 ├── real_questions.json # 真实企业真题素材库（含来源署名与许可证）
 ├── real_questions_builtin.json  # 自建真题（补齐 4 个专业）
 ├── notion_sync.py      # 知识库归档到 Notion（干跑 / 推送，非运行时依赖）
@@ -122,7 +127,7 @@ AIagent/
 ├── vendor/             # 第三方前端库（glasatarjs，MIT；来源与改动见 vendor/README.md）
 ├── requirements.txt    # 运行依赖（streamlit / openai / httpx / PyMuPDF / python-docx / edge-tts）
 ├── .trae/documents/    # v2–v3 的原始实施方案（历史记录，保留原样）
-├── test_*.py           # 18 套离线单测（共 554 个用例）
+├── test_*.py           # 21 套离线单测（共 620 个用例）
 ├── 项目说明.md          # 使用与部署说明（运行环境要求 / 安装启动 / 常见问题；另有同源的 .docx）
 ├── DESIGN.md           # 权威设计文档（另有同源的 DESIGN.docx）
 ├── 变更清单-v7.md       # v7–v16 逐文件改动清单

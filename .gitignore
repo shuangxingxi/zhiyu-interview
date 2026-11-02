@@ -73,3 +73,5 @@ _*_probe*.py
 *.swp
 Thumbs.db
 desktop.ini
+
+dist/
