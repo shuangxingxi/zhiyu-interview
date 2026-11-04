@@ -1123,66 +1123,517 @@ def _logout() -> None:
     st.rerun()
 
 
+_LOGIN_CSS = """
+<style>
+/* ============================================================
+   登录页 —— 期刊封面式双栏
+   左：巨型衬线刊名 + 目录式要点（纯装饰，一眼看清这是什么）
+   右：白色卡片承载登录 / 注册（唯一的操作区）
+   这一整套样式只在未登录时注入，登录成功后随页面一起消失，
+   所以可以直接改 .block-container 这类全局选择器而不影响主界面。
+   ============================================================ */
+[data-testid="stHeader"] {
+    background-color: transparent !important;
+    border-bottom: none !important;
+}
+/* 登录页是"产品第一屏"，不该露出开发工具条 */
+[data-testid="stAppDeployButton"],
+[data-testid="stToolbar"] {
+    display: none !important;
+}
+.block-container,
+[data-testid="stMainBlockContainer"],
+[data-testid="stMain"] > div:first-child {
+    max-width: 1160px;
+    padding-top: clamp(2.75rem, 6vh, 4.5rem);
+    padding-bottom: 2rem;
+}
+
+/* ---------- 页眉：一条细线加两端小字，像期刊页眉 ---------- */
+.zy-auth-mast {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    margin: 0 0 2rem;
+}
+.zy-auth-mast span {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    /* 用 muted 而不是 faint：#9A9184 在纸底上只有约 2.7:1，小字看不清 */
+    color: var(--zy-muted);
+    white-space: nowrap;
+}
+.zy-auth-mast i {
+    flex: 1;
+    height: 1px;
+    background: var(--zy-line-strong);
+}
+
+/* ---------- 左栏 ---------- */
+.zy-auth-bar {
+    width: 46px;
+    height: 3px;
+    background: var(--zy-accent);
+    border-radius: 2px;
+    margin-bottom: 1.6rem;
+}
+.zy-auth-kicker {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: var(--zy-muted);
+    margin-bottom: 1.15rem;
+}
+[data-testid="stMarkdownContainer"] .zy-auth-word {
+    font-family: var(--zy-serif);
+    font-size: clamp(3.2rem, 5.2vw, 4.75rem);
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    line-height: 1.02;
+    color: var(--zy-ink);
+    margin: 0;
+}
+.zy-auth-word em {
+    font-style: normal;
+    color: var(--zy-accent);
+}
+[data-testid="stMarkdownContainer"] .zy-auth-lede {
+    font-family: var(--zy-serif);
+    font-size: clamp(1.05rem, 1.4vw, 1.25rem);
+    font-weight: 700;
+    line-height: 1.6;
+    color: var(--zy-ink);
+    margin: 1.2rem 0 0;
+    /* 父级不要限宽：限了会把里面的副文案一起挤窄（原来副文案只剩 18 字/行） */
+}
+[data-testid="stMarkdownContainer"] .zy-auth-lede span {
+    display: block;
+    font-family: var(--zy-sans);
+    font-size: 0.9375rem;
+    font-weight: 400;
+    line-height: 1.8;
+    color: var(--zy-muted);
+    margin-top: 0.55rem;
+    max-width: 30em;
+}
+.zy-auth-list {
+    list-style: none;
+    margin: 1.9rem 0 0;
+    padding: 0;
+    max-width: 33rem;
+}
+.zy-auth-list li {
+    display: grid;
+    grid-template-columns: 2.1rem 1fr;
+    gap: 0 0.9rem;
+    padding: 0.85rem 0;
+    border-top: 1px solid var(--zy-line);
+}
+.zy-auth-list li:last-child {
+    border-bottom: 1px solid var(--zy-line);
+}
+.zy-auth-idx {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: var(--zy-accent);
+    padding-top: 0.35rem;
+}
+[data-testid="stMarkdownContainer"] .zy-auth-list h4 {
+    margin: 0 0 0.3rem;
+    font-family: var(--zy-serif);
+    font-size: 1.0625rem;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+    color: var(--zy-ink);
+}
+[data-testid="stMarkdownContainer"] .zy-auth-list p {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.75;
+    color: var(--zy-muted);
+}
+.zy-auth-foot {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    margin-top: 1.6rem;
+}
+.zy-auth-seal {
+    flex: none;
+    font-family: var(--zy-serif);
+    font-size: 0.8125rem;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    line-height: 1;
+    color: #FFFFFF;
+    background: var(--zy-accent);
+    border-radius: 5px;
+    padding: 0.55rem 0.6rem;
+}
+.zy-auth-fine {
+    font-size: 0.75rem;
+    line-height: 1.65;
+    letter-spacing: 0.04em;
+    color: var(--zy-muted);
+}
+
+/* ---------- 右栏卡片（st.container(key="zy_auth_card") 自动挂这个类）---------- */
+.st-key-zy_auth_card {
+    background-color: var(--zy-surface);
+    border: 1px solid var(--zy-line);
+    border-radius: 20px;
+    padding: 1.75rem 1.75rem 1.65rem;
+    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.04), 0 22px 46px -20px rgba(33, 29, 25, 0.24);
+}
+/* 卡片内部不要再套一层表单边框——那是"卡片套卡片" */
+.st-key-zy_auth_card [data-testid="stForm"] {
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    padding: 0;
+}
+.zy-auth-cardhead {
+    margin-bottom: 0.35rem;
+}
+.zy-auth-eyebrow {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--zy-accent);
+    margin-bottom: 0.6rem;
+}
+[data-testid="stMarkdownContainer"] .zy-auth-cardhead p {
+    margin: 0 0 0.9rem;
+    font-size: 0.875rem;
+    line-height: 1.7;
+    color: var(--zy-muted);
+}
+/* 页签收紧成两个等宽切换项，别像主界面那样铺开 */
+.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-list"] {
+    gap: 0;
+    margin-bottom: 0.5rem;
+}
+.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-list"] button[role="tab"] {
+    padding: 0.45rem 0;
+    margin-right: 1.75rem;
+    font-size: 0.9375rem;
+    letter-spacing: 0.04em;
+}
+.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-highlight"],
+.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-border"] {
+    display: none;
+}
+/* 卡片内的提示条压成"表单内联消息"，不抢标题的位置 */
+.st-key-zy_auth_card [data-testid="stAlert"] {
+    background-color: #FBF7F0 !important;
+    border-left-width: 3px !important;
+    box-shadow: none !important;
+    margin: 0.35rem 0 0.75rem !important;
+    padding: 0.65rem 0.9rem !important;
+}
+.st-key-zy_auth_card [data-testid="stAlert"] p {
+    font-size: 0.875rem;
+    line-height: 1.6;
+}
+/* 占位符用 muted 而不是全局的 faint：faint 在白底上不到 3:1，读不出来 */
+.st-key-zy_auth_card [data-testid="stTextInput"] input::placeholder {
+    color: var(--zy-muted) !important;
+    opacity: 1;
+}
+
+/* ---------- 演示通行证：虚线框，一眼看出是"凭证"不是表单 ---------- */
+.st-key-zy_auth_pass {
+    margin-top: 0.9rem;
+    padding: 0.9rem 1.15rem 1rem;
+    border: 1px dashed var(--zy-line-strong);
+    border-radius: 14px;
+    background-color: #FBF7F0;
+}
+.zy-pass-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+.zy-pass-tag {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--zy-muted);
+}
+.zy-pass-cred {
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.8125rem;
+    letter-spacing: 0.02em;
+    color: var(--zy-ink);
+    background: transparent;
+}
+[data-testid="stMarkdownContainer"] .zy-pass-note {
+    margin: 0.5rem 0 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.6;
+    color: var(--zy-muted);
+}
+.st-key-zy_auth_pass [data-testid="stButton"] button {
+    background-color: transparent !important;
+    border: 1px solid var(--zy-line-strong) !important;
+    color: var(--zy-ink) !important;
+    font-size: 0.875rem;
+    font-weight: 600;
+}
+.st-key-zy_auth_pass [data-testid="stButton"] button:hover {
+    border-color: var(--zy-accent) !important;
+    color: var(--zy-accent) !important;
+    background-color: var(--zy-accent-soft) !important;
+}
+
+/* ---------- 页脚小字 ---------- */
+[data-testid="stMarkdownContainer"] .zy-auth-legal {
+    margin: 1.75rem 0 0;
+    padding-top: 1rem;
+    border-top: 1px solid var(--zy-line);
+    font-size: 0.75rem;
+    line-height: 1.8;
+    letter-spacing: 0.02em;
+    color: var(--zy-muted);
+}
+[data-testid="stMarkdownContainer"] .zy-auth-legal code {
+    background: #F1EADF;
+    border-radius: 4px;
+    padding: 0.1rem 0.3rem;
+    font-size: 0.72rem;
+    color: var(--zy-accent-deep);
+}
+
+/* ---------- 入场：只给左栏做，卡片不参与（提交时重播会闪） ---------- */
+@keyframes zy-auth-in {
+    from {
+        opacity: 0;
+        transform: translateY(9px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+.zy-auth-panel {
+    animation: zy-auth-in 0.36s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+    .zy-auth-panel {
+        animation: none;
+    }
+}
+
+/* ---------- 矮屏（1366×768 这类笔记本 / 投影）：收一档纵向节奏，
+   让品牌区也能落在首屏里，不用滚一下才看到印章 ---------- */
+@media (max-height: 820px) and (min-width: 901px) {
+    .block-container,
+    [data-testid="stMainBlockContainer"],
+    [data-testid="stMain"] > div:first-child {
+        padding-top: 2.35rem;
+    }
+    .zy-auth-mast {
+        margin-bottom: 1.5rem;
+    }
+    .zy-auth-list {
+        margin-top: 1.4rem;
+    }
+    .zy-auth-list li {
+        padding: 0.65rem 0;
+    }
+    .zy-auth-foot {
+        margin-top: 1.15rem;
+    }
+    [data-testid="stMarkdownContainer"] .zy-auth-legal {
+        margin-top: 1.25rem;
+        padding-top: 0.85rem;
+    }
+}
+
+/* ---------- 窄屏：Streamlit 的列默认不堆叠，这里手动反序 ----------
+   反序是为了让表单先出现：手机上不该先滚过一整屏品牌介绍才看到登录框。 */
+@media (max-width: 900px) {
+    [data-testid="stHorizontalBlock"] {
+        flex-direction: column-reverse;
+        gap: 1.75rem;
+    }
+    [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+        min-width: 0 !important;
+    }
+    .zy-auth-mast {
+        margin-bottom: 1.75rem;
+    }
+    .zy-auth-word {
+        font-size: 3rem;
+    }
+    .zy-auth-list {
+        margin-top: 1.75rem;
+    }
+    .zy-auth-foot {
+        margin-top: 1.5rem;
+    }
+    .st-key-zy_auth_card {
+        padding: 1.4rem 1.25rem 1.25rem;
+    }
+}
+</style>
+"""
+
+
 def render_login() -> None:
-    """登录 / 注册页。没登录进不来主界面，所以这一页要自己撑住观感。"""
-    _flush_flash()
+    """登录 / 注册页。
+
+    没登录进不来主界面，所以这一页要自己撑住观感：左边立牌（这是什么、
+    凭什么可信），右边只有一个动作区（登录或注册）。
+    """
+    st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
+
     st.markdown(
-        """
-        <div class="zy-hero">
-            <div class="zy-kicker">AI Interview Agent</div>
-            <div class="zy-title">知遇<em>。</em></div>
-            <p class="zy-sub">每个账号有独立的面试历史、评分与复盘。
-            登录之后，你的回答原文只有你自己看得到。</p>
-        </div>
-        """,
+        "<div class=\"zy-auth-mast\">"
+        "<span>AI Interview Agent</span>"
+        "<i></i>"
+        "<span>本机部署 · 数据不出机器</span>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns([1, 1])
+    left, right = st.columns([1.14, 1], gap="large")
+
     with left:
-        st.subheader("登录")
-        with st.form("login_form"):
-            account = st.text_input("账号", key="login_account")
-            password = st.text_input("密码", type="password", key="login_password")
-            submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
-        if submitted:
-            user = auth.authenticate(BASE_DIR, account, password)
-            if user is None:
-                st.error("账号或密码不正确。")
-            else:
-                _complete_login(
-                    user["account"],
-                    f"欢迎回来，{user['name'] or user['account']}。",
-                )
+        st.markdown(
+            "<div class=\"zy-auth-panel\">"
+            "<div class=\"zy-auth-bar\"></div>"
+            "<div class=\"zy-auth-kicker\">模拟面试 · 复盘</div>"
+            "<h1 class=\"zy-auth-word\">知遇<em>。</em></h1>"
+            "<p class=\"zy-auth-lede\">先被听懂，才被选中。"
+            "<span>按岗位出题，顺着你的话追问，最后给一份能照着改的复盘。</span></p>"
+            "<ol class=\"zy-auth-list\">"
+            "<li><span class=\"zy-auth-idx\">01</span><div>"
+            "<h4>按岗位出题</h4>"
+            "<p>场景、专业、难度组合出题，题目来自真题库，不是随机抽。</p>"
+            "</div></li>"
+            "<li><span class=\"zy-auth-idx\">02</span><div>"
+            "<h4>顺着回答往下追</h4>"
+            "<p>你说得浅就再挖一层，答偏了会被拉回来。</p>"
+            "</div></li>"
+            "<li><span class=\"zy-auth-idx\">03</span><div>"
+            "<h4>结束就有复盘</h4>"
+            "<p>逐维度评分、拿你的原话当证据，给出下次能用的改法。</p>"
+            "</div></li>"
+            "</ol>"
+            "<div class=\"zy-auth-foot\">"
+            "<span class=\"zy-auth-seal\">知遇</span>"
+            "<span class=\"zy-auth-fine\">账号之间互不可见<br>历史、评分、逐字稿归各自所有</span>"
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     with right:
-        st.subheader("注册")
-        with st.form("register_form"):
-            new_account = st.text_input("账号", key="reg_account", help="字母、数字、下划线，2~20 位")
-            new_name = st.text_input("显示名（可留空）", key="reg_name")
-            new_password = st.text_input("密码", type="password", key="reg_password")
-            confirm = st.text_input("再输一次密码", type="password", key="reg_confirm")
-            registered = st.form_submit_button("创建账号", use_container_width=True)
-        if registered:
-            if new_password != confirm:
-                st.error("两次输入的密码不一致。")
-            else:
-                ok, message = auth.register(BASE_DIR, new_account, new_password, new_name)
-                if not ok:
-                    st.error(message)
-                else:
-                    user = auth.authenticate(BASE_DIR, new_account, new_password)
-                    if user is None:
-                        st.error("账号已创建，但自动登录失败，请手动登录。")
-                    else:
-                        _complete_login(user["account"], "账号已创建。")
+        with st.container(key="zy_auth_card"):
+            st.markdown(
+                "<div class=\"zy-auth-cardhead\">"
+                "<div class=\"zy-auth-eyebrow\">账号</div>"
+                "<p>登录后，面试历史与评分只属于这个账号。</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            _flush_flash()
 
-    st.divider()
-    st.caption(
-        f"演示账号：`{auth.DEMO_ACCOUNT}` / `{auth.DEMO_PASSWORD}` —— "
-        "现场演示用，任何人都能登，别往里放真实数据。"
+            tab_login, tab_register = st.tabs(["登录", "创建账号"])
+
+            with tab_login:
+                with st.form("login_form"):
+                    account = st.text_input(
+                        "账号",
+                        key="login_account",
+                        placeholder="2~20 位字母、数字或下划线",
+                    )
+                    password = st.text_input(
+                        "密码", type="password", key="login_password", placeholder="至少 6 位"
+                    )
+                    submitted = st.form_submit_button(
+                        "登录", type="primary", use_container_width=True
+                    )
+                if submitted:
+                    user = auth.authenticate(BASE_DIR, account, password)
+                    if user is None:
+                        st.error("账号或密码不正确。")
+                    else:
+                        _complete_login(
+                            user["account"],
+                            f"欢迎回来，{user['name'] or user['account']}。",
+                        )
+
+            with tab_register:
+                with st.form("register_form"):
+                    new_account = st.text_input(
+                        "账号",
+                        key="reg_account",
+                        placeholder="2~20 位字母、数字或下划线",
+                    )
+                    new_name = st.text_input(
+                        "显示名", key="reg_name", placeholder="可留空，默认用账号名"
+                    )
+                    new_password = st.text_input(
+                        "密码", type="password", key="reg_password", placeholder="至少 6 位"
+                    )
+                    confirm = st.text_input(
+                        "确认密码", type="password", key="reg_confirm", placeholder="再输一次"
+                    )
+                    registered = st.form_submit_button(
+                        "创建账号", type="primary", use_container_width=True
+                    )
+                if registered:
+                    if new_password != confirm:
+                        st.error("两次输入的密码不一致。")
+                    else:
+                        ok, message = auth.register(
+                            BASE_DIR, new_account, new_password, new_name
+                        )
+                        if not ok:
+                            st.error(message)
+                        else:
+                            user = auth.authenticate(BASE_DIR, new_account, new_password)
+                            if user is None:
+                                st.error("账号已创建，但自动登录失败，请手动登录。")
+                            else:
+                                _complete_login(user["account"], "账号已创建。")
+
+        with st.container(key="zy_auth_pass"):
+            st.markdown(
+                f"<div class=\"zy-pass-row\">"
+                f"<span class=\"zy-pass-tag\">演示通行证</span>"
+                f"<span class=\"zy-pass-cred\">{auth.DEMO_ACCOUNT} / {auth.DEMO_PASSWORD}</span>"
+                f"</div>"
+                f"<p class=\"zy-pass-note\">公开账号，谁都能进，别往里放真实内容。</p>",
+                unsafe_allow_html=True,
+            )
+            if st.button("用演示账号进入", key="zy_demo_login", use_container_width=True):
+                user = auth.authenticate(BASE_DIR, auth.DEMO_ACCOUNT, auth.DEMO_PASSWORD)
+                if user is None:
+                    st.error("演示账号不存在，请重启程序自动重建。")
+                else:
+                    _complete_login(user["account"], "已用演示账号进入。")
+
+    st.markdown(
+        "<p class=\"zy-auth-legal\">忘记密码没有自助找回：账号由本机文件管理，"
+        "需要管理员改 <code>.auth/users.json</code>。<br>"
+        "多人共用时请用 <code>分享给别人.ps1 -Mode lan</code> 启动，"
+        "双击启动器只监听本机。</p>",
+        unsafe_allow_html=True,
     )
-    st.caption("忘记密码没有自助找回：账号由本机文件管理，需要管理员改 `.auth/users.json`。")
 
 
 def _login_gate() -> str:
