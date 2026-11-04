@@ -31,6 +31,17 @@ SNAPSHOT_DIR_NAME = ".snapshots"
 LEGACY_SNAPSHOT_NAME = ".session_snapshot.json"
 SESSION_KEY = "_session_id"
 
+# 本机访问时客户端 IP 的几种形态。
+# 加账号体系之前，快照与历史记录的 `owner` 就是这些值（或干脆没有），
+# 判断"这条数据是不是登录功能之前的本机产物"要靠它。
+LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def is_local_owner(value: str) -> bool:
+    """这个 owner 标记是否属于"加登录之前的本机来源"（空 或 loopback）。"""
+    text = str(value or "").strip()
+    return not text or text in LOOPBACK
+
 # 跨线程 / 跨进程的写锁超时。正常人不会在前一个人写盘的同时点保存，
 # 5 秒都拿不到锁说明有别的进程卡死了，宁可报错也不要把界面永久挂住。
 LOCK_TIMEOUT = 5.0
@@ -288,3 +299,32 @@ def clear_all(base: Path) -> None:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def claim_local_snapshots(base: Path, owner: str) -> int:
+    """把"加登录之前"留下的本机快照认领给 owner，返回改了几份。
+
+    和 history_store.claim_local_records 是同一个理由：换成按账号隔离后，
+    升级前那场没做完的面试对谁都不可见了，用户会觉得"我的进度丢了"。
+
+    只认领 owner 为空或 loopback 的。别人通过局域网留下的快照不动。
+    """
+    owner = str(owner or "").strip()
+    if not owner:
+        return 0
+    changed = 0
+    for path in _candidate_files(base):
+        data = read_snapshot_file(path)
+        if data is None:
+            continue
+        if not is_local_owner(str(data.get("owner") or "")):
+            continue
+        if str(data.get("owner") or "").strip() == owner:
+            continue
+        data["owner"] = owner
+        try:
+            atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+        except OSError:
+            continue
+        changed += 1
+    return changed

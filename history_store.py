@@ -24,7 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from session_store import atomic_write_text, file_lock
+from session_store import LOOPBACK as _LOOPBACK
+from session_store import atomic_write_text, file_lock, is_local_owner
 
 # 单场最多看这么多场，避免图表被几十场记录压扁
 DEFAULT_LIMIT = 20
@@ -34,8 +35,6 @@ DEFAULT_LIMIT = 20
 # 归属隔离：谁产生的记录，只有谁看得见
 # ---------------------------------------------------------------------------
 
-# 本机访问时客户端 IP 的几种形态。旧版记录没有 owner 字段，一律视为本机产生。
-_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 def _owner_of(record: dict) -> str:
@@ -189,6 +188,38 @@ def set_outcome(
             _write_records(path, records)
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# 归属迁移：把"加登录之前"的本机记录认领给某个账号
+# ---------------------------------------------------------------------------
+
+
+def claim_local_records(path: Path, owner: str) -> int:
+    """把无主的本机记录划给 owner，返回改了几条。
+
+    加账号体系之前，记录的 owner 是客户端 IP（本机就是 `127.0.0.1`），
+    或者干脆没有这个字段。换成按账号隔离后，这些记录对谁都不可见——
+    用户会以为"我的历史全没了"。
+
+    所以只认领**确实是本机产生**的那批：owner 为空、或 owner 是 loopback。
+    别人通过局域网访问时留下的记录（192.168.x 之类）不归你，不能顺手一起收编。
+    """
+    owner = str(owner or "").strip()
+    if not owner:
+        return 0
+    with file_lock(path):
+        records = _read_all(path)
+        changed = 0
+        for record in records:
+            current = _owner_of(record)
+            if not is_local_owner(current):
+                continue
+            record["owner"] = owner
+            changed += 1
+        if changed:
+            _write_records(path, records)
+    return changed
 
 
 # ---------------------------------------------------------------------------

@@ -13,8 +13,13 @@ $env:SILICONFLOW_API_KEY = "sk-xxxx"     # 可选：语音识别与合成兜底
 py -3.12 -m streamlit run app.py
 ```
 
-浏览器打开后，在左侧选「场景 → 专业 → 难度」，可选填候选人背景或上传简历，
+浏览器打开后先**注册一个账号**（或直接用演示账号 `demo` / `ZhiyuDemo2026` 登录）；
+进入主界面后在左侧选「场景 → 专业 → 难度」，可选填候选人背景或上传简历，
 点「开始面试」即可。API Key 也可以直接在侧边栏手填，不必设环境变量。
+
+每个账号有独立的面试历史、评分报告与未完成场次。多人共用同一台机器（局域网分享）
+时各看各的；登录态存在 URL 的 `?u=` 参数上，所以刷新页面不会掉登录，但换一个新标签页
+需要重新登录。
 
 难度档调的是**三档题的配比**，不是整场只问同一档：A 级 = 高难 60% / 中等 30% / 基础 10%，
 B 级 = 20% / 60% / 20%，C 级 = 0% / 30% / 70%（`knowledge.LEVEL_TOPIC_MIX`）。
@@ -56,6 +61,7 @@ py -3.12 -m unittest test_tool_call -v
 py -3.12 -m unittest test_mood -v
 py -3.12 -m unittest test_interview_state -v
 py -3.12 -m unittest test_session_store -v
+py -3.12 -m unittest test_auth -v
 py -3.12 -m unittest test_chat_json -v
 py -3.12 -m unittest test_history_store -v
 py -3.12 -m unittest test_rubric_hint -v
@@ -76,12 +82,12 @@ py -3.12 -m unittest test_prompt_guard -v
 py -3.12 -m unittest test_report_text -v
 ```
 
-23 套共 **685 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
+24 套共 **726 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
 **检索用真件**（真简历、真切片、真跑本地 BM25）。
 
 > 注：`test_session_store` 与 `test_history_store` 依赖 `tempfile` 的清理权限。
 > 在受限沙箱下这两套可能报 `PermissionError`，那是**环境问题**、与代码无关；
-> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 685 例应全部通过。
+> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 726 例应全部通过。
 
 ## 文档导航
 
@@ -111,8 +117,9 @@ AIagent/
 ├── jd_match.py         # 岗位 JD 对照 + JD 定向场收尾（纯本地，不调模型）
 ├── voice.py            # 语音识别（SenseVoice）与合成（智谱 GLM-TTS 优先，硅基流动/edge-tts 兜底）
 ├── avatar.py           # 语音动效组件（glasatarjs 磨砂玻璃，CSS 声波球兜底）
-├── session_store.py    # 会话快照存储（一场一文件 + 原子写）
-├── history_store.py    # 历史记录存储与统计（趋势 / 维度对比 / 结局回填 / 删除）
+├── session_store.py    # 会话快照存储（一场一文件 + 原子写 + 跨进程写锁）
+├── history_store.py    # 历史记录存储与统计（趋势 / 维度对比 / 结局回填 / 删除 / 归属隔离）
+├── auth.py             # 账号与会话（注册 / 登录 / token 签发吊销，纯标准库）
 ├── calibration.py      # 评分校准：把「评分」与「真实结局」对照（纯函数，只读不改分）
 ├── rubrics.json        # 评分参照库（技术面 6 专业 318 条，与代码分离便于校订）
 ├── rubric_behavior.json # 行为面参照库（45 条 = A/B/C 各 15，不按专业分、单独一个文件）
@@ -129,7 +136,7 @@ AIagent/
 ├── vendor/             # 第三方前端库（glasatarjs，MIT；来源与改动见 vendor/README.md）
 ├── requirements.txt    # 运行依赖（streamlit / openai / httpx / PyMuPDF / python-docx / edge-tts）
 ├── .trae/documents/    # v2–v3 的原始实施方案（历史记录，保留原样）
-├── test_*.py           # 23 套离线单测（共 685 个用例）
+├── test_*.py           # 24 套离线单测（共 726 个用例）
 ├── 项目说明.md          # 使用与部署说明（运行环境要求 / 安装启动 / 常见问题；另有同源的 .docx）
 ├── DESIGN.md           # 权威设计文档（另有同源的 DESIGN.docx）
 ├── 变更清单-v7.md       # v7–v16 逐文件改动清单
@@ -143,10 +150,15 @@ AIagent/
   「简历优化」功能同理：结果也只留在页面上，只有你主动点「导出优化建议」时才落成文件。
 - **提升建议**：按评分维度给出的建议**不写入 `history.json`**——它每条都引用你的原话，
   属于个人化内容。它只出现在本场报告页，以及你主动导出报告时的 Markdown 里。
-- **面试逐字稿**：会落盘到 `history.json`（供回看与跨场对比）。该文件已加入
+- **面试逐字稿**：会落盘到 `history.json`（供回看与跨场对比），并按账号隔离——
+  登录之后，别人的记录你读不到，你的记录别人也读不到。该文件已加入
   `.gitignore`，因为其中可能含真实候选人的个人信息。界面提供**逐场删除**与
-  **清空全部**（两步确认）两个入口。
+  **清空全部**（两步确认）两个入口，且只作用于自己的记录。
+- **账号密码**：只存 `pbkdf2-hmac-sha256` 哈希 + 每条独立的随机盐，明文密码从不落盘。
+  会话 token 落盘时也只存哈希。`.auth/` 整个目录已加入 `.gitignore`。
 - **API Key**：一律从环境变量或界面读取，**不写入任何文件**。
+- **登录态**：靠 URL 上的 `?u=<token>` 穿过页面刷新，所以 token 会出现在地址栏与
+  浏览器历史里。局域网演示可以接受；真要上公网，应当换成 HttpOnly Cookie。
 
 ## 数据覆盖范围（如实声明）
 

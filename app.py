@@ -20,6 +20,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import auth
 import calibration
 import delivery
 import history_store
@@ -1013,29 +1014,206 @@ def _session_id() -> str:
     return str(ss[session_store.SESSION_KEY])
 
 
-def _client_tag() -> str:
-    """区分"谁在访问"的粗粒度标记：用客户端 IP。
+# ---------------------------------------------------------------------------
+# 登录
+# ---------------------------------------------------------------------------
 
-    局域网分享出去后，多个浏览器连的是同一个 Streamlit 进程、同一份
-    `.snapshots/` 目录。只按保存时间挑最近的快照，A 的首页就会冒出 B 那场
-    没做完的面试，点"继续"等于接手别人的对话 —— 数据串味，而且当事人
-    未必立刻发现。用 IP 分组之后，不同机器各看各的。
+_AUTH_ACCOUNT_KEY = "auth_account"
+_AUTH_TOKEN_KEY = "auth_token"
+_TOKEN_PARAM = "u"  # URL 上的会话 token 参数名
 
-    同一台机器开多个标签页仍算同一个人（同一个 IP），这符合直觉：
-    都是自己没做完的场次，恢复哪一场都能接受。
 
-    拿不到 IP（非常规运行环境、代理未透传）时返回空串，此时行为退回到
-    原来的"全目录挑最近"，宁可多提示一次也不要让续面功能失效。
+def _query_token() -> str:
+    """从 URL 取会话 token。
+
+    刷新页面时 Streamlit 会丢掉 `session_state`，而 URL 活得更久，
+    所以登录态只能靠 query 参数穿过一次刷新。
     """
     try:
-        value = st.context.ip_address
+        value = st.query_params.get(_TOKEN_PARAM)
     except Exception:  # noqa: BLE001
         return ""
-    # 只认字符串：测试桩 / 未来版本可能给出别的对象，脏值会一路渗进
-    # 过滤逻辑，宁可退回"不隔离"也不要按乱码去分组。
-    if not isinstance(value, str):
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def _current_account() -> str:
+    """当前登录账号；未登录返回空串。
+
+    先看 session_state（同一次会话内最快），miss 再用 URL token 验一次
+    （刷新后的第一帧就走这条路）。
+    """
+    cached = str(st.session_state.get(_AUTH_ACCOUNT_KEY) or "")
+    if cached:
+        return cached
+    token = _query_token()
+    if not token:
         return ""
-    return value.strip()
+    account = auth.resolve_token(BASE_DIR, token) or ""
+    if account:
+        st.session_state[_AUTH_ACCOUNT_KEY] = account
+        st.session_state[_AUTH_TOKEN_KEY] = token
+    return account
+
+
+def _claim_local_data(account: str) -> str:
+    """把"加登录之前"的本机记录与快照认领给这个账号，返回给用户看的一句话。
+
+    只在真正完成一次登录时调用（不是每次 rerun）。登录一次就够了：
+    认领过之后 owner 变成 `u:账号`，再登录也不会被重复收编。
+
+    **演示账号不参与认领**。它是公开的（密码写在登录页上），如果让它认领，
+    评委现场先登 demo 就会把主人原有的历史全划到 demo 名下 —— 主人之后
+    注册自己的账号，看到的是空历史，真实数据反而躺在一个人人都能进的号里。
+    规则本身在 auth.may_claim_legacy（可单测），这里只负责执行。
+    """
+    if not auth.may_claim_legacy(account):
+        return ""
+    owner = auth.owner_tag(account)
+    records = snapshots = 0
+    try:
+        records = history_store.claim_local_records(HISTORY_FILE, owner)
+    except (OSError, TimeoutError) as exc:  # noqa: BLE001
+        print(f"[认领历史记录失败] {exc}", file=sys.stderr, flush=True)
+    try:
+        snapshots = session_store.claim_local_snapshots(BASE_DIR, owner)
+    except (OSError, TimeoutError) as exc:  # noqa: BLE001
+        print(f"[认领快照失败] {exc}", file=sys.stderr, flush=True)
+
+    if not records and not snapshots:
+        return ""
+    parts = []
+    if records:
+        parts.append(f"{records} 场历史记录")
+    if snapshots:
+        parts.append(f"{snapshots} 份未完成的面试")
+    return "已把本机原有的 " + "、".join(parts) + "归到你这个账号下。"
+
+
+def _complete_login(account: str, announce: str = "") -> None:
+    """登录成功后的收尾：签 token、落 session_state、同步 URL、认领老数据。"""
+    token = auth.issue_token(BASE_DIR, account)
+    st.session_state[_AUTH_ACCOUNT_KEY] = account
+    st.session_state[_AUTH_TOKEN_KEY] = token
+    try:
+        st.query_params[_TOKEN_PARAM] = token
+    except Exception:  # noqa: BLE001
+        pass  # URL 写不进去也不影响本次会话，只是刷新后要重新登录
+    claimed = _claim_local_data(account)
+    st.session_state.flash = " ".join(part for part in (announce, claimed) if part)
+    st.rerun()
+
+
+def _logout() -> None:
+    """退出登录：吊销服务端 token，清掉本地状态与 URL 参数。"""
+    token = str(st.session_state.get(_AUTH_TOKEN_KEY) or _query_token())
+    if token:
+        try:
+            auth.revoke_token(BASE_DIR, token)
+        except OSError:
+            pass
+    st.session_state.pop(_AUTH_ACCOUNT_KEY, None)
+    st.session_state.pop(_AUTH_TOKEN_KEY, None)
+    try:
+        st.query_params.pop(_TOKEN_PARAM, None)
+    except Exception:  # noqa: BLE001
+        pass
+    st.session_state.flash = "已退出登录。"
+    st.rerun()
+
+
+def render_login() -> None:
+    """登录 / 注册页。没登录进不来主界面，所以这一页要自己撑住观感。"""
+    _flush_flash()
+    st.markdown(
+        """
+        <div class="zy-hero">
+            <div class="zy-kicker">AI Interview Agent</div>
+            <div class="zy-title">知遇<em>。</em></div>
+            <p class="zy-sub">每个账号有独立的面试历史、评分与复盘。
+            登录之后，你的回答原文只有你自己看得到。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.subheader("登录")
+        with st.form("login_form"):
+            account = st.text_input("账号", key="login_account")
+            password = st.text_input("密码", type="password", key="login_password")
+            submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
+        if submitted:
+            user = auth.authenticate(BASE_DIR, account, password)
+            if user is None:
+                st.error("账号或密码不正确。")
+            else:
+                _complete_login(
+                    user["account"],
+                    f"欢迎回来，{user['name'] or user['account']}。",
+                )
+
+    with right:
+        st.subheader("注册")
+        with st.form("register_form"):
+            new_account = st.text_input("账号", key="reg_account", help="字母、数字、下划线，2~20 位")
+            new_name = st.text_input("显示名（可留空）", key="reg_name")
+            new_password = st.text_input("密码", type="password", key="reg_password")
+            confirm = st.text_input("再输一次密码", type="password", key="reg_confirm")
+            registered = st.form_submit_button("创建账号", use_container_width=True)
+        if registered:
+            if new_password != confirm:
+                st.error("两次输入的密码不一致。")
+            else:
+                ok, message = auth.register(BASE_DIR, new_account, new_password, new_name)
+                if not ok:
+                    st.error(message)
+                else:
+                    user = auth.authenticate(BASE_DIR, new_account, new_password)
+                    if user is None:
+                        st.error("账号已创建，但自动登录失败，请手动登录。")
+                    else:
+                        _complete_login(user["account"], "账号已创建。")
+
+    st.divider()
+    st.caption(
+        f"演示账号：`{auth.DEMO_ACCOUNT}` / `{auth.DEMO_PASSWORD}` —— "
+        "现场演示用，任何人都能登，别往里放真实数据。"
+    )
+    st.caption("忘记密码没有自助找回：账号由本机文件管理，需要管理员改 `.auth/users.json`。")
+
+
+def _login_gate() -> str:
+    """确保已登录。未登录则渲染登录页并终止本次脚本。返回账号名。
+
+    演示账号只在"有人要看登录页"时才确保存在——已经登录的用户走不到这里，
+    省掉每次 rerun 读一次 users.json。
+    """
+    account = _current_account()
+    if account:
+        return account
+    try:
+        auth.ensure_demo_user(BASE_DIR)
+    except OSError as exc:
+        print(f"[创建演示账号失败] {exc}", file=sys.stderr, flush=True)
+    render_login()
+    st.stop()
+    return ""  # 到不了，st.stop() 会抛 StopException
+
+
+def _client_tag() -> str:
+    """当前登录账号的归属标记，写进 history / 快照的 `owner` 字段。
+
+    v18 用的是客户端 IP，v19 换成账号：登录之后"谁是谁"不再靠网络位置猜，
+    换个设备、换个网络登录同一个账号，看到的还是自己的历史。
+
+    账号隔离下没有"拿不到身份就放行"这个口子——没登录的人根本进不到
+    这一层（`_login_gate` 已经把页面挡住了），所以这里返回空串等于数据
+    无处可归，宁可让上层看到空 owner 的默认行为也不要乱认。
+    """
+    return auth.owner_tag(st.session_state.get("auth_account") or "")
 
 
 def save_snapshot() -> None:
@@ -2367,6 +2545,22 @@ def _render_running_panel() -> None:
     st.caption("面试官的情绪会随你的回答变化，但本场结束前不显示——报告里会揭晓整条状态轨迹。")
 
 
+def _render_account_bar() -> None:
+    """侧边栏顶部的账号区：当前是谁、退出登录。
+
+    面试进行中也要显示——换人演示时第一件事就是退出上一个账号。
+    """
+    account = str(st.session_state.get(_AUTH_ACCOUNT_KEY) or "")
+    if not account:
+        return
+    info = auth.public_user(BASE_DIR, account) or {}
+    display = str(info.get("name") or "").strip() or account
+    st.caption(f"👤 **{display}**（{account}）")
+    if st.button("退出登录", key="logout_button", use_container_width=True):
+        _logout()
+    st.divider()
+
+
 def render_sidebar() -> None:
     """侧边栏。
 
@@ -2374,6 +2568,7 @@ def render_sidebar() -> None:
     **空闲时**按用途分组折叠，避免两百行控件平铺。
     """
     with st.sidebar:
+        _render_account_bar()
         if st.session_state.status == "running" and st.session_state.profile:
             _render_running_panel()
             return
@@ -3295,6 +3490,8 @@ def _flush_flash() -> None:
 
 def main() -> None:
     init_state()
+    # 未登录在这里就被拦下（渲染登录页并 st.stop()），后面的逻辑都假定有账号。
+    _login_gate()
     # 把计量绑到本会话的账本上。必须每次 rerun 都绑：Streamlit 每次重跑脚本
     # 都是一个新线程，上一次 bind 的上下文不会自动带过来。
     bind_usage_meter(st.session_state.usage_meter)
