@@ -75,12 +75,12 @@ test_harvest_generated_rubrics -v
 py -3.12 -m unittest test_harvest_generated_rubrics -v
 ```
 
-21 套共 **620 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
+21 套共 **625 个用例**。设计上有两条硬要求：**不联网**（把网络层换成替身）、
 **检索用真件**（真简历、真切片、真跑本地 BM25）。
 
 > 注：`test_session_store` 与 `test_history_store` 依赖 `tempfile` 的清理权限。
 > 在受限沙箱下这两套可能报 `PermissionError`，那是**环境问题**、与代码无关；
-> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 620 例应全部通过。
+> 在具备正常临时目录权限的环境里（本项目当前默认策略）全量 625 例应全部通过。
 
 ## 文档导航
 
@@ -127,7 +127,7 @@ AIagent/
 ├── vendor/             # 第三方前端库（glasatarjs，MIT；来源与改动见 vendor/README.md）
 ├── requirements.txt    # 运行依赖（streamlit / openai / httpx / PyMuPDF / python-docx / edge-tts）
 ├── .trae/documents/    # v2–v3 的原始实施方案（历史记录，保留原样）
-├── test_*.py           # 21 套离线单测（共 620 个用例）
+├── test_*.py           # 21 套离线单测（共 625 个用例）
 ├── 项目说明.md          # 使用与部署说明（运行环境要求 / 安装启动 / 常见问题；另有同源的 .docx）
 ├── DESIGN.md           # 权威设计文档（另有同源的 DESIGN.docx）
 ├── 变更清单-v7.md       # v7–v16 逐文件改动清单

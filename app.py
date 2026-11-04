@@ -31,10 +31,11 @@ import resume_optimize
 import session_store
 from agents import (
     advisor_review,
+    bind_usage_meter,
     coach_review,
     evaluate_interview,
     interviewer_turn,
-    reset_usage,
+    new_usage_meter,
     resume_review,
     test_connection,
     usage_snapshot,
@@ -1134,6 +1135,9 @@ def init_state() -> None:
         "advice": {},
         "resume_advice": {},
         "usage": {},  # 本场 token 计量（开局清零，报告生成后取值）
+        # 本场计量的账本。必须放在 session_state 里：Streamlit 一个进程跑所有
+        # 浏览器会话，模块级累加器会被别的标签页清零/混算（详见 agents 的注释）。
+        "usage_meter": new_usage_meter(),
         # 清空历史记录需要两步确认（不可撤销），这个标记记住"已点过一次"
         "confirm_clear_history": False,
         # 本场记录落盘时写下的 time。报告页的"结局回填"靠它定位 history.json 里
@@ -1197,7 +1201,11 @@ def init_state() -> None:
 def start_interview(profile: dict, api_key: str) -> None:
     """重置状态并让面试官开场。"""
     clear_snapshot()  # 开新场次即丢弃上一场残留的快照，避免首页又提示"继续上次面试"
-    reset_usage()  # 本场 token 计量从零开始
+    # 本场 token 计量从零开始：换一本**新账**再绑定，而不是 reset_usage()。
+    # 后者清的是当前绑定的那本账，语义上没问题，但换新账更直白：
+    # 上一场的数字原样留在它自己的字典里，不会被下一场改写。
+    st.session_state.usage_meter = new_usage_meter()
+    bind_usage_meter(st.session_state.usage_meter)
     st.session_state.profile = profile
     st.session_state.api_key = api_key
     st.session_state.history = []
@@ -1468,8 +1476,9 @@ def finish_interview() -> None:
         st.session_state.evaluation = evaluation
         st.session_state.coach = coach
         st.session_state.advice = advisor
-        # 报告生成完再取一次计量，这样本场消耗把评估官与教练的调用也算进去
-        st.session_state.usage = usage_snapshot()
+        # 报告生成完再取一次计量，这样本场消耗把评估官与教练的调用也算进去。
+        # 显式传本会话的账本，不依赖"当前绑定"，避免取到别人的数字。
+        st.session_state.usage = usage_snapshot(st.session_state.usage_meter)
 
         # 记住这场记录的落盘时间：报告页的"结局回填"靠它定位这一条记录
         record_time = datetime.now().isoformat(timespec="seconds")
@@ -2288,7 +2297,11 @@ def _render_voice_section() -> None:
         if st.button("重试语音合成", use_container_width=True):
             st.session_state.tts_note = ""
             st.session_state.tts_failures = 0
-            reset_edge_breaker()
+            # 只解除本会话这两把 Key 的熔断：全局清零会把别人正在被保护的通道
+            # 一起打开，他那边下一轮又要白等一次超时。
+            reset_edge_breaker(
+                st.session_state.zhipu_key, st.session_state.sf_key
+            )
             st.rerun()
 
     st.session_state.voice_on = st.checkbox(
@@ -3733,6 +3746,9 @@ def _flush_flash() -> None:
 
 def main() -> None:
     init_state()
+    # 把计量绑到本会话的账本上。必须每次 rerun 都绑：Streamlit 每次重跑脚本
+    # 都是一个新线程，上一次 bind 的上下文不会自动带过来。
+    bind_usage_meter(st.session_state.usage_meter)
     render_sidebar()
     _flush_flash()
 

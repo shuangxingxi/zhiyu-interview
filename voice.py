@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import re
 import sys
@@ -116,15 +117,24 @@ ZHIPU_VOICES: dict[str, str] = {
 # 12 秒 = 中位数的 4 倍，慢到这份上就不值得让候选人干等了，直接换下一条通道。
 ZHIPU_TTS_TIMEOUT = 12.0
 
+# —— 熔断 ——
+#
+# 熔断要回答的问题是"这条通道现在还能不能打通"，而智谱 / 硅基流动能不能打通
+# 取决于**用户在各自会话里填的那把 Key**。所以状态必须按 Key 分桶，
+# 不能做成一个全局开关：
+#   · A 的 Key 余额不足 → 全局熔断 600 秒 → B 的好 Key 也十分钟不被尝试，
+#     B 听到的音色与延迟跟自己的配置对不上，界面上还没有任何解释；
+#   · B 点一次「重试语音合成」→ 全局清零 → 拆掉 A 正在享受的"已知故障快速跳过"。
+#
+# edge-tts 是匿名接口、没有 Key，它的 403 对所有客户端一样，因此保持全局。
+#
 # 智谱熔断：余额不足（429 / code 1113）是账号级问题，长熔断；
 # 超时、5xx 算瞬时。
 _ZHIPU_RETRY_AFTER_HARD = 600
 _ZHIPU_RETRY_AFTER_SOFT = 60
-_zhipu_down_until = 0.0
 # 瞬时失败连续两次才熔断。实测 8 连发全部 1.7~3.1 秒，但偶发一次 12 秒超时
 # （接线测试里真遇到过）。如果一次超时就熔断 60 秒，接下来一分钟里每轮
 # 都只能靠下一条通道——用户听到的是"这一分钟都没声音"，比偶发慢一轮更糟。
-_zhipu_fail_streak = 0
 _ZHIPU_FAIL_LIMIT = 2
 
 # edge-tts 熔断时长（秒）。分两档：永久性故障（403 拒绝第三方客户端）长熔断，
@@ -139,7 +149,30 @@ _edge_down_until = 0.0
 # 超时、5xx、429 只算瞬时故障。
 _SF_RETRY_AFTER_HARD = 600
 _SF_RETRY_AFTER_SOFT = 60
-_sf_down_until = 0.0
+
+# 分桶表：{"zhipu:ab12cd34": {"down_until": 时间戳, "streak": 连续瞬时失败数}}
+# 键里的指纹只用于区分 Key，不保存 Key 本身，也不进日志。
+_breakers: dict[str, dict[str, float]] = {}
+
+
+def _key_fp(key: str) -> str:
+    """Key 指纹（前 8 位十六进制）。同一个 Key 稳定，不同 Key 几乎不会撞。"""
+    return hashlib.sha1((key or "").strip().encode("utf-8")).hexdigest()[:8]
+
+
+def _breaker(provider: str, key: str) -> dict[str, float]:
+    """取某把 Key 在某条通道上的熔断状态；没有就建一个空桶。"""
+    name = f"{provider}:{_key_fp(key)}"
+    state = _breakers.get(name)
+    if state is None:
+        state = {"down_until": 0.0, "streak": 0.0}
+        _breakers[name] = state
+    return state
+
+
+def breaker_until(provider: str, key: str) -> float:
+    """这条通道在这把 Key 上的熔断截止时间戳；0 表示未熔断。"""
+    return _breaker(provider, key)["down_until"]
 
 # 单句合成的有界重试次数。瞬时故障重试，永久故障不重试（重试也白搭）。
 _EDGE_MAX_ATTEMPTS = 3
@@ -302,18 +335,19 @@ def synthesize(
 
     # —— 通道一：智谱 ——
     if zhipu_key:
-        if time.time() >= _zhipu_down_until:
+        if time.time() >= breaker_until("zhipu", zhipu_key):
             try:
                 audio = _synth_zhipu(text, voice, rate, zhipu_key)
                 if is_valid_audio(audio):
-                    _reset_zhipu_streak()
+                    _reset_zhipu_streak(zhipu_key)
                     return audio
                 errors.append("智谱返回空音频或非 WAV 数据")
                 # 接口说成功却给不出能播的音频，多半是账号/模型侧问题，长熔断
-                _mark_zhipu_down(permanent=True)
+                _mark_zhipu_down(zhipu_key, permanent=True)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"智谱={exc}")
                 _mark_zhipu_down(
+                    zhipu_key,
                     permanent=_is_permanent_zhipu_error(exc),
                     transient_is_fatal=False,
                 )
@@ -321,18 +355,19 @@ def synthesize(
             errors.append("智谱处于熔断期")
 
     # —— 通道二：硅基流动 ——
-    if fallback_key and time.time() >= _sf_down_until:
+    if fallback_key and time.time() >= breaker_until("sf", fallback_key):
         try:
             audio = _synth_siliconflow(text, voice, rate, fallback_key)
             if is_valid_audio(audio):
                 return audio
             errors.append("硅基流动返回空音频或非 MP3 数据")
-            _mark_sf_down(permanent=True)
+            _mark_sf_down(fallback_key, permanent=True)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"硅基流动={exc}")
             unusable_output = "空音频" in str(exc)
             _mark_sf_down(
-                permanent=unusable_output or _is_permanent_edge_error(exc)
+                fallback_key,
+                permanent=unusable_output or _is_permanent_edge_error(exc),
             )
     elif fallback_key:
         errors.append("硅基流动处于熔断期")
@@ -383,27 +418,30 @@ def _is_permanent_zhipu_error(exc: Exception) -> bool:
     return False
 
 
-def _mark_zhipu_down(permanent: bool, *, transient_is_fatal: bool = True) -> None:
-    """记一次智谱失败。永久性错误立刻长熔断；瞬时错误要连续两次才熔断。
+def _mark_zhipu_down(
+    key: str, permanent: bool, *, transient_is_fatal: bool = True
+) -> None:
+    """记一次智谱失败（只记在这把 Key 的桶里）。永久错误立刻长熔断，
+    瞬时错误要连续两次才熔断。
 
     `transient_is_fatal=False` 是 synthesize 里用的：偶发一次超时不该让
     接下来一分钟全都放弃合成，下一轮再试一次的成本（最多 12 秒）比
     "一分钟没声音"小得多。
     """
-    global _zhipu_down_until, _zhipu_fail_streak
+    state = _breaker("zhipu", key)
     if permanent:
-        _zhipu_fail_streak = 0
-        _zhipu_down_until = time.time() + _ZHIPU_RETRY_AFTER_HARD
+        state["streak"] = 0.0
+        state["down_until"] = time.time() + _ZHIPU_RETRY_AFTER_HARD
         return
-    _zhipu_fail_streak += 1
-    if transient_is_fatal or _zhipu_fail_streak >= _ZHIPU_FAIL_LIMIT:
-        _zhipu_fail_streak = 0
-        _zhipu_down_until = time.time() + _ZHIPU_RETRY_AFTER_SOFT
+    state["streak"] += 1
+    if transient_is_fatal or state["streak"] >= _ZHIPU_FAIL_LIMIT:
+        state["streak"] = 0.0
+        state["down_until"] = time.time() + _ZHIPU_RETRY_AFTER_SOFT
 
 
-def _reset_zhipu_streak() -> None:
-    global _zhipu_fail_streak
-    _zhipu_fail_streak = 0
+def _reset_zhipu_streak(key: str) -> None:
+    """合成成功，清掉这把 Key 的连续失败计数。"""
+    _breaker("zhipu", key)["streak"] = 0.0
 
 
 def _id3_tag_end(data: bytes) -> int:
@@ -490,25 +528,33 @@ def _parse_status_codes(text: str) -> tuple[int, ...]:
     return tuple(int(m) for m in _STATUS_RE.findall(text) if 100 <= int(m) <= 599)
 
 
-def reset_edge_breaker() -> None:
-    """手动解除三条语音通道的熔断。
+def reset_edge_breaker(*keys: str) -> None:
+    """手动解除熔断。
 
     熔断本来是为了避免每轮都去撞一个已经不可用的接口；但用户在侧边栏
     点「重试语音合成」时必须真的重新试一次，否则点了也还是走兜底/直接跳过，
     看起来就像按钮坏了。
+
+    **只清当前会话的 Key**：这是会话级操作，顺手清空全局会把别人正在被保护的
+    通道重新打开（他那边下一轮又要白等一次超时）。不带参数时清全部，
+    留给单测和显式全局重置。
     """
-    global _edge_down_until, _sf_down_until, _zhipu_down_until, _zhipu_fail_streak
+    global _edge_down_until
     _edge_down_until = 0.0
-    _sf_down_until = 0.0
-    _zhipu_down_until = 0.0
-    _zhipu_fail_streak = 0
+    if not keys:
+        _breakers.clear()
+        return
+    for key in keys:
+        if not (key or "").strip():
+            continue
+        _breaker("zhipu", key).update({"down_until": 0.0, "streak": 0.0})
+        _breaker("sf", key).update({"down_until": 0.0, "streak": 0.0})
 
 
-def _mark_sf_down(permanent: bool) -> None:
-    """标记硅基流动进入熔断期（与 edge-tts 同一套软/硬两档策略）。"""
-    global _sf_down_until
+def _mark_sf_down(key: str, permanent: bool) -> None:
+    """标记硅基流动在这把 Key 上进入熔断期（与 edge-tts 同一套软/硬两档策略）。"""
     window = _SF_RETRY_AFTER_HARD if permanent else _SF_RETRY_AFTER_SOFT
-    _sf_down_until = time.time() + window
+    _breaker("sf", key)["down_until"] = time.time() + window
     print(
         f"[TTS] 硅基流动{'永久故障' if permanent else '瞬时故障'}，{window}s 内不再尝试",
         file=sys.stderr,

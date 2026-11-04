@@ -346,25 +346,17 @@ class TestZhipuTts(unittest.TestCase):
 
     def setUp(self):
         self._orig_openai = voice.OpenAI
-        self._state = (
-            voice._zhipu_down_until,
-            voice._zhipu_fail_streak,
-            voice._edge_down_until,
-            voice._sf_down_until,
-        )
-        voice._zhipu_down_until = 0.0
-        voice._zhipu_fail_streak = 0
+        # 熔断状态按 Key 分桶，快照整个表再清空：用例之间不能互相漏桶。
+        self._state = {name: dict(state) for name, state in voice._breakers.items()}
+        self._edge = voice._edge_down_until
+        voice._breakers.clear()
         voice._edge_down_until = time.time() + 3600  # 别让测试真去连 edge
-        voice._sf_down_until = 0.0
 
     def tearDown(self):
         voice.OpenAI = self._orig_openai
-        (
-            voice._zhipu_down_until,
-            voice._zhipu_fail_streak,
-            voice._edge_down_until,
-            voice._sf_down_until,
-        ) = self._state
+        voice._breakers.clear()
+        voice._breakers.update(self._state)
+        voice._edge_down_until = self._edge
 
     def _install(self, sink, content=None):
         payload = content if content is not None else (
@@ -493,8 +485,8 @@ class TestZhipuTts(unittest.TestCase):
                 voice.synthesize("你好", zhipu_key="k")
         finally:
             voice._synth_zhipu = orig
-        self.assertEqual(voice._zhipu_down_until, 0.0, "第一次瞬时失败不该熔断")
-        self.assertEqual(voice._zhipu_fail_streak, 1)
+        self.assertEqual(voice.breaker_until("zhipu", "k"), 0.0, "第一次瞬时失败不该熔断")
+        self.assertEqual(voice._breaker("zhipu", "k")["streak"], 1)
 
     def test_two_transient_failures_trip_the_breaker(self):
         def _boom(*_a, **_k):
@@ -508,18 +500,44 @@ class TestZhipuTts(unittest.TestCase):
                     voice.synthesize("你好", zhipu_key="k")
         finally:
             voice._synth_zhipu = orig
-        self.assertGreater(voice._zhipu_down_until, time.time())
+        self.assertGreater(voice.breaker_until("zhipu", "k"), time.time())
         # 熔断期内不再尝试，报错要说明是熔断而不是又失败一次
         with self.assertRaises(RuntimeError) as ctx:
             voice.synthesize("你好", zhipu_key="k")
         self.assertIn("熔断", str(ctx.exception))
 
     def test_reset_clears_zhipu_breaker(self):
-        voice._mark_zhipu_down(permanent=True)
-        self.assertGreater(voice._zhipu_down_until, time.time())
+        voice._mark_zhipu_down("k", permanent=True)
+        self.assertGreater(voice.breaker_until("zhipu", "k"), time.time())
         voice.reset_edge_breaker()
-        self.assertEqual(voice._zhipu_down_until, 0.0)
-        self.assertEqual(voice._zhipu_fail_streak, 0)
+        self.assertEqual(voice.breaker_until("zhipu", "k"), 0.0)
+        self.assertEqual(voice._breaker("zhipu", "k")["streak"], 0)
+
+    # —— 多会话隔离：熔断必须按 Key 分桶 ——
+
+    def test_breaker_is_bucketed_by_key(self):
+        # 别人的 Key 余额不足（长熔断），不该把你的通道一起停掉
+        voice._mark_zhipu_down("bad-key", permanent=True)
+        self.assertGreater(voice.breaker_until("zhipu", "bad-key"), time.time())
+        self.assertEqual(
+            voice.breaker_until("zhipu", "good-key"), 0.0,
+            "另一把 Key 不该受连累",
+        )
+
+    def test_transient_streak_is_not_shared_across_keys(self):
+        # 两把 Key 各失败一次，不能凑成「连续两次」而熔断
+        voice._mark_zhipu_down("key-a", permanent=False, transient_is_fatal=False)
+        voice._mark_zhipu_down("key-b", permanent=False, transient_is_fatal=False)
+        self.assertEqual(voice.breaker_until("zhipu", "key-a"), 0.0)
+        self.assertEqual(voice.breaker_until("zhipu", "key-b"), 0.0)
+
+    def test_reset_only_clears_the_given_keys(self):
+        # 「重试语音合成」是会话级操作：只清自己的 Key，别人的保护要留着
+        voice._mark_zhipu_down("mine", permanent=True)
+        voice._mark_zhipu_down("theirs", permanent=True)
+        voice.reset_edge_breaker("mine")
+        self.assertEqual(voice.breaker_until("zhipu", "mine"), 0.0)
+        self.assertGreater(voice.breaker_until("zhipu", "theirs"), time.time())
 
 
 if __name__ == "__main__":

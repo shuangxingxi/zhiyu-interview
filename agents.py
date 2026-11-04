@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import sys
 import threading
@@ -114,26 +115,58 @@ def _client(api_key: str, timeout: httpx.Timeout | None = None) -> OpenAI:
 # ---------------------------------------------------------------------------
 # Token 计量
 #
-# DESIGN 反复强调"省成本"，但此前没有任何计量。这里按进程累计每次调用的
-# usage，供界面显示本场消耗。刻意做成模块级累加器 + 显式 reset：
-# Streamlit 每次 rerun 都在同一进程里重跑脚本，模块级变量天然跨轮存活，
-# 而"本场"的边界由调用方（开局 / 结束时）显式划定。
+# 这里必须区分两个层级：
+#   · "本场"是一次会话私有的边界（Streamlit 把它放在 session_state 里）；
+#   · 而模块级变量是**进程级**的——Streamlit 用一个进程跑所有浏览器会话，
+#     模块只 import 一次，所有标签页共享同一份内存。
+# 早期版本把累加器做成模块级全局：单机单人没问题，但两个人同时开标签页时，
+# 后开场的那位一 reset_usage() 就把前一位的账清零，前一位结束时
+# usage_snapshot() 拿到的是两个人的混合值，还会写进 history.json 变成错账。
+#
+# 所以计量状态改成**按会话绑定**：调用方（app）在每次 rerun 开头
+# bind_usage_meter() 绑定自己那本账，本模块只往"当前绑定的账"累加。
+#
+# 用 ContextVar 而不是把 meter 一路传参：chat_json 的调用点有二十多处，
+# 逐个加参数会把计量污染到每个函数签名里；ContextVar 是随上下文走的隐式参数，
+# agents 也因此不必依赖 streamlit。
 # ---------------------------------------------------------------------------
 
 _usage_lock = threading.Lock()
-_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+
+# 没有绑定会话时（单测、脚本直接调用）记在这本默认账上，行为与旧版一致。
+_DEFAULT_USAGE: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+_usage_ctx: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar(
+    "zy_usage_meter", default=None
+)
 
 
-def reset_usage() -> None:
-    """把计量清零。开新场时调用。"""
+def new_usage_meter() -> dict[str, int]:
+    """建一本空账，由调用方存进会话状态。"""
+    return {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+
+
+def bind_usage_meter(meter: dict[str, int] | None) -> None:
+    """把后续调用记到这本账上；传 None 退回默认账（单测 / 非会话场景）。"""
+    _usage_ctx.set(meter)
+
+
+def _meter() -> dict[str, int]:
+    meter = _usage_ctx.get()
+    return meter if meter is not None else _DEFAULT_USAGE
+
+
+def reset_usage(meter: dict[str, int] | None = None) -> None:
+    """把计量清零。不传参数时清**当前绑定的那本账**，而不是进程全局。"""
+    target = meter if meter is not None else _meter()
     with _usage_lock:
-        _usage.update({"prompt_tokens": 0, "completion_tokens": 0, "calls": 0})
+        target.update({"prompt_tokens": 0, "completion_tokens": 0, "calls": 0})
 
 
-def usage_snapshot() -> dict[str, int]:
-    """读取当前累计值（拷贝，调用方改不动内部状态）。"""
+def usage_snapshot(meter: dict[str, int] | None = None) -> dict[str, int]:
+    """读取累计值（拷贝，调用方改不动内部状态）。"""
+    target = meter if meter is not None else _meter()
     with _usage_lock:
-        return dict(_usage)
+        return dict(target)
 
 
 def _record_usage(response: Any) -> None:
@@ -143,12 +176,13 @@ def _record_usage(response: Any) -> None:
         return
     prompt = getattr(usage, "prompt_tokens", None)
     completion = getattr(usage, "completion_tokens", None)
+    target = _meter()
     with _usage_lock:
-        _usage["calls"] += 1
+        target["calls"] += 1
         if isinstance(prompt, int):
-            _usage["prompt_tokens"] += prompt
+            target["prompt_tokens"] += prompt
         if isinstance(completion, int):
-            _usage["completion_tokens"] += completion
+            target["completion_tokens"] += completion
 
 
 def _loads_lenient(text: str | None) -> dict[str, Any]:

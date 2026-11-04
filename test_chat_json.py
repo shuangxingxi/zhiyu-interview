@@ -330,5 +330,52 @@ class TestChatJsonUsage(unittest.TestCase):
         self.assertEqual(agents.usage_snapshot()["calls"], 0)
 
 
+class TestUsageMeterIsolation(unittest.TestCase):
+    """多会话隔离：Streamlit 一个进程跑所有标签页，计量必须各记各的账。
+
+    旧实现用一个模块级累加器：B 一开局 reset 就会把 A 的账清零，
+    A 结束时读到的又是两个人的混合值。这里钉住"按会话绑定"这条契约。
+    """
+
+    def tearDown(self):
+        agents.bind_usage_meter(None)
+
+    def _patch(self, client):
+        return mock.patch.object(agents, "_client", lambda *args, **kwargs: client)
+
+    def test_two_sessions_do_not_overwrite_each_other(self):
+        a = agents.new_usage_meter()
+        b = agents.new_usage_meter()
+
+        agents.bind_usage_meter(a)
+        agents.reset_usage()  # A 开局
+        with self._patch(
+            FakeClient(FakeResponse('{"ok": true}', usage=FakeUsage(100, 20)))
+        ):
+            agents.chat_json([{"role": "user", "content": "hi"}], "key")
+
+        agents.bind_usage_meter(b)
+        agents.reset_usage()  # B 开局：不能抹掉 A 的账
+        with self._patch(
+            FakeClient(FakeResponse('{"ok": true}', usage=FakeUsage(7, 3)))
+        ):
+            agents.chat_json([{"role": "user", "content": "hi"}], "key")
+
+        self.assertEqual(agents.usage_snapshot(a)["calls"], 1)
+        self.assertEqual(agents.usage_snapshot(a)["prompt_tokens"], 100)
+        self.assertEqual(agents.usage_snapshot(b)["calls"], 1)
+        self.assertEqual(agents.usage_snapshot(b)["prompt_tokens"], 7)
+
+    def test_unbound_calls_fall_back_to_default_meter(self):
+        # 没绑定会话时（单测、脚本直调）也不能崩，落在默认账上
+        agents.bind_usage_meter(None)
+        agents.reset_usage()
+        with self._patch(
+            FakeClient(FakeResponse('{"ok": true}', usage=FakeUsage(5, 1)))
+        ):
+            agents.chat_json([{"role": "user", "content": "hi"}], "key")
+        self.assertEqual(agents.usage_snapshot()["calls"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
