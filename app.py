@@ -945,11 +945,12 @@ st.markdown(
 
 
 def load_records() -> list[dict]:
-    return history_store.load_records(HISTORY_FILE)
+    """本机历史记录。多人共用同一个进程时，只返回自己那些（见 _client_tag）。"""
+    return history_store.load_records(HISTORY_FILE, owner=_client_tag())
 
 
 def save_record(record: dict) -> None:
-    history_store.append_record(HISTORY_FILE, record)
+    history_store.append_record(HISTORY_FILE, record, owner=_client_tag())
 
 
 def recent_asked_topics(limit: int = 3) -> list[str]:
@@ -1012,6 +1013,31 @@ def _session_id() -> str:
     return str(ss[session_store.SESSION_KEY])
 
 
+def _client_tag() -> str:
+    """区分"谁在访问"的粗粒度标记：用客户端 IP。
+
+    局域网分享出去后，多个浏览器连的是同一个 Streamlit 进程、同一份
+    `.snapshots/` 目录。只按保存时间挑最近的快照，A 的首页就会冒出 B 那场
+    没做完的面试，点"继续"等于接手别人的对话 —— 数据串味，而且当事人
+    未必立刻发现。用 IP 分组之后，不同机器各看各的。
+
+    同一台机器开多个标签页仍算同一个人（同一个 IP），这符合直觉：
+    都是自己没做完的场次，恢复哪一场都能接受。
+
+    拿不到 IP（非常规运行环境、代理未透传）时返回空串，此时行为退回到
+    原来的"全目录挑最近"，宁可多提示一次也不要让续面功能失效。
+    """
+    try:
+        value = st.context.ip_address
+    except Exception:  # noqa: BLE001
+        return ""
+    # 只认字符串：测试桩 / 未来版本可能给出别的对象，脏值会一路渗进
+    # 过滤逻辑，宁可退回"不隔离"也不要按乱码去分组。
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
 def save_snapshot() -> None:
     """把"进行中的面试"写进**本会话自己的**快照文件。
 
@@ -1022,6 +1048,7 @@ def save_snapshot() -> None:
     data = {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "started_at": st.session_state.started_at.isoformat(timespec="seconds"),
+        "owner": _client_tag(),
         # 简历不落盘：profile 里剔除 resume / resume_chunks，
         # 另记一个"本场是否用过简历"的标记，恢复后好提示用户。
         "profile": {
@@ -1040,8 +1067,10 @@ def save_snapshot() -> None:
 
 
 def load_snapshot() -> dict | None:
-    """读取最近一场未完成的面试（排除本会话自己）；没有则 None。"""
-    return session_store.latest_snapshot(BASE_DIR, exclude_session=_session_id())
+    """读取最近一场未完成的面试（排除本会话自己、只认本机来源）；没有则 None。"""
+    return session_store.latest_snapshot(
+        BASE_DIR, exclude_session=_session_id(), owner=_client_tag()
+    )
 
 
 def clear_snapshot() -> None:
@@ -2691,7 +2720,9 @@ def _render_outcome_backfill(time_key: str, key_prefix: str) -> None:
         placeholder="例如：自我介绍太长 / 项目细节答不上来",
     )
     if st.button("保存结局", key=f"outcome_save_{key_prefix}"):
-        if history_store.set_outcome(HISTORY_FILE, time_key, choice, note):
+        if history_store.set_outcome(
+            HISTORY_FILE, time_key, choice, note, owner=_client_tag()
+        ):
             # 不能直接 st.success 再 st.rerun()——rerun 会立刻中断本次运行，
             # 那句提示根本渲染不出来（全仓其余 rerun 都是"状态驱动"的，用户
             # 通过界面变化就能看出成功；这里是表单提交，必须给一句明确反馈）。
@@ -2843,7 +2874,7 @@ def render_history_tab() -> None:
             # 删除入口：DESIGN 的隐私应对写了"提供删除入口"，
             # 而落盘的 history.json 里存着完整逐字稿，必须让用户能自己清掉。
             if st.button("删除这一场", key=f"del_record_{index}"):
-                history_store.delete_record(HISTORY_FILE, index)
+                history_store.delete_record(HISTORY_FILE, index, owner=_client_tag())
                 st.session_state.flash = "已删除这一场记录。"
                 st.rerun()
 
@@ -2854,10 +2885,10 @@ def render_history_tab() -> None:
         "简历本身从不落盘，但逐字稿会——想清掉的话用下面的按钮。"
     )
     if st.session_state.get("confirm_clear_history"):
-        st.warning(f"将永久删除全部 {len(records)} 场记录，无法撤销。")
+        st.warning(f"将永久删除你的全部 {len(records)} 场记录，无法撤销。")
         col1, col2 = st.columns([1, 3])
         if col1.button("确认清空", type="primary"):
-            history_store.clear_records(HISTORY_FILE)
+            history_store.clear_records(HISTORY_FILE, owner=_client_tag())
             st.session_state.confirm_clear_history = False
             st.session_state.flash = "已清空全部历史记录。"
             st.rerun()

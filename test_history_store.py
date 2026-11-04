@@ -344,5 +344,197 @@ class TestSetOutcome(TempBase):
         self.assertFalse(history_store.set_outcome(self.path, "任意", "被拒"))
 
 
+class TestOwnerIsolation(unittest.TestCase):
+    """局域网多人共用时，各自只看得到自己的记录。
+
+    这是"能不能多人同时用"的真正分界线：并发写坏了只是丢数据，
+    归属没隔离则是**把别人的逐字稿和分数摊给所有人看**——
+    `history.json` 里存着完整问答原文与自述背景。
+
+    归属规则（history_store.visible_to）：
+        1. 不传 owner  → 全部可见（老调用方 / 离线单测）；
+        2. 有 owner    → 只认自己；
+        3. 无 owner 的老记录 → 本机访问可见，外部来源不可见。
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = Path(self._dir.name) / "history.json"
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _seed(self):
+        history_store.append_record(self.path, make_record(overall=90), owner="10.0.0.2")
+        history_store.append_record(self.path, make_record(overall=60), owner="10.0.0.9")
+
+    def test_owner_sees_only_own_records(self):
+        self._seed()
+        mine = history_store.load_records(self.path, owner="10.0.0.2")
+        self.assertEqual([r["overall_score"] for r in mine], [90])
+
+        theirs = history_store.load_records(self.path, owner="10.0.0.9")
+        self.assertEqual([r["overall_score"] for r in theirs], [60])
+
+    def test_owner_is_written_into_record(self):
+        history_store.append_record(self.path, make_record(), owner="10.0.0.2")
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(raw[0]["owner"], "10.0.0.2")
+
+    def test_no_owner_means_see_everything(self):
+        """不传 owner 保持老行为，否则现有一堆调用点会突然读不到数据。"""
+        self._seed()
+        self.assertEqual(len(history_store.load_records(self.path)), 2)
+
+    def test_legacy_records_visible_on_localhost_only(self):
+        """升级前的记录没有 owner：本机照常看得见，外部来客看不到。"""
+        history_store.append_record(self.path, make_record(overall=88))  # 无 owner
+        history_store.append_record(self.path, make_record(overall=60), owner="10.0.0.9")
+
+        local = history_store.load_records(self.path, owner="127.0.0.1")
+        self.assertEqual(sorted(r["overall_score"] for r in local), [60, 88])
+
+        remote = history_store.load_records(self.path, owner="10.0.0.2")
+        self.assertEqual(remote, [], "外部来客不该看到主人留下的老记录")
+
+    def test_delete_uses_visible_index(self):
+        """按可见视图的下标删除，绝不能删到别人的记录。
+
+        这是最容易写错的一处：界面上显示的是过滤后的列表，
+        下标 0 对应的是"我的第一条"，而不是文件里的第 0 条。
+        """
+        history_store.append_record(self.path, make_record(overall=10), owner="10.0.0.9")  # 别的机器
+        history_store.append_record(self.path, make_record(overall=90), owner="10.0.0.2")  # 我的
+        history_store.append_record(self.path, make_record(overall=95), owner="10.0.0.2")  # 我的
+
+        self.assertTrue(history_store.delete_record(self.path, 0, owner="10.0.0.2"))
+
+        all_records = history_store.load_records(self.path)
+        self.assertEqual(
+            [r["overall_score"] for r in all_records],
+            [10, 95],
+            "删掉的必须是 90 那场（我的第 0 条），别人的 10 分要留着",
+        )
+
+    def test_delete_out_of_visible_range_is_safe(self):
+        history_store.append_record(self.path, make_record(), owner="10.0.0.9")
+        self.assertFalse(history_store.delete_record(self.path, 0, owner="10.0.0.2"))
+        self.assertEqual(len(history_store.load_records(self.path)), 1)
+
+    def test_clear_only_removes_own(self):
+        """一个人点"清空历史"，不能把局域网里所有人的成绩单一起抹掉。"""
+        self._seed()
+        history_store.clear_records(self.path, owner="10.0.0.2")
+
+        remaining = history_store.load_records(self.path)
+        self.assertEqual([r["overall_score"] for r in remaining], [60])
+
+    def test_set_outcome_cannot_touch_others(self):
+        history_store.append_record(
+            self.path, make_record(overall=90, time="2026-10-11T10:00:00"), owner="10.0.0.9"
+        )
+        self.assertFalse(
+            history_store.set_outcome(
+                self.path, "2026-10-11T10:00:00", "被拒", owner="10.0.0.2"
+            )
+        )
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotIn("outcome", raw[0])
+
+
+class TestConcurrentAppend(unittest.TestCase):
+    """多人同时交卷不能丢记录。
+
+    这是一条**实测过的**回归线：改之前 `atomic_write_text` 的临时文件名固定为
+    `<目标>.tmp`，40 个线程同时 append 只落盘 1 条，其余 39 条抛
+    PermissionError；即使不抛异常，读-改-写不加锁也会互相覆盖
+    （A 读到 10 条、B 也读到 10 条，各自写回 11 条，凭空少一份成绩）。
+
+    所以这里同时钉两件事：临时名唯一、读-改-写全程持锁。
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = Path(self._dir.name) / "history.json"
+        history_store.clear_records(self.path)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_threads_do_not_lose_records(self):
+        import threading
+
+        count = 24
+        barrier = threading.Barrier(count)
+        errors: list[str] = []
+
+        def write(index: int) -> None:
+            barrier.wait()  # 让所有线程尽可能挤在同一瞬间，放大竞态
+            try:
+                history_store.append_record(self.path, {"time": f"t{index}"})
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [], "并发写入不该抛异常")
+        records = history_store.load_records(self.path)
+        self.assertEqual(
+            sorted(r["time"] for r in records),
+            sorted(f"t{i}" for i in range(count)),
+            "每一条都要落盘，一条都不能少",
+        )
+
+    def test_append_after_concurrency_leaves_no_temp(self):
+        import threading
+
+        def write(index: int) -> None:
+            history_store.append_record(self.path, {"time": f"t{index}"})
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        leftovers = list(self.path.parent.glob("*.tmp"))
+        self.assertEqual(leftovers, [], "并发之后也不该留下临时文件")
+
+    def test_delete_during_append_keeps_data_consistent(self):
+        """删和加同时来，最终条数要能对上，且文件始终是合法 JSON。
+
+        断言用的是"起点 + 新增 - 删除成功次数"，而不是写死的数字：
+        删除和追加的相对时序本来就不确定，钉死条数会做出一个 flaky 测试。
+        """
+        import threading
+
+        history_store.append_record(self.path, {"time": "seed"})
+        history_store.append_record(self.path, {"time": "seed2"})
+
+        def appender() -> None:
+            for i in range(6):
+                history_store.append_record(self.path, {"time": f"a{i}"})
+
+        removed = []
+
+        def deleter() -> None:
+            for _ in range(4):
+                removed.append(history_store.delete_record(self.path, 0))
+
+        threads = [threading.Thread(target=appender), threading.Thread(target=deleter)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        records = history_store.load_records(self.path)
+        self.assertEqual(len(records), 2 + 6 - sum(removed))
+        self.assertEqual(len({r["time"] for r in records}), len(records), "不该出现重复记录")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

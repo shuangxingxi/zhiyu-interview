@@ -176,6 +176,44 @@ class TestLatestSnapshot(TempBase):
             session_store.latest_snapshot(self.base, exclude_session="mine")
         )
 
+    def test_owner_filters_other_people(self):
+        """局域网多人同时用：A 不该在首页看到 B 那场没做完的面试。
+
+        两个人各自有快照文件，只按 saved_at 挑最近的会让 A 看到 B 的对话，
+        点"继续"就等于接手别人的面试 —— 数据直接串味。
+        """
+        session_store.write_snapshot(
+            self.base, "b_session", sample_snapshot(saved_at="2026-10-11T18:00:00", owner="10.0.0.9")
+        )
+        session_store.write_snapshot(
+            self.base, "a_session", sample_snapshot(saved_at="2026-10-11T09:00:00", owner="10.0.0.2")
+        )
+
+        # A 只看得到自己那场（哪怕 B 的更新）
+        latest = session_store.latest_snapshot(self.base, owner="10.0.0.2")
+        self.assertEqual(latest[session_store.SESSION_KEY], "a_session")
+
+        # B 同理
+        latest = session_store.latest_snapshot(self.base, owner="10.0.0.9")
+        self.assertEqual(latest[session_store.SESSION_KEY], "b_session")
+
+        # 没有匹配来源时返回 None，而不是退而求其次拿别人的
+        self.assertIsNone(session_store.latest_snapshot(self.base, owner="10.0.0.99"))
+
+    def test_owner_empty_falls_back_to_old_behaviour(self):
+        """拿不到 IP 时不能把续面功能弄没了：空 owner = 不按来源过滤。"""
+        session_store.write_snapshot(
+            self.base, "s1", sample_snapshot(saved_at="2026-10-11T18:00:00", owner="10.0.0.9")
+        )
+        latest = session_store.latest_snapshot(self.base, owner="")
+        self.assertEqual(latest[session_store.SESSION_KEY], "s1")
+
+    def test_legacy_snapshot_without_owner_is_still_visible(self):
+        """升级前留下的快照没有 owner 字段，不能被当成"别人的"而隐藏。"""
+        session_store.write_snapshot(self.base, "legacy", sample_snapshot())
+        latest = session_store.latest_snapshot(self.base, owner="10.0.0.2")
+        self.assertEqual(latest[session_store.SESSION_KEY], "legacy")
+
     def test_skips_corrupt_file(self):
         # 一个坏文件不该让整条续面路径失效
         bad = session_store.snapshot_path(self.base, "bad")

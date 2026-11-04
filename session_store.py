@@ -18,14 +18,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import threading
+import time
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 SNAPSHOT_DIR_NAME = ".snapshots"
 LEGACY_SNAPSHOT_NAME = ".session_snapshot.json"
 SESSION_KEY = "_session_id"
+
+# 跨线程 / 跨进程的写锁超时。正常人不会在前一个人写盘的同时点保存，
+# 5 秒都拿不到锁说明有别的进程卡死了，宁可报错也不要把界面永久挂住。
+LOCK_TIMEOUT = 5.0
+_LOCK_POLL = 0.02
 
 
 def snapshot_dir(base: Path) -> Path:
@@ -50,11 +59,139 @@ def atomic_write_text(path: Path, text: str) -> None:
     直接 write_text 一旦写到一半崩掉（断电 / 进程被杀 / 磁盘满），
     留下的是半截 JSON，下次读会抛 JSONDecodeError，整场记录就没了。
     os.replace 在同一分区上是原子的：读到的要么是旧内容、要么是新内容。
+
+    临时文件名**必须每个写入者各不相同**。原先固定叫 `<目标>.tmp`，
+    多人同时用同一份 history.json 时，后到的写入会撞上别人正打开的临时
+    文件（Windows 上直接 PermissionError），实测 40 个并发 append 丢了 39 条。
+    加上 pid + 线程 id + 随机串之后，各写各的临时文件，replace 才是纯原子操作。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+    )
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        _replace_with_retry(tmp, path)
+    finally:
+        # replace 成功时 tmp 已经不在了；失败时由这里清掉，不留垃圾。
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _replace_with_retry(src: Path, dst: Path, attempts: int = 25) -> None:
+    """os.replace，遇 Windows 的瞬时占用错误就重试。
+
+    目标文件正被另一个线程读（Scan 病毒 / 索引器 / 并发的 load_records）
+    时，Windows 会拒绝替换并抛 PermissionError。这属于"等一会儿就好"，
+    不是真的没权限，所以短暂重试而不是把异常丢给界面。
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(_LOCK_POLL)
+
+
+# ---------------------------------------------------------------------------
+# 跨线程 / 跨进程写锁
+# ---------------------------------------------------------------------------
+
+_locks_guard = threading.Lock()
+_path_locks: dict[str, threading.RLock] = {}
+
+
+def _thread_lock(key: str) -> threading.RLock:
+    """同一个目标路径共用一个可重入锁（进程内）。"""
+    with _locks_guard:
+        lock = _path_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _path_locks[key] = lock
+        return lock
+
+
+def _os_lock(fd: int, timeout: float) -> None:
+    """对已打开的 fd 加排他锁，拿不到就轮询直到超时。
+
+    Windows 与 POSIX 的语义不同，但都够用来串行化"读-改-写"：
+    我们只在几毫秒内持有它，不需要公平性。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("等待文件写锁超时，可能有另一个进程卡住了")
+            time.sleep(_LOCK_POLL)
+
+
+def _os_unlock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, timeout: float = LOCK_TIMEOUT) -> Iterator[None]:
+    """锁住某个数据文件的"读-改-写"整段。
+
+    两道锁缺一不可：进程内的 RLock 管同进程多会话（Streamlit 一个进程跑
+    所有标签页，这是最常见的并发来源），文件锁管用户开了两个启动器、
+    跑起两个 Streamlit 进程的情况。只加文件锁的话，同进程内还要为
+    每个 fd 的锁互相等待，白白多出超时风险。
+
+    用法：
+        with file_lock(history_path):
+            records = load_records(history_path)
+            ...改 records...
+            _write_records(history_path, records)
+    """
+    key = str(path.resolve()).lower()
+    tlock = _thread_lock(key)
+    if not tlock.acquire(timeout=timeout):
+        raise TimeoutError(f"等待 {path.name} 的写锁超时")
+
+    fd: int | None = None
+    try:
+        lock_path = path.with_name(path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        _os_lock(fd, timeout)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                _os_unlock(fd)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        tlock.release()
 
 
 def write_snapshot(base: Path, session_id: str, data: dict[str, Any]) -> None:
@@ -90,13 +227,21 @@ def _candidate_files(base: Path) -> list[Path]:
     return files
 
 
-def latest_snapshot(base: Path, exclude_session: str = "") -> dict[str, Any] | None:
+def latest_snapshot(
+    base: Path, exclude_session: str = "", owner: str = ""
+) -> dict[str, Any] | None:
     """返回最近保存的那一场未完成面试（附 `_session_id`）；没有则 None。
 
     exclude_session 用来跳过"自己"：正在面试的那个会话，不该在首页看到自己。
+
+    owner 用来隔离**不同的人**。局域网分享出去之后，多个浏览器同时连这台
+    机器，各自都有快照文件；只按时间挑最近的，就会让 A 看到 B 那场没做完的
+    面试、点"继续"直接接手别人的对话。传 owner 时只接受同一来源的快照，
+    空 owner 的快照（升级前留下的，没有这个字段）仍然兼容。
     """
     best: dict[str, Any] | None = None
     best_key: tuple[str, float] | None = None
+    owner = str(owner or "").strip()
 
     for path in _candidate_files(base):
         if exclude_session and path.stem == exclude_session:
@@ -104,6 +249,9 @@ def latest_snapshot(base: Path, exclude_session: str = "") -> dict[str, Any] | N
         data = read_snapshot_file(path)
         if data is None:
             continue
+        file_owner = str(data.get("owner") or "").strip()
+        if owner and file_owner and file_owner != owner:
+            continue  # 别人的场次，不提示、不恢复
         try:
             mtime = path.stat().st_mtime
         except OSError:

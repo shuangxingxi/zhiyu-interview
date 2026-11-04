@@ -24,10 +24,53 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from session_store import atomic_write_text
+from session_store import atomic_write_text, file_lock
 
 # 单场最多看这么多场，避免图表被几十场记录压扁
 DEFAULT_LIMIT = 20
+
+
+# ---------------------------------------------------------------------------
+# 归属隔离：谁产生的记录，只有谁看得见
+# ---------------------------------------------------------------------------
+
+# 本机访问时客户端 IP 的几种形态。旧版记录没有 owner 字段，一律视为本机产生。
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _owner_of(record: dict) -> str:
+    return str(record.get("owner") or "").strip()
+
+
+def visible_to(record: dict, owner: str) -> bool:
+    """这条记录该不该给 owner 这个人看。
+
+    不传 owner 时全部可见 —— 保持老调用方（以及离线单测）的行为不变。
+
+    本机访问（loopback）也全部可见。理由很实际：数据文件就躺在主人自己的
+    硬盘上，`notepad history.json` 就能看，再在本机做过滤只是自欺欺人；
+    而且同一个人换个地址访问（localhost / 局域网 IP）不该看到两份不同的历史。
+
+    其余情况按 owner 严格隔离。没有 owner 字段的记录是升级前留下的，
+    产生在这台机器上，所以对外部来客一律隐藏。
+    """
+    owner = str(owner or "").strip()
+    if not owner or owner in _LOOPBACK:
+        return True
+    record_owner = _owner_of(record)
+    if not record_owner:
+        return False
+    return record_owner == owner
+
+
+def _visible_indexes(records: list[dict], owner: str) -> list[int]:
+    """可见记录在**原始列表**里的下标。
+
+    界面上的下标是过滤后视图的下标，直接拿去删原始列表会删错人 ——
+    中间隔着一批别人的记录，偏移量完全对不上。所有按下标写操作的地方
+    都必须先经过这把映射。
+    """
+    return [i for i, record in enumerate(records) if visible_to(record, owner)]
 
 
 # ---------------------------------------------------------------------------
@@ -35,10 +78,12 @@ DEFAULT_LIMIT = 20
 # ---------------------------------------------------------------------------
 
 
-def load_records(path: Path) -> list[dict]:
+def load_records(path: Path, owner: str = "") -> list[dict]:
     """读取历史记录；文件缺失或损坏都返回空列表，绝不抛异常。
 
     历史只是回看与去重用的，任何异常都不该挡住正常面试。
+
+    owner 非空时只返回这个人自己的记录（见 visible_to 的归属规则）。
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -46,43 +91,73 @@ def load_records(path: Path) -> list[dict]:
         return []
     if not isinstance(data, list):
         return []
-    return [item for item in data if isinstance(item, dict)]
+    return [item for item in data if isinstance(item, dict) and visible_to(item, owner)]
+
+
+def _read_all(path: Path) -> list[dict]:
+    """不做归属过滤地读全量 —— 只有"读-改-写"内部才该用它。"""
+    return load_records(path, owner="")
 
 
 def _write_records(path: Path, records: list[dict]) -> None:
     atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=2))
 
 
-def append_record(path: Path, record: dict) -> None:
-    """追加一场记录。读-改-写，写入走原子替换。"""
-    records = load_records(path)
-    records.append(record)
-    _write_records(path, records)
+def append_record(path: Path, record: dict, owner: str = "") -> None:
+    """追加一场记录。读-改-写全程持锁。
+
+    不加锁时两个人同时交卷：A 读到 10 条、B 也读到 10 条，
+    A 写回 11 条、B 写回 11 条 —— 其中一份成绩凭空消失，而且不报错。
+
+    owner 会被写进记录，之后别人读不到它。
+    """
+    with file_lock(path):
+        records = _read_all(path)
+        if owner:
+            record = {**record, "owner": str(owner).strip()}
+        records.append(record)
+        _write_records(path, records)
 
 
-def delete_record(path: Path, index: int) -> bool:
+def delete_record(path: Path, index: int, owner: str = "") -> bool:
     """按下标删掉一场记录，返回是否真的删掉了。
 
     下标越界时返回 False 而不是抛异常——界面上的下标可能因为并发操作过期。
+    持锁读改写，避免和另一个会话的 append 撞车后把整份历史写回旧版本。
+
+    index 是**可见视图**里的下标：别人的记录不占位，也就删不到。
     """
-    records = load_records(path)
-    if not 0 <= index < len(records):
-        return False
-    del records[index]
-    _write_records(path, records)
-    return True
+    with file_lock(path):
+        records = _read_all(path)
+        indexes = _visible_indexes(records, owner)
+        if not 0 <= index < len(indexes):
+            return False
+        del records[indexes[index]]
+        _write_records(path, records)
+        return True
 
 
-def clear_records(path: Path) -> None:
-    """清空全部历史记录。
+
+def clear_records(path: Path, owner: str = "") -> None:
+    """清空历史记录。
 
     刻意写成"写入空列表"而不是删文件：`load_records` 对两者都返回空列表，
     但保留文件能避免某些平台上"删了又被别的进程重建"的竞态困惑。
+
+    owner 非空时只清掉自己那些，别人的记录原地保留 —— 否则一个人点
+    "清空历史"，把整个局域网里所有人的成绩单一起抹了。
     """
-    _write_records(path, [])
+    with file_lock(path):
+        if not owner:
+            _write_records(path, [])
+            return
+        kept = [record for record in _read_all(path) if not visible_to(record, owner)]
+        _write_records(path, kept)
 
 
-def set_outcome(path: Path, time_key: str, outcome: str, note: str = "") -> bool:
+def set_outcome(
+    path: Path, time_key: str, outcome: str, note: str = "", owner: str = ""
+) -> bool:
     """按落盘时间回填这一场的真实结局；找不到对应记录返回 False。
 
     为什么用 time 当键而不是下标：界面上的下标会因为"删掉一场"而整体前移，
@@ -92,21 +167,27 @@ def set_outcome(path: Path, time_key: str, outcome: str, note: str = "") -> bool
     outcome 的取值由调用方（界面）从 calibration.OUTCOMES 里选，
     这里只负责原样落盘；读取侧的兜底在 calibration.outcome_of，
     所以即使历史文件被手改成乱码，也不会把界面搞崩。
+
+    owner 非空时只在**自己可见**的记录里找：别人的场次即使 time 撞上，
+    也不该被顺手改掉结局。
     """
-    records = load_records(path)
     key = str(time_key or "").strip()
     if not key:
         return False
-    for record in records:
-        if str(record.get("time") or "").strip() != key:
-            continue
-        record["outcome"] = {
-            "value": str(outcome or "").strip(),
-            "note": str(note or "").strip(),
-            "time": datetime.now().isoformat(timespec="seconds"),
-        }
-        _write_records(path, records)
-        return True
+    with file_lock(path):
+        records = _read_all(path)
+        for record in records:
+            if str(record.get("time") or "").strip() != key:
+                continue
+            if not visible_to(record, owner):
+                continue
+            record["outcome"] = {
+                "value": str(outcome or "").strip(),
+                "note": str(note or "").strip(),
+                "time": datetime.now().isoformat(timespec="seconds"),
+            }
+            _write_records(path, records)
+            return True
     return False
 
 
