@@ -34,6 +34,7 @@ from openai import APITimeoutError, OpenAI
 from knowledge import (
     MAX_PROBES_STRICT,
     MAX_REFLECTS_IN_A_ROW,
+    UNTRUSTED_GUARD,
     deep_dive_block,
     profile_summary,
     real_question_block,
@@ -44,6 +45,7 @@ from knowledge import (
     rubric_hint_block,
     topic_mix_block,
     unanchored_block,
+    wrap_untrusted,
 )
 from mood import describe as describe_mood, effective_max_probes
 import advice
@@ -216,8 +218,16 @@ def chat_json(
     temperature: float = 0.3,
     attempts: int = 3,
     timeout: httpx.Timeout | None = None,
+    think: bool = True,
 ) -> dict[str, Any]:
     """调用 DeepSeek，要求返回 JSON 并解析成字典。
+
+    `think=False` 关掉思考模式，只给**交互轮**用（面试官那一轮）。两个理由：
+    ① deepseek-flash 默认开思考，单轮要 2~4 秒才出字，而交互轮只有 15 秒上限；
+    ② 官方明确「thinking 模式下 temperature 不生效」——本函数重试时靠"降温度
+       让它更守规矩"的策略，在思考模式下是空转的，关掉才真的起作用。
+    报告类角色（评估官 / 教练 / 建议官 / 简历优化）保留默认 True：他们本来就在
+    等结果，多几秒换更稳的判定值得，何况超时给到 90 秒。
 
     DeepSeek 偶尔会返回空白内容（finish_reason='stop'，content 全是空格），
     对话轮数变多后更容易出现。这是服务端偶发行为，重试即可恢复，
@@ -236,6 +246,9 @@ def chat_json(
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0.1 if attempt > 1 else temperature,
+                # 关思考时才显式传：开思考是服务端默认，多发一个字段只会多一份被
+                # 旧接口拒绝的风险（extra_body 是 OpenAI SDK 的透传位）。
+                **({} if think else {"extra_body": {"thinking": {"type": "disabled"}}}),
             )
         except APITimeoutError as exc:
             # 超时不重试：服务器没响应时再等一轮只是把干等翻倍。
@@ -290,6 +303,18 @@ def test_connection(api_key: str, model: str = DEFAULT_MODEL) -> str:
     return reply
 
 
+def _neutralize_utterance(text: Any) -> str:
+    """把候选人原话压成单行并中和结构标记。
+
+    逐字稿是「面试官：/候选人：」按行组织的。候选人只要在回答里打一个换行再写
+    「面试官：」，就能在评估官眼里伪造一轮面试官发言；写「【考点：X】」则能把
+    轮次归属带偏（评估官是按考点归属逐轮对照要点的）。这里统一压平并替换标记。
+    真实的换行在口头作答里没有语义，压平不损失信息。
+    """
+    flat = " ".join(str(text or "").split())
+    return flat.replace("【考点：", "【考点(原文引用)：")
+
+
 def format_transcript(
     history: list[dict[str, Any]], *, tag_topics: bool = False
 ) -> str:
@@ -325,7 +350,7 @@ def format_transcript(
                 head = f"【考点：{topic}】" if topic else "【考点：（未标注）】"
             lines.append(f"{head}面试官：{msg.get('content', '')}")
         else:
-            lines.append(f"候选人：{msg.get('content', '')}")
+            lines.append(f"候选人：{_neutralize_utterance(msg.get('content', ''))}")
     return "\n".join(lines)
 
 
@@ -411,7 +436,7 @@ def summarize_history(
 # 智能体 1 · 面试官（多轮对话 + 决策状态机）
 # ---------------------------------------------------------------------------
 
-INTERVIEWER_SYSTEM = """你叫「知遇」，是一位真实的面试官，正在主持一场{interview_type}，面试对象是「{scene}」场景下的候选人。
+INTERVIEWER_SYSTEM = UNTRUSTED_GUARD + """你叫「知遇」，是一位真实的面试官，正在主持一场{interview_type}，面试对象是「{scene}」场景下的候选人。
 
 【你的身份】
 你在{level_label}做{major}方向的面试。
@@ -893,14 +918,17 @@ def _resume_tool_round(
             {"role": "assistant", "content": json.dumps(current, ensure_ascii=False)},
             {
                 "role": "user",
-                "content": resume_rag.detail_block(hits, title="你查阅到的简历原文")
+                "content": wrap_untrusted(
+                    resume_rag.detail_block(hits, title="你查阅到的简历原文"),
+                    "resume",
+                )
                 + "\n\n"
                 + instruction,
             },
         ]
         try:
             nxt = _apply_fallbacks(
-                chat_json(follow_up, api_key, model, temperature=0.7),
+                chat_json(follow_up, api_key, model, temperature=0.7, think=False),
                 profile,
                 cur_q,
                 probes_used,
@@ -988,7 +1016,7 @@ def interviewer_turn(
     else:
         messages.append({"role": "user", "content": "（面试现在开始，请开场并问第一道题。）"})
 
-    data = chat_json(messages, api_key, model, temperature=0.7)
+    data = chat_json(messages, api_key, model, temperature=0.7, think=False)
     data = _apply_fallbacks(
         data, profile, cur_q, probes_used, reflects_in_a_row, mood_state
     )
@@ -1009,7 +1037,7 @@ def interviewer_turn(
         ]
         try:
             retried = _apply_fallbacks(
-                chat_json(retry_messages, api_key, model, temperature=0.7),
+                chat_json(retry_messages, api_key, model, temperature=0.7, think=False),
                 profile, cur_q, probes_used, reflects_in_a_row, mood_state,
             )
         except ValueError:
@@ -1045,7 +1073,7 @@ def interviewer_turn(
 # 智能体 2 · 评估官
 # ---------------------------------------------------------------------------
 
-EVALUATOR_SCORE_SYSTEM = """你是一位资深面试评委。请根据这场{interview_type}的完整对话记录，对候选人做出结构化评估。
+EVALUATOR_SCORE_SYSTEM = UNTRUSTED_GUARD + """你是一位资深面试评委。请根据这场{interview_type}的完整对话记录，对候选人做出结构化评估。
 
 【本场面试配置】
 {summary}
@@ -1116,7 +1144,7 @@ resume_check 同样是可选字段：只有在本场提供了「候选人简历�
 # 刻意与评分子调用分开，而不是在同一次调用里多要两个字段：同一次调用里，
 # 面试官的情绪表演会顺着上下文影响他对候选人的判断（审查方一旦继承起草方的叙事，
 # 审查就退化成自我确认）。所以评分子调用根本拿不到状态轨迹。
-EVALUATOR_ATTRIBUTION_SYSTEM = """你是一位资深面试评委。评分子任务已经完成，现在你只做一件事：
+EVALUATOR_ATTRIBUTION_SYSTEM = UNTRUSTED_GUARD + """你是一位资深面试评委。评分子任务已经完成，现在你只做一件事：
 判断候选人的表现有多少是被面试官状态逼出来的。
 
 【本场面试配置】
@@ -1327,7 +1355,7 @@ def _merge_attribution(
 # 智能体 3 · 教练
 # ---------------------------------------------------------------------------
 
-COACH_SYSTEM = """你是一位专门辅导应届生的面试教练，说话直接、务实，不讲套话。
+COACH_SYSTEM = UNTRUSTED_GUARD + """你是一位专门辅导应届生的面试教练，说话直接、务实，不讲套话。
 
 【本场背景】
 {summary}
@@ -1448,7 +1476,7 @@ def coach_review(
 # 从数据形状上就把两者区分开，避免报告里出现两份高度雷同的"最需要改的问题"。
 # ---------------------------------------------------------------------------
 
-ADVISOR_SYSTEM = """你是一位带过上百名应届生的求职教练。你不是来复述这场面试的，而是来告诉候选人：**下一次面试前，具体该补什么**。
+ADVISOR_SYSTEM = UNTRUSTED_GUARD + """你是一位带过上百名应届生的求职教练。你不是来复述这场面试的，而是来告诉候选人：**下一次面试前，具体该补什么**。
 
 【本场背景】
 {summary}
@@ -1554,7 +1582,7 @@ def advisor_review(
 # 两道关卡都必要：提示词降低发生率，本地核对兜住漏网的。
 # ---------------------------------------------------------------------------
 
-RESUME_SYSTEM = """你是一位在大厂做过五年招聘、也帮人改过上千份简历的简历顾问。现在请你帮候选人优化简历。
+RESUME_SYSTEM = UNTRUSTED_GUARD + """你是一位在大厂做过五年招聘、也帮人改过上千份简历的简历顾问。现在请你帮候选人优化简历。
 
 【本次目标】
 {target}
@@ -1660,7 +1688,7 @@ def resume_review(
 
     system = RESUME_SYSTEM.format(
         target=target,
-        resume=text,
+        resume=wrap_untrusted(text, "resume"),
         skeleton=_resume_skeleton(text),
     )
     data = chat_json(

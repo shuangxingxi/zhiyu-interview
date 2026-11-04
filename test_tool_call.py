@@ -68,7 +68,14 @@ class FakeChat:
         self.calls: list[dict] = []
 
     def __call__(
-        self, messages, api_key, model=None, temperature=0.3, attempts=3, timeout=None
+        self,
+        messages,
+        api_key,
+        model=None,
+        temperature=0.3,
+        attempts=3,
+        timeout=None,
+        think=True,
     ):
         # 签名必须与 agents.chat_json 保持一致：调用方一旦新增关键字参数，
         # 这里会立刻报错，而不是被 **kwargs 悄悄吞掉。
@@ -77,6 +84,7 @@ class FakeChat:
                 "messages": [dict(m) for m in messages],
                 "temperature": temperature,
                 "timeout": timeout,
+                "think": think,
             }
         )
         if not self.responses:

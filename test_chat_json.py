@@ -330,6 +330,29 @@ class TestChatJsonUsage(unittest.TestCase):
         self.assertEqual(agents.usage_snapshot()["calls"], 0)
 
 
+class TestThinkingSwitch(unittest.TestCase):
+    """交互轮要关思考：deepseek-flash 默认开，单轮 2~4 秒才出字，
+    而且官方明确 thinking 下 temperature 不生效——重试降温度是空转的。"""
+
+    def _patch(self, client):
+        return mock.patch.object(agents, "_client", lambda *args, **kwargs: client)
+
+    def test_thinking_disabled_is_passed_through(self):
+        client = FakeClient(FakeResponse('{"ok": true}'))
+        with self._patch(client):
+            agents.chat_json([{"role": "user", "content": "hi"}], "key", think=False)
+        self.assertEqual(
+            client.calls[0].get("extra_body"), {"thinking": {"type": "disabled"}}
+        )
+
+    def test_thinking_stays_on_by_default(self):
+        # 报告类角色要保留思考：不发字段就是服务端默认（开）
+        client = FakeClient(FakeResponse('{"ok": true}'))
+        with self._patch(client):
+            agents.chat_json([{"role": "user", "content": "hi"}], "key")
+        self.assertNotIn("extra_body", client.calls[0])
+
+
 class TestUsageMeterIsolation(unittest.TestCase):
     """多会话隔离：Streamlit 一个进程跑所有标签页，计量必须各记各的账。
 
