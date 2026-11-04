@@ -19,11 +19,15 @@
 from __future__ import annotations
 
 import asyncio
+import array
 import hashlib
+import io
+import math
 import random
 import re
 import sys
 import time
+import wave
 
 import edge_tts
 from openai import OpenAI
@@ -191,6 +195,15 @@ _ID3_HEADER_LEN = 10
 _WAV_MAGIC = b"RIFF"
 _WAV_HEADER_MIN = 44
 
+# 智谱合成音频开头的提示音参数（实测 2026-11-04，见 strip_lead_tone）。
+# 频率量出来约 550Hz，两侧各留 100Hz 余量；静音阈值取 -55dBFS 上下——
+# 比它低的片段裁掉没有任何损失，比它高又恒定在 450~650Hz 的才是提示音。
+_LEAD_TONE_HZ: tuple[float, float] = (450.0, 650.0)
+_LEAD_SILENCE_RMS = 60.0
+# 实测提示音最长 1.94 秒（三组文本 × 两个音色都在 1.84~1.94 之间，与文本无关）。
+# 给到 2.5 秒是留余量：万一哪天服务端把等待音拉长，别裁到一半就收手。
+_LEAD_SCAN_SECONDS = 2.5
+
 # 语气由两条正交的轴叠加：难度档给基线，情绪状态给偏移。
 # 值是 (语速偏移 %, 音调偏移 Hz)。每句再叠一点随机抖动，
 # 免得同一状态下每一句都像同一个模子刻出来的。
@@ -326,6 +339,9 @@ def synthesize(
 
     传进来的文本先过一遍 `tts_text` 清掉 markdown 记号：提示词要求面试官
     不要用 Markdown，但模型不总照做，漏出来的星号会被逐字念出来。
+
+    智谱那条通道拿到的音频还会过一遍 `strip_lead_tone`：它在人声前贴了约
+    1.9 秒的等待音，不裁掉就是每句话开口前"嘟…嘟"（2026-11-04 报障）。
     """
     text = tts_text(text)
     if not text:
@@ -485,6 +501,114 @@ def is_valid_audio(data: bytes) -> bool:
     return data[0] == _MP3_MAGIC
 
 
+def strip_lead_tone(audio: bytes) -> bytes:
+    """裁掉合成音频开头自带的提示音与静音。
+
+    2026-11-04 报障「每次说话前都有嘟嘟的声音」。逐帧量了四组文本 × 两个音色
+    的智谱返回值，前导完全一致：约 550Hz 的恒定纯音（RMS 1264、过零率 22 / 20ms）
+    与静音交替出现，最长一路拖到 **1.8 秒**才进人声。人与合成语音都发不出「频率
+    恒定、幅度恒定」的音，所以这不是念错了字，是接口在音频前贴了等待音。
+    听感就是开口前"嘟…嘟…嘟"几下。
+
+    判定分三档，逐 20ms 帧：
+        silent —— RMS 低于 -55dBFS，且出现在开头，裁掉无损；
+        tone   —— 频率落在 450~650Hz **且**幅度与开头几帧几乎相同（提示音幅度恒定，
+                  而人声同一个字的清音、爆破音幅度是跳变的）；
+        other  —— 其余。不能见到 other 就停：提示音每段之间都有淡入淡出帧
+                  （实测 280 / 640 / 1340 / 1460 / 1760ms 各一帧），停在那里只会
+                  裁掉 0.12 秒，嘟嘟声照旧。
+
+    所以 other 帧要看**往后 10 帧（200ms）**再决定：只有后面 mostly 都是 other、
+    几乎没有 tone，才算真的进了人声。这条把「淡入淡出帧」（后面紧跟着成串 tone
+    或静音）和「人声起点」（后面是清音→元音的连续变化）分开。
+
+    两道保护，宁可不裁也不能误伤：
+        ① 开头三帧必须都是 tone，否则认为这段音频本来就没有提示音，原样返回；
+        ② 前导几乎占满整段（裁完不足一帧）时也原样返回，不产出空音频。
+
+    只处理 16bit PCM WAV（智谱这条通道）。MP3 要解码才能裁，而项目不想为这点
+    事引入音频解码依赖；硅基流动那条通道返回 MP3，原样返回。
+    """
+    if len(audio) < _WAV_HEADER_MIN or not audio.startswith(_WAV_MAGIC):
+        return audio
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as handle:
+            channels = handle.getnchannels()
+            width = handle.getsampwidth()
+            rate = handle.getframerate()
+            raw = handle.readframes(handle.getnframes())
+    except (wave.Error, EOFError):
+        return audio
+    if width != 2 or channels not in (1, 2) or rate <= 0:
+        return audio
+
+    usable = len(raw) - len(raw) % (width * channels)
+    if usable < rate * width * channels // 50:  # 不足一帧，没什么可裁的
+        return audio
+    mono = array.array("h")
+    mono.frombytes(raw[:usable])
+    if channels == 2:
+        mono = array.array("h", [(mono[i] + mono[i + 1]) // 2 for i in range(0, len(mono) - 1, 2)])
+
+    span = max(1, rate // 50)                     # 20ms 一帧
+    scanned = min(len(mono) // span, int(rate * _LEAD_SCAN_SECONDS / span))
+    if scanned < 3:
+        return audio
+
+    # 每帧 (rms, 估计频率) 只算一次：后面要反复回看窗口。
+    frames: list[tuple[float, float]] = []
+    for index in range(scanned):
+        segment = mono[index * span:(index + 1) * span]
+        rms = math.sqrt(sum(v * v for v in segment) / len(segment))
+        crossings = sum(1 for a, b in zip(segment, segment[1:]) if (a < 0) != (b < 0))
+        frames.append((rms, crossings * rate / (2.0 * span)))
+
+    def is_tone(rms: float, hertz: float, reference: float) -> bool:
+        return (
+            abs(rms - reference) <= max(40.0, reference * 0.06)
+            and _LEAD_TONE_HZ[0] <= hertz <= _LEAD_TONE_HZ[1]
+        )
+
+    # 保护①：开头三帧都是提示音才算"这段带提示音"，否则不动。
+    reference = frames[0][0]
+    if reference <= _LEAD_SILENCE_RMS or not all(
+        is_tone(rms, hertz, reference) for rms, hertz in frames[1:3]
+    ):
+        return audio
+
+    window = 10                                    # 200ms 的回看窗口
+    start = 0
+    for index, (rms, hertz) in enumerate(frames):
+        if rms <= _LEAD_SILENCE_RMS or is_tone(rms, hertz, reference):
+            start = (index + 1) * span
+            continue
+        ahead = frames[index:index + window]
+        tones = sum(1 for r, h in ahead if is_tone(r, h, reference))
+        others = sum(1 for r, h in ahead if r > _LEAD_SILENCE_RMS and not is_tone(r, h, reference))
+        if others >= len(ahead) * 0.4 and tones < len(ahead) * 0.2:
+            break                                  # 进入人声，start 停在上一帧末尾
+        start = (index + 1) * span                 # 提示音的淡入淡出帧，继续往后
+
+    if start < rate // 2:                          # 前导不足 0.5 秒，不值得动刀
+        # 实测提示音 1.84~1.94 秒，远长于这个门槛。设这道坎是为了挡住误伤：
+        # 女声稳态元音（基频 300Hz 上下）也可能连着几帧"幅度稳、频率落在
+        # 450~650"，但它们撑不满半秒——一旦真被认成提示音，切掉的就是字头。
+        return audio
+    if start >= len(mono) - span:
+        return audio                               # 几乎整段都是前导，宁可不裁
+
+    out = io.BytesIO()
+    try:
+        with wave.open(out, "wb") as handle:
+            handle.setnchannels(channels)
+            handle.setsampwidth(width)
+            handle.setframerate(rate)
+            handle.writeframes(raw[start * width * channels:])
+    except (wave.Error, ValueError):
+        return audio
+    return out.getvalue()
+
+
 def audio_format(data: bytes) -> str:
     """音频字节的 MIME 类型，给 st.audio / 头像动效用。
 
@@ -614,7 +738,9 @@ def _synth_zhipu(text: str, voice: str, rate: str, api_key: str) -> bytes:
             speed=round(speed, 2),
             timeout=ZHIPU_TTS_TIMEOUT,
         )
-        return result.content
+        # 智谱会在音频前贴一段 550Hz 提示音（见 strip_lead_tone），
+        # 不裁掉就是每句话开口前"嘟…嘟"两下。
+        return strip_lead_tone(result.content)
 
     tone = ZHIPU_VOICES.get(voice, ZHIPU_VOICES[DEFAULT_VOICE])
     try:

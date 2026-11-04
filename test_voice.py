@@ -4,9 +4,13 @@
 真机合成需要网络，属于 `_verify_live` 那类手动验证的范围。
 """
 
+import array
+import io
+import math
 import time
 import types
 import unittest
+import wave
 
 import voice
 
@@ -538,6 +542,116 @@ class TestZhipuTts(unittest.TestCase):
         voice.reset_edge_breaker("mine")
         self.assertEqual(voice.breaker_until("zhipu", "mine"), 0.0)
         self.assertGreater(voice.breaker_until("zhipu", "theirs"), time.time())
+
+
+class TestStripLeadTone(unittest.TestCase):
+    """裁掉合成音频开头的提示音（2026-11-04「每次说话前嘟嘟」报障的修复）。
+
+    这批用例不联网：用合成波形复现实测到的结构，钉住三件事——
+    该裁的裁干净、不该裁一个字都不能动、裁完仍是合法且参数不变的 WAV。
+    """
+
+    RATE = 24000
+
+    # ---- 波形构造 ----
+    def _tone(self, ms: int, hertz: float = 550.0, amp: float = 1788.0) -> list[int]:
+        # amp 取 1788 → 正弦 RMS ≈ 1264，与实测提示音一致
+        n = int(self.RATE * ms / 1000)
+        return [int(amp * math.sin(2 * math.pi * hertz * i / self.RATE)) for i in range(n)]
+
+    def _silence(self, ms: int) -> list[int]:
+        return [0] * int(self.RATE * ms / 1000)
+
+    def _speech(self, ms: int) -> list[int]:
+        """伪人声：基频游走、幅度每 20ms 跳变。
+
+        幅度要明显离开提示音的 1264（这里 2400/3400 → RMS 1697/2404），
+        否则会被判据认成"幅度稳定的纯音"——真实人声也不会长时间维持同一幅度。
+        """
+        n = int(self.RATE * ms / 1000)
+        out = []
+        for i in range(n):
+            freq = 200 + 150 * math.sin(2 * math.pi * 3 * i / self.RATE)
+            amp = 2400 if (i // 480) % 2 == 0 else 3400
+            out.append(int(amp * math.sin(2 * math.pi * freq * i / self.RATE)))
+        return out
+
+    def _wav(self, samples: list[int], channels: int = 1) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as handle:
+            handle.setnchannels(channels)
+            handle.setsampwidth(2)
+            handle.setframerate(self.RATE)
+            data = samples
+            if channels == 2:
+                data = []
+                for value in samples:
+                    data += [value, value]
+            handle.writeframes(
+                array.array("h", [max(-32768, min(32767, v)) for v in data]).tobytes()
+            )
+        return buf.getvalue()
+
+    def _lead(self) -> list[int]:
+        """复现实测的前导结构：纯音与静音交替，共 1440ms。"""
+        return (
+            self._tone(120) + self._silence(160)
+            + self._tone(340) + self._silence(660)
+            + self._tone(120) + self._silence(40)
+        )
+
+    def _seconds(self, audio: bytes) -> float:
+        with wave.open(io.BytesIO(audio), "rb") as handle:
+            return handle.getnframes() / handle.getframerate()
+
+    # ---- 用例 ----
+    def test_beep_before_speech_is_cut(self):
+        beep = self._wav(self._lead() + self._speech(600))
+        out = voice.strip_lead_tone(beep)
+        self.assertNotEqual(out, beep, "带提示音的音频必须被处理")
+        self.assertAlmostEqual(self._seconds(out), 0.6, delta=0.12)
+
+    def test_trimmed_audio_keeps_wav_params(self):
+        out = voice.strip_lead_tone(self._wav(self._lead() + self._speech(600)))
+        with wave.open(io.BytesIO(out), "rb") as handle:
+            self.assertEqual(handle.getnchannels(), 1)
+            self.assertEqual(handle.getsampwidth(), 2)
+            self.assertEqual(handle.getframerate(), self.RATE)
+        self.assertTrue(voice.is_valid_audio(out))
+
+    def test_stereo_channels_survive(self):
+        out = voice.strip_lead_tone(self._wav(self._lead() + self._speech(600), channels=2))
+        with wave.open(io.BytesIO(out), "rb") as handle:
+            self.assertEqual(handle.getnchannels(), 2)
+        self.assertAlmostEqual(self._seconds(out), 0.6, delta=0.12)
+
+    def test_audio_without_beep_is_left_alone(self):
+        # 开头直接是人声（第一帧幅度就跳）——一个字节都不许动
+        plain = self._wav(self._speech(800))
+        self.assertEqual(voice.strip_lead_tone(plain), plain)
+
+    def test_steady_vowel_opening_is_left_alone(self):
+        # 女声稳态元音：前几帧幅度稳、频率也可能落在 450~650，
+        # 但撑不满半秒，所以不该被当成提示音切掉字头
+        steady = []
+        for i in range(int(self.RATE * 0.15)):
+            steady.append(int(1788 * math.sin(2 * math.pi * 300 * i / self.RATE)))
+        audio = self._wav(steady + self._speech(600))
+        self.assertEqual(voice.strip_lead_tone(audio), audio)
+
+    def test_all_beep_is_left_alone(self):
+        # 整段都是提示音（没有任何人声）：裁完会变空音频，宁可不裁
+        only = self._wav(self._lead())
+        self.assertEqual(voice.strip_lead_tone(only), only)
+
+    def test_non_wav_bytes_pass_through(self):
+        mp3 = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xff\xfb" + b"\x00" * 200
+        self.assertEqual(voice.strip_lead_tone(mp3), mp3)
+        self.assertEqual(voice.strip_lead_tone(b""), b"")
+
+    def test_truncated_wav_does_not_raise(self):
+        broken = self._wav(self._lead() + self._speech(600))[:60]
+        self.assertEqual(voice.strip_lead_tone(broken), broken)
 
 
 if __name__ == "__main__":
