@@ -91,6 +91,27 @@ SILICONFLOW_KEY_ENV = "SILICONFLOW_API_KEY"
 ZHIPU_KEY_ENV = "ZHIPU_API_KEY"
 
 
+def _bridge_secrets() -> None:
+    """把 Streamlit Secrets 灌进环境变量（云端部署专用）。
+
+    `load_api_key` 只认进程环境变量（外加 Windows 注册表），而 Streamlit
+    Community Cloud 只提供 `st.secrets`，两者互不相通。没有这一步，云上
+    服务端拿不到 Key，评委点开看到的就是一颗灰掉的"开始面试"。
+
+    本机运行时没有 secrets 文件，取不到值就跳过，行为与之前完全一致。
+    """
+    names = (DEEPSEEK_KEY_ENV, SILICONFLOW_KEY_ENV, ZHIPU_KEY_ENV, auth.ACCESS_CODE_ENV)
+    for name in names:
+        if os.getenv(name):
+            continue
+        try:
+            value = st.secrets[name]
+        except Exception:  # noqa: BLE001 —— 没有 secrets 文件是常态
+            continue
+        if value:
+            os.environ[name] = str(value)
+
+
 def load_api_key(env_name: str) -> str:
     """读取某个 API Key：进程环境变量 → Windows 用户级环境变量。
 
@@ -156,6 +177,8 @@ def _awaiting_interviewer() -> bool:
 
 
 st.set_page_config(page_title="知遇 · AI 虚拟面试官", page_icon="🎤", layout="wide")
+
+_bridge_secrets()
 
 
 # =====================================================================
@@ -945,13 +968,63 @@ st.markdown(
 # ---------------------------------------------------------------------------
 
 
+def _demo_mode() -> bool:
+    """当前是不是演示账号。
+
+    演示账号的记录**只留在本次浏览器会话里**，不落盘。理由：它的密码印在
+    登录页上，公网部署后所有评委共用同一个 owner —— 一旦落盘，A 评委的
+    简历与逐字稿就会出现在 B 评委的历史页里。
+    """
+    return _current_account() == auth.DEMO_ACCOUNT
+
+
 def load_records() -> list[dict]:
     """本机历史记录。多人共用同一个进程时，只返回自己那些（见 _client_tag）。"""
+    if _demo_mode():
+        return list(st.session_state.get("demo_records") or [])
     return history_store.load_records(HISTORY_FILE, owner=_client_tag())
 
 
 def save_record(record: dict) -> None:
+    if _demo_mode():
+        st.session_state.setdefault("demo_records", []).append(record)
+        return
     history_store.append_record(HISTORY_FILE, record, owner=_client_tag())
+
+
+def delete_record_at(index: int) -> None:
+    """删除可见视图里的第 index 条。演示账号只删内存里的那份。"""
+    if _demo_mode():
+        records = st.session_state.setdefault("demo_records", [])
+        if 0 <= index < len(records):
+            del records[index]
+        return
+    history_store.delete_record(HISTORY_FILE, index, owner=_client_tag())
+
+
+def clear_records() -> None:
+    if _demo_mode():
+        st.session_state["demo_records"] = []
+        return
+    history_store.clear_records(HISTORY_FILE, owner=_client_tag())
+
+
+def set_record_outcome(time_key: str, choice: str, note: str) -> bool:
+    """回填某一场的真实结局。演示账号改的是内存里那份。"""
+    if _demo_mode():
+        for record in st.session_state.setdefault("demo_records", []):
+            if str(record.get("time") or "").strip() != str(time_key or "").strip():
+                continue
+            record["outcome"] = {
+                "value": str(choice or "").strip(),
+                "note": str(note or "").strip(),
+                "time": datetime.now().isoformat(timespec="seconds"),
+            }
+            return True
+        return False
+    return history_store.set_outcome(
+        HISTORY_FILE, time_key, choice, note, owner=_client_tag()
+    )
 
 
 def recent_asked_topics(limit: int = 3) -> list[str]:
@@ -1577,6 +1650,9 @@ def render_login() -> None:
                         )
 
             with tab_register:
+                # 公网部署时用访问口令挡住陌生人注册（否则谁都能注册来烧
+                # 服务端的 API Key）。没配 ZY_ACCESS_CODE 就不显示这一栏。
+                access_code_box = None
                 with st.form("register_form"):
                     new_account = st.text_input(
                         "账号",
@@ -1592,11 +1668,22 @@ def render_login() -> None:
                     confirm = st.text_input(
                         "确认密码", type="password", key="reg_confirm", placeholder="再输一次"
                     )
+                    if auth.access_code_required():
+                        access_code_box = st.text_input(
+                            "访问口令",
+                            type="password",
+                            key="reg_access_code",
+                            placeholder="本次演示需要口令，向主办方索取",
+                        )
                     registered = st.form_submit_button(
                         "创建账号", type="primary", use_container_width=True
                     )
                 if registered:
-                    if new_password != confirm:
+                    if access_code_box is not None and not auth.verify_access_code(
+                        access_code_box
+                    ):
+                        st.error("访问口令不正确。")
+                    elif new_password != confirm:
                         st.error("两次输入的密码不一致。")
                     else:
                         ok, message = auth.register(
@@ -1674,6 +1761,10 @@ def save_snapshot() -> None:
     """
     if st.session_state.get("status") != "running" or not st.session_state.get("profile"):
         return
+    if _demo_mode():
+        # 演示账号不写快照：快照按 owner 过滤，所有人都是 demo，等于
+        # 下一个评委点"继续上次面试"就接上了上一个评委的简历。
+        return
     data = {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "started_at": st.session_state.started_at.isoformat(timespec="seconds"),
@@ -1697,6 +1788,8 @@ def save_snapshot() -> None:
 
 def load_snapshot() -> dict | None:
     """读取最近一场未完成的面试（排除本会话自己、只认本机来源）；没有则 None。"""
+    if _demo_mode():
+        return None  # 见 save_snapshot：演示账号不留、也不接别人的快照
     return session_store.latest_snapshot(
         BASE_DIR, exclude_session=_session_id(), owner=_client_tag()
     )
@@ -3366,9 +3459,7 @@ def _render_outcome_backfill(time_key: str, key_prefix: str) -> None:
         placeholder="例如：自我介绍太长 / 项目细节答不上来",
     )
     if st.button("保存结局", key=f"outcome_save_{key_prefix}"):
-        if history_store.set_outcome(
-            HISTORY_FILE, time_key, choice, note, owner=_client_tag()
-        ):
+        if set_record_outcome(time_key, choice, note):
             # 不能直接 st.success 再 st.rerun()——rerun 会立刻中断本次运行，
             # 那句提示根本渲染不出来（全仓其余 rerun 都是"状态驱动"的，用户
             # 通过界面变化就能看出成功；这里是表单提交，必须给一句明确反馈）。
@@ -3520,7 +3611,7 @@ def render_history_tab() -> None:
             # 删除入口：DESIGN 的隐私应对写了"提供删除入口"，
             # 而落盘的 history.json 里存着完整逐字稿，必须让用户能自己清掉。
             if st.button("删除这一场", key=f"del_record_{index}"):
-                history_store.delete_record(HISTORY_FILE, index, owner=_client_tag())
+                delete_record_at(index)
                 st.session_state.flash = "已删除这一场记录。"
                 st.rerun()
 
@@ -3534,7 +3625,7 @@ def render_history_tab() -> None:
         st.warning(f"将永久删除你的全部 {len(records)} 场记录，无法撤销。")
         col1, col2 = st.columns([1, 3])
         if col1.button("确认清空", type="primary"):
-            history_store.clear_records(HISTORY_FILE, owner=_client_tag())
+            clear_records()
             st.session_state.confirm_clear_history = False
             st.session_state.flash = "已清空全部历史记录。"
             st.rerun()

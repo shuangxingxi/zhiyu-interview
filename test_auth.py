@@ -20,6 +20,7 @@ session_store.claim_local_snapshots）。
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -293,6 +294,45 @@ class TestDemoUser(TempBase):
         self.assertFalse(auth.may_claim_legacy(auth.DEMO_ACCOUNT.upper()))
         self.assertTrue(auth.may_claim_legacy("alice"))
         self.assertFalse(auth.may_claim_legacy(""))
+
+    def test_demo_account_does_not_persist_history(self):
+        """演示号的记录不落盘：所有人共用一个 owner，落盘就是互相看简历。"""
+        self.assertFalse(auth.may_save_history(auth.DEMO_ACCOUNT))
+        self.assertFalse(auth.may_save_history(auth.DEMO_ACCOUNT.upper()))
+        self.assertTrue(auth.may_save_history("alice"))
+        self.assertFalse(auth.may_save_history(""))
+
+
+class TestAccessCode(TempBase):
+    """公网演示的准入口令：配了才拦，没配就完全不影响本机自用。"""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = os.environ.pop(auth.ACCESS_CODE_ENV, None)
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop(auth.ACCESS_CODE_ENV, None)
+        else:
+            os.environ[auth.ACCESS_CODE_ENV] = self._saved
+        super().tearDown()
+
+    def test_no_code_configured_lets_everyone_in(self):
+        self.assertEqual(auth.access_code_required(), "")
+        self.assertTrue(auth.verify_access_code(""))
+        self.assertTrue(auth.verify_access_code("随便输什么都行"))
+
+    def test_configured_code_is_enforced(self):
+        os.environ[auth.ACCESS_CODE_ENV] = "zy-2026"
+        self.assertEqual(auth.access_code_required(), "zy-2026")
+        self.assertTrue(auth.verify_access_code("zy-2026"))
+        self.assertFalse(auth.verify_access_code("zy-2025"))
+        self.assertFalse(auth.verify_access_code(""))
+
+    def test_blank_code_is_treated_as_absent(self):
+        os.environ[auth.ACCESS_CODE_ENV] = "   "
+        self.assertEqual(auth.access_code_required(), "")
+        self.assertTrue(auth.verify_access_code(""))
 
 
 # ---------------------------------------------------------------------------

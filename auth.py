@@ -298,6 +298,41 @@ def may_claim_legacy(account: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 公网部署：准入口令与演示账号的记录策略
+# ---------------------------------------------------------------------------
+
+ACCESS_CODE_ENV = "ZY_ACCESS_CODE"
+
+
+def access_code_required() -> str:
+    """当前生效的准入口令；空串表示不设防（本机自用就是这种）。
+
+    口令放环境变量而不是配置文件：它不该跟着仓库走。部署平台配一个变量
+    就生效，删掉就恢复原样，误提交的可能性为零。
+    """
+    return str(os.getenv(ACCESS_CODE_ENV, "") or "").strip()
+
+
+def verify_access_code(code: str) -> bool:
+    """校验准入口令。未配置口令时一律通过，本机自用不受影响。"""
+    expected = access_code_required()
+    if not expected:
+        return True
+    return hmac.compare_digest(str(code or "").strip(), expected)
+
+
+def may_save_history(account: str) -> bool:
+    """这个账号的面试记录要不要落到 history.json。
+
+    演示账号不落：密码印在登录页上，所有评委共用同一个 owner ——
+    落盘等于 A 评委的简历与逐字稿出现在 B 评委的历史页里。
+    规则在 app.py 执行（改成留在本次会话内存里）。
+    """
+    account = normalize_account(account)
+    return bool(account) and account != DEMO_ACCOUNT
+
+
+# ---------------------------------------------------------------------------
 # 会话 token
 # ---------------------------------------------------------------------------
 
