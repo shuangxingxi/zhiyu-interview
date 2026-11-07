@@ -78,6 +78,8 @@ _*_probe*.py
 *.swp
 Thumbs.db
 desktop.ini
+# Office 打开文件时生成的 ~$ 锁文件
+~$*
 
 dist/
 
