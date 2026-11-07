@@ -3484,6 +3484,103 @@ def _render_outcome_backfill(time_key: str, key_prefix: str) -> None:
             st.error("没找到这一场记录，可能已经被删掉了。")
 
 
+def _score_text(value: Any) -> str:
+    """分数转文字；缺失时不写 0 分，写一个破折号。"""
+    return "—" if value is None else f"{value}"
+
+
+def _render_record_detail(record: dict) -> None:
+    """历史里一场的详细回看：分数 → 维度 → 亮点/风险 → 教练 → 逐字稿。
+
+    此前这里只有一行 `st.json(record["evaluation"])`：raw JSON 能看但读不动，
+    而落盘的 transcript 压根没露过面——所谓「复盘」其实只是瞄一眼分数。
+    记录里本来就存着完整逐字稿与教练点评，直接把它们摆出来。
+    """
+    evaluation = record.get("evaluation") or {}
+    profile = record.get("profile") or {}
+    coach = record.get("coach") or {}
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("综合得分", _score_text(evaluation.get("overall_score")))
+    # 剥离干扰分只有高强度情绪模式才有；缺席是正常的，不该显成 0
+    col2.metric("剥离干扰后", _score_text(evaluation.get("adjusted_score")))
+    col3.metric("结论", str(evaluation.get("level") or record.get("level") or "—"))
+
+    scene_line = " · ".join(
+        part
+        for part in (
+            str(profile.get("scene") or ""),
+            str(profile.get("major") or ""),
+            f"{profile.get('level')} 级" if profile.get("level") else "",
+            f"情绪 {profile.get('mood_mode')}" if profile.get("mood_mode") else "",
+        )
+        if part
+    )
+    if scene_line:
+        st.caption(scene_line)
+
+    if evaluation.get("summary"):
+        st.markdown(f"**总评**：{evaluation['summary']}")
+
+    dims = [d for d in (evaluation.get("dimensions") or []) if isinstance(d, dict)]
+    if dims:
+        st.markdown("**维度得分**")
+        st.dataframe(
+            [
+                {
+                    "维度": str(d.get("name") or ""),
+                    "得分": d.get("score"),
+                    "评语": str(d.get("comment") or ""),
+                }
+                for d in dims
+            ],
+            hide_index=True,
+        )
+
+    highlights = [h for h in (evaluation.get("highlights") or []) if str(h).strip()]
+    risks = [r for r in (evaluation.get("risks") or []) if str(r).strip()]
+    if highlights or risks:
+        left, right = st.columns(2)
+        with left:
+            if highlights:
+                st.markdown("**亮点**")
+                for item in highlights:
+                    st.markdown(f"- {item}")
+        with right:
+            if risks:
+                st.markdown("**风险与硬伤**")
+                for item in risks:
+                    st.markdown(f"- {item}")
+
+    weakest = [w for w in (coach.get("weakest") or []) if isinstance(w, dict)]
+    if weakest:
+        st.markdown("**最该改的几处**")
+        for item in weakest:
+            st.markdown(f"- **{item.get('problem', '')}**：{item.get('fix', '')}")
+            if item.get("evidence"):
+                st.caption(f"依据：{item['evidence']}")
+
+    drills = [d for d in (coach.get("drills") or []) if str(d).strip()]
+    if drills:
+        st.markdown("**接下来练什么**")
+        for i, item in enumerate(drills, start=1):
+            st.markdown(f"{i}. {item}")
+
+    if coach.get("encouragement"):
+        st.caption(str(coach["encouragement"]))
+
+    transcript = [m for m in (record.get("transcript") or []) if isinstance(m, dict)]
+    if transcript:
+        turns = len([m for m in transcript if m.get("role") == "user"])
+        with st.expander(f"完整逐字稿（{turns} 轮回答）"):
+            for msg in transcript:
+                speaker = "面试官" if msg.get("role") == "assistant" else "候选人"
+                st.markdown(f"**{speaker}**：{msg.get('content', '')}")
+
+    with st.expander("原始数据（JSON）"):
+        st.json(record)
+
+
 def render_history_tab() -> None:
     """历史记录页：跨场趋势 + 维度对比 + 逐场回看 + 删除入口。
 
@@ -3497,6 +3594,12 @@ def render_history_tab() -> None:
         return
 
     st.caption(f"共 {len(records)} 场面试记录，保存在 history.json")
+    if _demo_mode():
+        st.caption(
+            "演示账号的记录只留在本次浏览器会话里，刷新页面或换设备后会清空"
+            "——这是为了让多位评委同时体验时彼此看不见对方的逐字稿。"
+            "注册自己的账号，记录才会长期保留。"
+        )
 
     # -- 结局回填与评分校准 ------------------------------------------------
     # 分数只能说明"我这几场有没有进步"；要回答"这个分准不准"就必须有真实结局。
@@ -3619,8 +3722,7 @@ def render_history_tab() -> None:
         # 去重；定位记录仍然只用时间（time_key 与 widget key 是两回事）。
         widget_prefix = f"hist_{record.get('time') or 'na'}_{index}"
         with st.expander(f"{label} · {outcome}" if outcome else label):
-            st.caption(record.get("level", ""))
-            st.json(record.get("evaluation", {}))
+            _render_record_detail(record)
             st.divider()
             _render_outcome_backfill(record.get("time"), widget_prefix)
             # 删除入口：DESIGN 的隐私应对写了"提供删除入口"，
@@ -4093,6 +4195,13 @@ def main() -> None:
         )
         st.caption("开始：在左侧完成配置（场景 → 专业 → 难度，以及面试官情绪），填好 API Key 后点击「开始面试」。")
         st.info("小提示：技术面和专业方向相关，行为面则主要考 STAR 结构，可分别各练一场。")
+
+        # 历史复盘此前只挂在「报告页」的第 5 个 tab——那意味着**必须刚做完一场**
+        # 才进得去，想复看上周那一场却找不到门。首页补一个常驻入口。
+        past = load_records()
+        if past:
+            with st.expander(f"📊 我的历史记录（{len(past)} 场）— 点开复盘"):
+                render_history_tab()
     elif status == "running":
         render_interview()
     else:

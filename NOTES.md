@@ -141,3 +141,14 @@
 **另一发现（未修）**：面试的结束完全靠模型自觉返回 `action:"end"`，**没有硬上限**。实测计划 5 轮的场次连答
 10 轮，模型仍在追问，只能手动点「结束面试并生成报告」。想兜底的话在 `advance()` 里加一句
 `if cur_q > total_rounds: 强制 finish`，但这会改变产品节奏，待定。
+
+## 2026-11-07 · 历史复盘入口
+
+- 用户要求「查看历史记录和结果，让用户可以复盘」。真相：`render_history_tab()` 早就写好了（评分校准 / 分数趋势 / 维度对比 / 逐场回看 / 两次确认清空），但只挂在报告页第 5 个 tab —— 必须**刚做完一场**才进得去，首页没有任何入口；逐场回看还只是 `st.json(record["evaluation"])` 的裸 JSON，落盘的 transcript 从未露过面。
+- 改动（app.py）：
+  1. 新增 `_score_text()`（None → "—"，避免缺分显示成 0）与 `_render_record_detail()`：三列 metric（综合得分 / 剥离干扰后 / 结论）→ 场景 caption → 总评 → 维度 `st.dataframe`（维度/得分/评语）→ 亮点与风险双列 → 教练 `weakest`（带"依据"）+ `drills` + `encouragement` → `完整逐字稿（N 轮回答）` expander → `原始数据（JSON）` expander。
+  2. 逐场回看段改用 `_render_record_detail()`，删除裸 JSON。
+  3. 首页 `status == "idle"` 分支加常驻入口：`with st.expander(f"📊 我的历史记录（{len(past)} 场）— 点开复盘"): render_history_tab()`。
+  4. `render_history_tab()` 顶部在 demo 模式下补一句提示：记录只留本次浏览器会话，刷新即清空。
+- 验证：`compileall` 0 错误；`python -m unittest discover` → 730 tests OK；`.tmp/verify_history.py`（把 evaluate/coach/advisor 换成秒回假实现，真调 interviewer_turn 跑 2 轮再手动收尾）→ 回首页后 expander 出现、`综合得分=76 / 剥离干扰后=72 / 结论=待定`、维度表含「编程基础与数据结构」、「最该改的几处」在、`完整逐字稿（2 轮回答）` 在、0 异常 → PASS。
+- 坑：AppTest 的 `Expander` **没有 `.expand()` 方法**；且 expander 内部代码始终会被执行（折叠只影响显示），元素本来就在 `at.expander` / `at.metric` / `at.dataframe` 里，直接在 `at.run()` 后断言即可。
