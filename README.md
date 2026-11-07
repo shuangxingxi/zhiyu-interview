@@ -4,6 +4,37 @@
 不是题库，而是一套**会现场追问**的面试官引擎：同一套代码，靠「场景 × 专业 × 难度」
 三级配置，还原不同面试官的真实差异，并在面试后给出**可执行**的复盘报告。
 
+## 在线体验
+
+**https://zhiyu-interview.streamlit.app**
+
+打开后点登录卡下方的「**用演示账号进入**」即可，不需要注册。
+
+| 项 | 值 |
+|---|---|
+| 账号 | `demo` |
+| 密码 | `ZhiyuDemo2026` |
+
+演示账号的面试记录只存在当前浏览器会话里、**不落盘**——多人同时体验时彼此看不见对方的
+简历与历史，也不会有人接着你的未完成场次。免费实例闲置会休眠，首次打开约需 30 秒唤醒。
+
+<details>
+<summary>自己部署一份</summary>
+
+fork 本仓库 → [share.streamlit.io](https://share.streamlit.io) → 选中仓库、主文件填 `app.py`、
+Python 选 3.12 → 在 Secrets 里填：
+
+```toml
+DEEPSEEK_API_KEY = "sk-xxxx"        # 必需：四个 LLM 角色
+SILICONFLOW_API_KEY = "sk-xxxx"     # 可选：语音识别
+ZHIPU_API_KEY = "xxxx"              # 可选：语音合成
+ZY_ACCESS_CODE = "your-code"        # 可选：不填则注册不设门槛
+```
+
+Secrets 会由 `app.py` 里的桥接函数搬进环境变量，本机用 `$env:` 时行为不变。
+
+</details>
+
 ## 快速开始
 
 ```powershell
