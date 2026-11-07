@@ -2272,10 +2272,11 @@ def finish_interview() -> None:
                 "usage": st.session_state.usage,
                 "evaluation": evaluation,
                 "coach": coach,
-                # 「提升建议」刻意不落盘：它的每条建议都引用候选人原话，属于个人化
-                # 内容（与简历同级）。留存只在**用户主动导出报告**时发生，
-                # 与 README 声明的"简历从不写入磁盘"保持一致口径。
-                # 想在这里补一行落盘时，必须同步修改 README 的隐私声明。
+                # 「提升建议」也落盘。原先刻意不存，理由是"每条建议都引用候选人原话"，
+                # 但逐字稿 transcript 本来就整段落盘了——建议只是对同一批内容的再加工，
+                # 不存反而让复盘断档：做完一场没当场导出，那一栏就永远看不到了。
+                # 隐私口径靠"按账号隔离 + 逐场可删 + 清空全部"来守，不是靠不存。
+                "advice": advisor,
             }
         )
         stage.update(label="报告已生成", state="complete", expanded=False)
@@ -3489,6 +3490,63 @@ def _score_text(value: Any) -> str:
     return "—" if value is None else f"{value}"
 
 
+def _render_record_advice(advice: dict) -> None:
+    """建议官那一栏。旧记录没有它——那批是在「建议不落盘」的口径下生成的。"""
+    if not advice or not advice.get("advice"):
+        st.caption(
+            "这一场没有保存提升建议：它生成于旧版本，当时建议官的结果只留在报告页、"
+            "不随记录落盘。新做的面试会连建议一起保存。"
+        )
+        return
+
+    st.markdown("**提升建议**")
+    st.caption(
+        "教练改的是**说法**（那句话该怎么讲），这一栏补的是**能力与经历**"
+        "（这个维度缺什么、下次面试前做什么）。"
+    )
+
+    priority = [p for p in (advice.get("priority") or []) if str(p).strip()]
+    if priority:
+        st.markdown("如果只改一件事")
+        for i, item in enumerate(priority, start=1):
+            st.markdown(f"{i}. {item}")
+
+    for item in advice["advice"]:
+        if not isinstance(item, dict):
+            continue
+        score = item.get("score")
+        title = str(item.get("dimension") or "未命名维度")
+        if score is not None:
+            title += f"（{score} 分）"
+        with st.expander(title):
+            if item.get("missing"):
+                st.caption("本次未给出该维度的建议。")
+                continue
+            if item.get("gap"):
+                st.markdown(f"**缺什么**：{item['gap']}")
+            if item.get("evidence"):
+                st.caption(f"依据：{item['evidence']}")
+            for action in item.get("actions") or []:
+                st.markdown(f"- {action}")
+            if item.get("self_check"):
+                st.info(f"自测：{item['self_check']}")
+
+    quick = [q for q in (advice.get("quick_wins") or []) if str(q).strip()]
+    if quick:
+        st.markdown("明天就能改")
+        for i, item in enumerate(quick, start=1):
+            st.markdown(f"{i}. {item}")
+
+    if advice.get("next_setup"):
+        st.markdown(f"**下一场怎么练**：{advice['next_setup']}")
+
+    if advice.get("evidence_missing"):
+        st.caption(
+            f"其中 {advice['evidence_missing']} 条建议没能引用到原话，已如实标出"
+            "——「缺量化结果」这类建议本身就不针对某一句原话。"
+        )
+
+
 def _render_record_detail(record: dict) -> None:
     """历史里一场的详细回看：分数 → 维度 → 亮点/风险 → 教练 → 逐字稿。
 
@@ -3499,6 +3557,7 @@ def _render_record_detail(record: dict) -> None:
     evaluation = record.get("evaluation") or {}
     profile = record.get("profile") or {}
     coach = record.get("coach") or {}
+    advice = record.get("advice") or {}
 
     col1, col2, col3 = st.columns(3)
     col1.metric("综合得分", _score_text(evaluation.get("overall_score")))
@@ -3537,6 +3596,24 @@ def _render_record_detail(record: dict) -> None:
             hide_index=True,
         )
 
+    rubric = [r for r in (evaluation.get("rubric_check") or []) if isinstance(r, dict)]
+    if rubric:
+        st.markdown("**逐题命中（考点 × 是否答到）**")
+        st.dataframe(
+            [
+                {
+                    "考点": str(r.get("topic") or ""),
+                    "来源": str(r.get("source") or ""),
+                    "必答点": "、".join(str(x) for x in (r.get("must_hit") or [])),
+                    "漏答": "、".join(str(x) for x in (r.get("missed") or [])),
+                    "说错": "、".join(str(x) for x in (r.get("errors") or [])),
+                    "点评": str(r.get("comment") or ""),
+                }
+                for r in rubric
+            ],
+            hide_index=True,
+        )
+
     highlights = [h for h in (evaluation.get("highlights") or []) if str(h).strip()]
     risks = [r for r in (evaluation.get("risks") or []) if str(r).strip()]
     if highlights or risks:
@@ -3560,14 +3637,42 @@ def _render_record_detail(record: dict) -> None:
             if item.get("evidence"):
                 st.caption(f"依据：{item['evidence']}")
 
+    rewrites = [w for w in (coach.get("rewrites") or []) if isinstance(w, dict)]
+    if rewrites:
+        st.markdown("**回答改写示范**")
+        for i, item in enumerate(rewrites, start=1):
+            with st.expander(f"{i}. {item.get('question', '')}"):
+                st.markdown(f"**你的原答**：{item.get('original', '')}")
+                st.success(f"**示范答案**：{item.get('improved', '')}")
+                st.caption(f"为什么这样改：{item.get('why', '')}")
+
     drills = [d for d in (coach.get("drills") or []) if str(d).strip()]
     if drills:
         st.markdown("**接下来练什么**")
         for i, item in enumerate(drills, start=1):
             st.markdown(f"{i}. {item}")
 
+    resilience = coach.get("resilience") or {}
+    if resilience.get("summary"):
+        st.markdown("**压力下的稳定性**")
+        st.markdown(str(resilience["summary"]))
+        if resilience.get("evidence"):
+            st.caption(f"证据：{resilience['evidence']}")
+        if resilience.get("fix"):
+            st.write(f"怎么稳住：{resilience['fix']}")
+
     if coach.get("encouragement"):
         st.caption(str(coach["encouragement"]))
+
+    _render_record_advice(advice)
+
+    decisions = [d for d in (record.get("decisions") or []) if isinstance(d, dict)]
+    if decisions:
+        st.markdown("**面试官决策轨迹**")
+        st.caption(
+            "每一轮追问或换题的依据；「工具调用」列显示面试官是否主动查阅了简历原文。"
+        )
+        st.dataframe(decisions, hide_index=True)
 
     transcript = [m for m in (record.get("transcript") or []) if isinstance(m, dict)]
     if transcript:

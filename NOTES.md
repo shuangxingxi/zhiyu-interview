@@ -152,3 +152,17 @@
   4. `render_history_tab()` 顶部在 demo 模式下补一句提示：记录只留本次浏览器会话，刷新即清空。
 - 验证：`compileall` 0 错误；`python -m unittest discover` → 730 tests OK；`.tmp/verify_history.py`（把 evaluate/coach/advisor 换成秒回假实现，真调 interviewer_turn 跑 2 轮再手动收尾）→ 回首页后 expander 出现、`综合得分=76 / 剥离干扰后=72 / 结论=待定`、维度表含「编程基础与数据结构」、「最该改的几处」在、`完整逐字稿（2 轮回答）` 在、0 异常 → PASS。
 - 坑：AppTest 的 `Expander` **没有 `.expand()` 方法**；且 expander 内部代码始终会被执行（折叠只影响显示），元素本来就在 `at.expander` / `at.metric` / `at.dataframe` 里，直接在 `at.run()` 后断言即可。
+
+## 2026-11-07 · 历史复盘补齐完整报告（advice 落盘）
+
+- 用户反馈「但是没有面试报告、建议那些东西啊」。根因两条：
+  1. `save_record()` **刻意不存 advice**（原注释与 README 隐私节的理由：「建议每条引用候选人原话，属个人化，与简历同级」）。后果是做一场不导出就永久丢失，复盘断档。
+  2. `_render_record_detail()` 只渲染了 evaluation 的分数/维度/亮点/风险 + coach 的 weakest/drills，**没渲染** `rubric_check`（逐题命中）、`rewrites`（改写示范）、`resilience`（压力稳定性）、`decisions`（决策轨迹）、`advice`。
+- 判断：原口径站不住——逐字稿 `transcript` 本来就整段落盘，advice 只是对同一批内容的再加工，不增加新的暴露面。隐私改由「按账号隔离 + 逐场删除 + 清空全部」守。
+- 改动：
+  1. `finish_interview()` 的 `save_record(...)` 增加 `"advice": advisor`，注释改为说明改动理由。
+  2. 新增 `_render_record_advice(advice)`：priority（如果只改一件事）/ advice[]（维度+分数+缺什么+依据+actions+自测，`missing` 维度显占位）/ quick_wins（明天就能改）/ next_setup / evidence_missing；**无 advice 的旧记录**显示「生成于旧版本」提示并 return。
+  3. `_render_record_detail()` 补 `rubric` 表（考点/来源/必答点/漏答/说错/点评）、`rewrites` 折叠、`resilience`、`decisions` 表，顺序对齐报告页。
+- 文档同步：README 隐私节改口径；DESIGN.md v14 段与权衡表「建议/简历优化的个人化内容被落盘」一行改写为 v21 调整版（简历优化仍不落盘）。
+- 验证：compileall 0；730 tests OK；`.tmp/verify_history.py`（假 evaluate/coach/advisor 带完整结构，真调 interviewer_turn 跑 2 轮）→ 15 项全 PASS：入口 / 分数 / 维度表 / 逐题命中 / 教练建议 / 改写示范 / 稳定性 / 建议优先级 / 建议明细 / 明天就能改 / 下一场怎么练 / 旧记录降级 / 决策轨迹 / 逐字稿 / 0 异常。
+- 又一个坑：`advice` 变量忘了在 `_render_record_detail()` 顶部取，第一次跑直接 `NameError: name 'advice' is not defined`——新版函数里引用新字段时，先把取值写在函数头。
