@@ -122,3 +122,22 @@
   桥接会自动搬进环境变量，评委零配置。
 - 演示账号的账号密码**不要指望能改**：`app.py` 里根本没有改密码界面（`change_password` 只被测试调用），
   所以"评委改掉 demo 密码把后面人锁死"这条风险不存在。真要防，等接设置页时再加 `may_change_password`。
+
+## 2026-11-07 · 末轮「面试官思考中」文案与报告进度
+
+**报障**：答完最后一题后界面停在「面试官思考中…」，实际是在生成报告（本地 20s+，Cloud 免费实例 40~95s）。
+
+**根因**：`app.py` 外层 `st.spinner("面试官思考中…")` 包住 `advance()`，而 `advance()` 在 `action == "end"`
+时于**同一次 run 内**直接调用 `finish_interview()`；spinner 文案在进入那一刻就固定，不会随阶段变化。
+`advance()` 内部本来就有「面试官正在看你的回答…」的 spinner，外层那层是多余外壳。
+
+**改法**：删掉四处外层 spinner（重试本轮 / 放弃本轮 / 对话输入 / 手动结束），在 `finish_interview()` 里改用
+`st.status(..., expanded=True)` 按段推进：① 评估官逐题打分 → ② 教练写点评 → ③ 建议官排练习 →
+`报告已生成`（`state="complete"` 自动折叠）。建议官失败时 update 成「未响应，这份报告缺该栏…」，不吞掉整份报告。
+
+**验证**：`python -m unittest discover` → 730 OK；`.tmp/verify_progress.py`（AppTest 真跑 3 轮 + 手动收尾）
+报告生成 95.0s、`evaluation` 9 键 / `coach` 5 键 / `advice` 6 键全部产出、0 异常。
+
+**另一发现（未修）**：面试的结束完全靠模型自觉返回 `action:"end"`，**没有硬上限**。实测计划 5 轮的场次连答
+10 轮，模型仍在追问，只能手动点「结束面试并生成报告」。想兜底的话在 `advance()` 里加一句
+`if cur_q > total_rounds: 强制 finish`，但这会改变产品节奏，待定。

@@ -2203,7 +2203,14 @@ def finish_interview() -> None:
             st.session_state.error = "有效回答太少，本次不生成报告。"
             return
 
+        # 三段模型调用是串行的，各要几秒到十几秒；Cloud 免费实例只有 1 个 CPU 核，
+        # 实际要四十秒开外。原先这里只有外层一句「面试官思考中…」，用户既看不出在
+        # 干什么、也不知道要等多久（2026-11-07 报障）。改成按段推进：每段开始前
+        # 先亮出下一句，进度感来自"文案在动"，而不是一个转不完的圈。
+        stage = st.status("正在生成复盘报告…", expanded=True)
+
         try:
+            stage.update(label="① 评估官正在逐题打分…")
             trace = st.session_state.mood_trace
             # 把**本场实际问到**的考点交给评估官：不传的话它会拿到该难度档的
             # 全部 15~17 条参照，把没问过的判成「遗漏」，教练再据此给出
@@ -2215,12 +2222,14 @@ def finish_interview() -> None:
                 mood_trace=trace,
                 asked_topics=st.session_state.asked_topics,
             )
+            stage.update(label="② 教练正在写逐条点评…")
             coach = coach_review(
                 history, evaluation, profile, st.session_state.api_key, mood_trace=trace
             )
             # 建议官排在教练之后：它要读教练没覆盖的那一层（按维度补什么）。
             # 但它是**可选**的——失败只记一笔降级说明，绝不让整份报告生成失败：
             # 评估与教练已经产出，因为多要一份建议而丢掉整份报告是本末倒置。
+            stage.update(label="③ 建议官正在排下一步练习…")
             try:
                 advisor = advisor_review(
                     history, evaluation, profile, st.session_state.api_key
@@ -2228,8 +2237,10 @@ def finish_interview() -> None:
             except Exception as exc:  # noqa: BLE001
                 print(f"[建议官调用失败，报告缺该栏] {exc}", file=sys.stderr, flush=True)
                 advisor = {}
+                stage.update(label="③ 建议官未响应，这份报告缺该栏…")
         except Exception as exc:  # noqa: BLE001
             st.session_state.error = f"生成报告失败：{exc}"
+            stage.update(label="报告生成失败", state="error")
             return
 
         st.session_state.evaluation = evaluation
@@ -2267,6 +2278,7 @@ def finish_interview() -> None:
                 # 想在这里补一行落盘时，必须同步修改 README 的隐私声明。
             }
         )
+        stage.update(label="报告已生成", state="complete", expanded=False)
     finally:
         # 面试一结束就丢弃简历，无论报告是否生成成功
         clear_resume()
@@ -3301,14 +3313,16 @@ def render_interview() -> None:
         col1, col2 = st.columns([1, 4])
         if col1.button("重试本轮", type="primary"):
             with st.chat_message("assistant", avatar="🧑‍💼"):
-                with st.spinner("面试官思考中…"):
-                    advance()
+                # advance 内部自带「面试官正在看你的回答…」；这里不再套外层 spinner：
+                # 末轮它会在同一次 run 里直接转进报告生成，外层的固定文案会把
+                # 下面的三段进度块盖成一句空话。
+                advance()
             st.rerun()
         # 至少答过一轮才有报告可生成；开场就失败时只给重试
         if len([m for m in st.session_state.history if m.get("role") == "user"]) >= 2:
             if col2.button("放弃这一轮，直接生成报告"):
-                with st.spinner("评估官与教练正在生成报告…"):
-                    finish_interview()
+                # finish_interview 自带三段进度块，外层再包一层 spinner 只会遮住它
+                finish_interview()
                 st.rerun()
         return
 
@@ -3358,14 +3372,15 @@ def render_interview() -> None:
         with st.chat_message("user", avatar="🙋"):
             st.markdown(answer)
         with st.chat_message("assistant", avatar="🧑‍💼"):
-            with st.spinner("面试官思考中…"):
-                advance()
+            # 进度由 advance 内部（看回答）与 finish_interview 的状态块（出报告）
+            # 各自负责；外层固定的「面试官思考中…」在末轮会盖住真实进度。
+            advance()
         st.rerun()
 
     col1, col2 = st.columns([1, 4])
     if col1.button("结束面试并生成报告"):
-        with st.spinner("评估官与教练正在生成报告…"):
-            finish_interview()
+        # 进度块由 finish_interview 自己显示，这里不要再套 spinner
+        finish_interview()
         st.rerun()
 
 
