@@ -1,4 +1,7 @@
-streamlit>=1.56
+# Streamlit 钉在本机验证过的 minor：云端装到同一个 1.65.x，
+# 评委看到的行为与本地复验（730 用例 + AppTest + 真模型链路）完全一致。
+# 放宽到 >=1.56 时云端会拉最新版，升级引入的渲染/rerun 变化无人复验过。
+streamlit>=1.65.0,<1.66
 openai>=1.30
 httpx>=0.27
 PyMuPDF>=1.24
