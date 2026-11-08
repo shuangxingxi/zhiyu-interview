@@ -487,10 +487,10 @@ st.markdown(
     }
     [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] button {
         border: none !important;
-        border-radius: 999px !important;
+        border-radius: 8px !important;
         background-color: var(--zy-accent) !important;
         color: #FFFFFF !important;
-        font-weight: 600;
+        font-weight: 500;
     }
     [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] {
         background-color: var(--zy-surface);
@@ -499,7 +499,7 @@ st.markdown(
     }
     [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] button {
         border: 1px solid var(--zy-line-strong);
-        border-radius: 999px !important;
+        border-radius: 8px !important;
     }
 
     /* ============================================================
@@ -861,11 +861,17 @@ st.markdown(
         background-color: var(--zy-surface);
         overflow: hidden;
     }
+    /* 语音作答不做成卡片：它只是"另一种输入方式"，不是独立区域。
+       白底 + 描边会让它读成压在按钮之上的第三块卡片，去掉之后像一条工具条。
+       高度压不动（内部波形区 min-height 是 68px），所以改的是它的重量而不是体积。 */
     [data-testid="stAudioInput"] {
-        background-color: var(--zy-surface);
-        border: 1px solid var(--zy-line-strong);
-        border-radius: 14px !important;
-        padding: 0.5rem 0.75rem;
+        background-color: transparent;
+        border: none;
+        padding: 0;
+    }
+    [data-testid="stAudioInput"] label p {
+        font-size: 0.8125rem !important;
+        color: var(--zy-muted) !important;
     }
     [data-testid="stAudio"] audio {
         width: 100%;
@@ -3404,7 +3410,12 @@ def _seal_avatar(text: str, filled: bool) -> str:
 def render_interview() -> None:
     profile = st.session_state.profile
 
-    render_page_header(profile_summary(profile))
+    # 页头只留能定位这一场的信息。`profile_summary` 里那句完整配置（含档位名与
+    # 情绪）是给模型和报告看的，摆在页头会变成一行六十字的状态栏。
+    render_page_header(
+        f"{profile['scene']} · {profile['major']} · {profile['level']} 级 · "
+        f"{profile['interview_type']} · {profile['total_rounds']} 轮"
+    )
 
     jd_topics = profile.get("jd_topics") or []
     if jd_topics:
