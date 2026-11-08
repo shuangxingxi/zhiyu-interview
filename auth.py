@@ -286,6 +286,33 @@ def ensure_demo_user(base: Path) -> bool:
     return ok
 
 
+def seed_users(base: Path, accounts: dict[str, str]) -> int:
+    """把预置账号灌进用户表，返回实际新建的个数。
+
+    存在的理由：Streamlit Community Cloud 的容器文件系统是临时的，重启、
+    休眠唤醒、每次重新部署都会回到 git 仓库的状态，而 `.auth/` 不在仓库里。
+    页面上注册的账号活不过一次重启——下次登录只会看到"账号或密码不正确"，
+    因为那条记录根本不存在了。账号写进 Secrets 才能跨容器存活，启动时由
+    `app.py` 调这里补回来。
+
+    只补缺失的，不覆盖已有记录：用户在页面上改过密码，重启后不该被冲掉。
+    账号名非法或密码太短的条目直接跳过（静默），坏配置不该把登录页搞崩。
+    """
+    created = 0
+    for raw_account, raw_password in dict(accounts or {}).items():
+        account = normalize_account(raw_account)
+        password = str(raw_password or "")
+        if not account or not password:
+            continue
+        # existing 里有的会返回"已被注册"，正好用来做"只补不覆盖"。
+        if validate_registration(account, password, existing=set(load_users(base))):
+            continue
+        ok, _ = register(base, account, password)
+        if ok:
+            created += 1
+    return created
+
+
 def may_claim_legacy(account: str) -> bool:
     """这个账号有没有资格认领"加登录之前"的本机旧数据。
 

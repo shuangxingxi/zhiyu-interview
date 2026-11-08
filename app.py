@@ -1723,6 +1723,33 @@ def render_login() -> None:
     )
 
 
+def _seed_cloud_users() -> None:
+    """从 Streamlit Secrets 的 `[ZY_USERS]` 表恢复预置账号。
+
+    云端容器重建后 `.auth/users.json` 会一起消失（那目录不在仓库里），
+    页面上注册过的账号随之蒸发，再登录只会得到"账号或密码不正确"。
+    Secrets 不随容器重建消失，是唯一能跨重启的存放位置。没配就是常态，
+    静默跳过。写法见 README 的部署一节。
+    """
+    try:
+        table = st.secrets["ZY_USERS"]
+    except Exception:  # noqa: BLE001 —— 没有 secrets 文件或没这个表
+        return
+    try:
+        mapping = {str(key): str(value) for key, value in dict(table).items()}
+    except (TypeError, ValueError):
+        return
+    if not mapping:
+        return
+    try:
+        created = auth.seed_users(BASE_DIR, mapping)
+    except OSError as exc:
+        print(f"[恢复预置账号失败] {exc}", file=sys.stderr, flush=True)
+        return
+    if created:
+        print(f"[恢复预置账号] 新建 {created} 个", file=sys.stderr, flush=True)
+
+
 def _login_gate() -> str:
     """确保已登录。未登录则渲染登录页并终止本次脚本。返回账号名。
 
@@ -1736,6 +1763,7 @@ def _login_gate() -> str:
         auth.ensure_demo_user(BASE_DIR)
     except OSError as exc:
         print(f"[创建演示账号失败] {exc}", file=sys.stderr, flush=True)
+    _seed_cloud_users()
     render_login()
     st.stop()
     return ""  # 到不了，st.stop() 会抛 StopException

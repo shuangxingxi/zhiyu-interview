@@ -335,6 +335,54 @@ class TestAccessCode(TempBase):
         self.assertTrue(auth.verify_access_code(""))
 
 
+class TestSeedUsers(TempBase):
+    """云端容器重建后从 Secrets 恢复预置账号。
+
+    云端文件系统是临时的，页面上注册的账号活不过一次重启。这里钉住三件事：
+    能补回来、不覆盖已改过的密码、坏配置不把登录页搞崩。
+    """
+
+    def test_seeds_missing_accounts(self):
+        created = auth.seed_users(
+            self.base, {"2024135004": "mypassword", "Alice": "another123"}
+        )
+        self.assertEqual(created, 2)
+        self.assertIsNotNone(auth.authenticate(self.base, "2024135004", "mypassword"))
+        # 账号名统一小写，Secrets 里写 Alice 也能用 alice 登
+        self.assertIsNotNone(auth.authenticate(self.base, "alice", "another123"))
+
+    def test_does_not_overwrite_existing_password(self):
+        auth.register(self.base, "2024135004", "changedbyuser")
+        created = auth.seed_users(self.base, {"2024135004": "fromsecrets"})
+        self.assertEqual(created, 0)
+        self.assertIsNotNone(auth.authenticate(self.base, "2024135004", "changedbyuser"))
+        self.assertIsNone(auth.authenticate(self.base, "2024135004", "fromsecrets"))
+
+    def test_second_run_is_noop(self):
+        """每次 rerun 都会调一次，必须幂等。"""
+        payload = {"2024135004": "mypassword"}
+        self.assertEqual(auth.seed_users(self.base, payload), 1)
+        self.assertEqual(auth.seed_users(self.base, payload), 0)
+
+    def test_bad_entries_are_skipped(self):
+        """密码太短、账号名非法、空值都跳过，剩下的照建。"""
+        created = auth.seed_users(
+            self.base,
+            {
+                "bad account": "whatever",
+                "short": "123",
+                "": "nopass",
+                "good": "goodpassword",
+            },
+        )
+        self.assertEqual(created, 1)
+        self.assertIsNotNone(auth.authenticate(self.base, "good", "goodpassword"))
+
+    def test_empty_payload_is_noop(self):
+        self.assertEqual(auth.seed_users(self.base, {}), 0)
+        self.assertEqual(auth.load_users(self.base), {})
+
+
 # ---------------------------------------------------------------------------
 # owner 标记
 # ---------------------------------------------------------------------------

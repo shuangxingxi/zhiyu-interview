@@ -29,9 +29,19 @@ DEEPSEEK_API_KEY = "sk-xxxx"        # 必需：四个 LLM 角色
 SILICONFLOW_API_KEY = "sk-xxxx"     # 可选：语音识别
 ZHIPU_API_KEY = "xxxx"              # 可选：语音合成
 ZY_ACCESS_CODE = "your-code"        # 可选：不填则注册不设门槛
+
+# 可选：容器重建后自动恢复的账号
+[ZY_USERS]
+"2024135004" = "your-password"
 ```
 
 Secrets 会由 `app.py` 里的桥接函数搬进环境变量，本机用 `$env:` 时行为不变。
+
+**关于 `[ZY_USERS]`**：Community Cloud 的容器文件系统是临时的——重启、休眠唤醒、
+每次重新部署都会回到 git 仓库的状态，而 `.auth/` 被 `.gitignore` 排除、不在仓库里。
+所以在页面上注册的账号活不过一次重启，下次登录只会看到「账号或密码不正确」。
+把账号写进 Secrets 是唯一能跨重启的位置，启动时自动补进用户表，且**只补缺失的**，
+不会覆盖你后来在页面上改过的密码。
 
 </details>
 
