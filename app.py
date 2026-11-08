@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
 import streamlit as st
@@ -261,7 +262,7 @@ st.markdown(
         min-width: 300px;
     }
     [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
-        padding: 1.75rem 1.25rem;
+        padding: 1.5rem 1rem;
     }
     [data-testid="stSidebar"] [data-testid="stSidebarNav"] {
         background-color: #F1EADF !important;
@@ -624,13 +625,15 @@ st.markdown(
     }
 
     /* ============================================================
-       8. 提示框 —— 暖白圆角 / 左侧柿橙竖条
+       8. 提示框 —— 暖白圆角 / 语义色只落在描边与图标上
+       原来左侧那条 4px 竖条是最典型的"AI 生成"记号：一条粗色边既
+       不表达层级也不表达状态。改成同色系的淡描边 + 极浅底，信息全在
+       图标与文字里，安静但不丢语义。
        ============================================================ */
     [data-testid="stAlert"],
     [data-testid="stNotification"] {
         background-color: var(--zy-surface) !important;
         border: 1px solid var(--zy-line) !important;
-        border-left: 4px solid var(--zy-accent) !important;
         border-radius: 12px !important;
         box-shadow: var(--zy-shadow-sm) !important;
         color: var(--zy-ink);
@@ -653,13 +656,16 @@ st.markdown(
         border-radius: 8px !important;
     }
     [data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) {
-        border-left-color: #4A7C59 !important;
+        background-color: #F5F8F3 !important;
+        border-color: #D5E2D6 !important;
     }
     [data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) {
-        border-left-color: #B4791F !important;
+        background-color: #FCF7EA !important;
+        border-color: #E9D9B6 !important;
     }
     [data-testid="stAlert"]:has([data-testid="stAlertContentError"]) {
-        border-left-color: #A6432F !important;
+        background-color: #FCF2EF !important;
+        border-color: #ECD0C7 !important;
     }
     [data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) svg {
         fill: #4A7C59;
@@ -991,7 +997,11 @@ st.markdown(
     }
     .zy-mark em {
         font-style: normal;
-        color: var(--zy-accent);
+        font-family: var(--zy-sans);
+        font-size: 0.8125rem;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        color: var(--zy-muted);
     }
     .zy-meta {
         font-size: 0.875rem;
@@ -1060,6 +1070,448 @@ st.markdown(
             font-size: 2.5rem;
         }
     }
+    /* ============================================================
+       17.5 页签 —— 分段控件
+       1.65 前端换成 react-aria 之后，旧的 [data-baseweb="tab-list"] 一条都命中不了，
+       报告页那五个页签等于从没被样式化过。这里按新结构重写。
+       ============================================================ */
+    [data-testid="stTabs"] [role="tablist"] {
+        display: flex !important;
+        gap: 4px !important;
+        padding: 4px !important;
+        margin-bottom: 1.6rem;
+        background: #F1E9DE !important;
+        border: 1px solid var(--zy-line) !important;
+        border-radius: 13px !important;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"],
+    [data-testid="stTabs"] [data-baseweb="tab-border"] {
+        display: none !important;
+    }
+    [data-testid="stTabs"] [data-testid="stTab"] {
+        flex: 1 1 0 !important;
+        justify-content: center !important;
+        background: transparent !important;
+        border: none !important;
+        border-radius: 10px !important;
+        padding: 0.6rem 0.5rem !important;
+        color: var(--zy-muted);
+        transition: color 0.2s ease;
+    }
+    [data-testid="stTabs"] [data-testid="stTab"]:hover {
+        color: var(--zy-ink);
+    }
+    [data-testid="stTabs"] [data-testid="stTab"][data-selected="true"] {
+        color: var(--zy-ink);
+    }
+    [data-testid="stTabs"] [data-testid="stTab"] p {
+        font-size: 0.9375rem !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.04em;
+        margin: 0 !important;
+        white-space: nowrap;
+    }
+    [data-testid="stTabs"] [data-testid="stTab"] [data-testid="stMarkdownContainer"] {
+        position: relative;
+        z-index: 2;
+    }
+    /* 选中指示器本是 tab 内一条 2px 横线，改成整块白色滑块 */
+    [data-testid="stTabs"] .react-aria-SelectionIndicator {
+        top: 0 !important;
+        bottom: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        width: auto !important;
+        height: auto !important;
+        border-radius: 10px !important;
+        background: var(--zy-surface) !important;
+        box-shadow: 0 1px 2px rgba(33, 29, 25, 0.10), 0 3px 10px rgba(33, 29, 25, 0.06);
+        z-index: 1;
+    }
+
+    /* ============================================================
+       18. 应用外壳 —— 墨色身份卡 / 编辑版式工作台
+
+       登录页是"海报"，进来之后是"工作台"。同样的纸、同样的橙，
+       但构图换成左边直排的主张 + 右边唯一一张卡：整页只有一个 surface，
+       其余靠字号、字距和发丝线撑，避免"卡片套卡片"的模板感。
+       ============================================================ */
+    /* --- 侧栏身份卡：一块墨色，把侧栏从"表单列"变成"书脊" --- */
+    .zy-idcard {
+        position: relative;
+        overflow: hidden;
+        background: var(--zy-ink);
+        border-radius: 16px;
+        padding: 1.05rem 1.1rem 1rem;
+        margin: 0 0 0.3rem;
+        box-shadow: 0 10px 26px -14px rgba(33, 29, 25, 0.55);
+    }
+    .zy-idcard::after {
+        content: "";
+        position: absolute;
+        right: -3.4rem;
+        top: -4.2rem;
+        width: 9.5rem;
+        height: 9.5rem;
+        background: radial-gradient(circle at center, rgba(194, 72, 27, 0.6), transparent 68%);
+        pointer-events: none;
+    }
+    .zy-idcard-user {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+    }
+    .zy-idcard-seal {
+        flex: none;
+        width: 2rem;
+        height: 2rem;
+        border-radius: 7px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: var(--zy-serif);
+        font-size: 0.9375rem;
+        font-weight: 600;
+        line-height: 1;
+        color: #FBF6EE;
+        background: rgba(251, 246, 238, 0.13);
+        border: 1px solid rgba(251, 246, 238, 0.24);
+    }
+    .zy-idcard-body {
+        min-width: 0;
+    }
+    .zy-idcard-name {
+        font-size: 0.875rem;
+        font-weight: 600;
+        line-height: 1.3;
+        color: #FBF6EE;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .zy-idcard-meta {
+        margin-top: 0.1rem;
+        font-size: 0.6875rem;
+        letter-spacing: 0.04em;
+        color: rgba(251, 246, 238, 0.55);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    /* 退出登录：降级成一行小字，它不该和「配置」抢注意力 */
+    .st-key-logout_button {
+        margin: 0 0 0.2rem !important;
+    }
+    .st-key-logout_button [data-testid="stButton"] {
+        text-align: left;
+    }
+    /* 带 [kind] 是为了压过全局那条 background 的 !important（那边是 0,2,1） */
+    .st-key-logout_button [data-testid="stButton"] button[kind] {
+        background: transparent !important;
+        border: none !important;
+        color: var(--zy-muted) !important;
+        font-weight: 500 !important;
+        padding: 0.15rem 0.1rem !important;
+        min-height: 1.4rem !important;
+        height: auto !important;
+        box-shadow: none !important;
+        transition: color 0.18s ease;
+    }
+    .st-key-logout_button [data-testid="stButton"] button[kind]:hover {
+        background: transparent !important;
+        color: var(--zy-accent) !important;
+    }
+    .st-key-logout_button [data-testid="stButton"] button[kind] p {
+        font-size: 0.8125rem !important;
+        line-height: 1.4 !important;
+    }
+
+    /* --- 侧栏分组标签：只给「本场设置」用，别去动 st.header ---
+       （「面试进行中」也是 h2，压成 11px 小标就看不见了） --- */
+    .zy-sidelabel {
+        margin: 1.15rem 0 0.5rem;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        color: var(--zy-faint);
+    }
+
+    /* --- 工作台左栏：直接坐在纸面上，不套卡 --- */
+    .zy-statement {
+        max-width: 35rem;
+        padding: 0.35rem 0 0;
+        animation: zy-rise 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    .zy-statement h1 {
+        font-family: var(--zy-serif);
+        font-size: clamp(2.5rem, 4.3vw, 3.85rem);
+        font-weight: 600;
+        line-height: 1.05;
+        letter-spacing: -0.03em;
+        color: var(--zy-ink);
+        margin: 0;
+    }
+    .zy-statement h1 em {
+        font-style: normal;
+        color: var(--zy-accent);
+    }
+    .zy-statement-lede {
+        margin: 1.4rem 0 0;
+        max-width: 28em;
+        font-size: 1rem;
+        line-height: 1.85;
+        color: var(--zy-muted);
+    }
+    /* 三个数字：靠字重与发丝线分区，不做成三张 metric 卡 */
+    .zy-figures {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem 1.9rem;
+        margin: 2.1rem 0 0;
+        padding-top: 1.1rem;
+        border-top: 1px solid var(--zy-line-strong);
+    }
+    .zy-figures span {
+        font-size: 0.8125rem;
+        letter-spacing: 0.02em;
+        color: var(--zy-muted);
+        white-space: nowrap;
+    }
+    .zy-figures b {
+        margin-right: 0.4rem;
+        font-family: var(--zy-serif);
+        font-size: 1.3125rem;
+        font-weight: 600;
+        color: var(--zy-ink);
+        font-variant-numeric: tabular-nums;
+    }
+
+    /* --- 工作台右栏：本场控制台（整页唯一一张卡） --- */
+    .st-key-zy_console {
+        background: var(--zy-surface);
+        border: 1px solid var(--zy-line);
+        border-radius: 18px;
+        padding: 1.35rem 1.5rem 1.25rem;
+        box-shadow: var(--zy-shadow-md);
+        animation: zy-rise 0.6s 0.08s cubic-bezier(0.16, 1, 0.3, 1) both;
+        transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+                    box-shadow 0.3s ease,
+                    border-color 0.3s ease;
+    }
+    .st-key-zy_console:focus-within {
+        transform: translateY(-2px);
+        border-color: rgba(194, 72, 27, 0.24);
+        box-shadow: 0 1px 2px rgba(33, 29, 25, 0.04), 0 26px 54px -20px rgba(33, 29, 25, 0.28);
+    }
+    .zy-console-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding-bottom: 0.8rem;
+        border-bottom: 1px solid var(--zy-line);
+    }
+    .zy-console-head b {
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--zy-ink);
+    }
+    .zy-console-head span {
+        font-size: 0.75rem;
+        color: var(--zy-faint);
+    }
+    /* 规格表：标签左、值右，靠基线与留白对齐，不加行框线 */
+    .zy-fields {
+        margin: 0.2rem 0 0;
+        padding: 0;
+    }
+    .zy-fields > div {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.52rem 0;
+    }
+    .zy-fields dt {
+        flex: none;
+        font-size: 0.8125rem;
+        letter-spacing: 0.02em;
+        color: var(--zy-muted);
+    }
+    .zy-fields dd {
+        margin: 0;
+        font-size: 0.9375rem;
+        font-weight: 600;
+        color: var(--zy-ink);
+        text-align: right;
+    }
+    .zy-console-foot {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.75rem;
+        margin: 0.55rem 0 0.95rem;
+        padding-top: 0.85rem;
+        border-top: 1px solid var(--zy-line);
+        font-size: 0.75rem;
+        letter-spacing: 0.02em;
+        color: var(--zy-faint);
+    }
+    .zy-console-foot b {
+        font-family: var(--zy-serif);
+        font-size: 0.9375rem;
+        font-weight: 600;
+        color: var(--zy-ink);
+        font-variant-numeric: tabular-nums;
+    }
+    .st-key-zy_console [data-testid="stButton"] {
+        margin-top: 0.55rem;
+    }
+    .st-key-zy_console [data-testid="stButton"] button {
+        width: 100%;
+        padding: 0.72rem 1rem !important;
+        border-radius: 11px !important;
+        font-size: 0.9375rem !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.06em !important;
+        transition: background-color 0.2s ease, border-color 0.2s ease,
+                    color 0.2s ease, transform 0.14s ease, box-shadow 0.2s ease;
+    }
+    .st-key-zy_console [data-testid="stButton"] button:not(:disabled):hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 20px -10px rgba(33, 29, 25, 0.45);
+    }
+    .st-key-zy_console [data-testid="stButton"] button:not(:disabled):active {
+        transform: translateY(0) scale(0.994);
+    }
+    .zy-console-note {
+        margin: 0.7rem 0 0;
+        font-size: 0.75rem;
+        line-height: 1.65;
+        color: var(--zy-muted);
+    }
+    .zy-console-note b {
+        font-weight: 600;
+        color: var(--zy-accent-deep);
+    }
+
+    /* --- 入场：全局只有这一个动作，别处不再各自抖一下 --- */
+    @keyframes zy-rise {
+        from {
+            opacity: 0;
+            transform: translateY(14px);
+        }
+        to {
+            opacity: 1;
+            transform: none;
+        }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .zy-statement,
+        .st-key-zy_console {
+            animation: none !important;
+        }
+        .st-key-zy_console,
+        .st-key-zy_console [data-testid="stButton"] button {
+            transition: none !important;
+        }
+    }
+
+    /* --- 浏览器自带表面也从这套色里取 --- */
+    ::selection {
+        background: rgba(194, 72, 27, 0.18);
+        color: var(--zy-ink);
+    }
+    [data-testid="stAppViewContainer"] input,
+    [data-testid="stAppViewContainer"] textarea {
+        caret-color: var(--zy-accent);
+    }
+
+    /* 侧栏 300px 时身份卡只剩 231px，账号名会被截断；给到 340 才够一行放完。
+       只在宽屏给：窄屏它是个抽屉，写死宽度会把主区挤没。 */
+    @media (min-width: 1100px) {
+        [data-testid="stSidebar"] {
+            width: 340px !important;
+            min-width: 340px !important;
+        }
+    }
+
+    /* 首页内容不满一屏时，让它垂直居中——否则下三分之一永远是空的 */
+    [data-testid="stMainBlockContainer"]:has(.zy-statement) {
+        display: flex;
+        flex-direction: column;
+        min-height: calc(100vh - 3.75rem);
+    }
+    /* 子层是 flex:1 1 0% 的纵向块，它自己会撑满，所以居中要写在它身上 */
+    [data-testid="stMainBlockContainer"]:has(.zy-statement) > [data-testid="stVerticalBlock"] {
+        justify-content: center;
+    }
+
+    /* 一次性提示（登录成功 / 已回填 / 已删除）：一条细线级的确认，不做成卡片 */
+    .zy-flash {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin: 0 0 0.9rem;
+        font-size: 0.8125rem;
+        line-height: 1.6;
+        color: var(--zy-ink);
+    }
+    .zy-flash::before {
+        content: "";
+        flex: none;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--zy-accent);
+    }
+
+    .zy-empty {
+        margin: 2rem 0 0;
+        padding-top: 1.1rem;
+        border-top: 1px solid var(--zy-line);
+        font-size: 0.8125rem;
+        letter-spacing: 0.02em;
+        color: var(--zy-faint);
+    }
+
+    /* 规格表右侧的值可能很长（难度档名），别把标签挤掉 */
+    .zy-fields dd {
+        max-width: 68%;
+        line-height: 1.5;
+        text-wrap: balance;
+    }
+    /* 值太长（档位全名）时，整行改成上下两行，避免标签被挤成孤字 */
+    .zy-fields > div.zy-row-wide {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.15rem;
+        padding: 0.6rem 0;
+    }
+    .zy-fields > div.zy-row-wide dd {
+        max-width: 100%;
+        text-align: left;
+    }
+
+    @media (max-width: 900px) {
+        .zy-statement h1 {
+            font-size: clamp(2.1rem, 8vw, 2.6rem);
+        }
+        .zy-statement-lede {
+            margin-top: 1.1rem;
+        }
+        .zy-figures {
+            margin-top: 1.4rem;
+            gap: 0.35rem 1.3rem;
+        }
+        .st-key-zy_console {
+            padding: 1.15rem 1.15rem 1.1rem;
+        }
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -1422,15 +1874,6 @@ _LOGIN_CSS = """
 .zy-auth-hero > *:nth-child(5) { animation-delay: 0.34s; }
 .zy-auth-hero > *:nth-child(6) { animation-delay: 0.40s; }
 
-[data-testid="stMarkdownContainer"] .zy-hero-kicker {
-    display: inline-block;
-    margin: 0 0 1.15rem;
-    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-    font-size: 0.6875rem;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    color: var(--zy-accent);
-}
 [data-testid="stMarkdownContainer"] .zy-hero-title {
     margin: 0;
     font-family: var(--zy-serif);
@@ -1779,7 +2222,6 @@ _LOGIN_CSS = """
 .st-key-zy_auth_card [data-testid="stAlert"] {
     background-color: #FDF4EE !important;
     border: 1px solid rgba(194, 72, 27, 0.18) !important;
-    border-left-width: 3px !important;
     border-radius: 9px !important;
     box-shadow: none !important;
     margin: 0.2rem 0 0.5rem !important;
@@ -1963,7 +2405,6 @@ def render_login() -> None:
     with left:
         st.markdown(
             "<div class=\"zy-auth-hero\">"
-            "<span class=\"zy-hero-kicker\">Mock Interview / 模拟面试</span>"
             "<h1 class=\"zy-hero-title\">把每一次面试<br>练到<em>不慌</em>。</h1>"
             "<p class=\"zy-hero-lede\">按岗位出题，顺着你的话往下追，答得浅就再挖一层。"
             "<br>结束给一份能照着改的复盘。</p>"
@@ -2082,8 +2523,8 @@ def render_login() -> None:
                     _complete_login(user["account"], "已用演示账号进入。")
 
     st.markdown(
-        "<p class=\"zy-auth-legal\">忘记密码没有自助找回，需要管理员在后台重置。"
-        "多人一起用请以局域网模式启动，默认只监听本机；部署说明见 README。</p>",
+        "<p class=\"zy-auth-legal\">账号只存在这台机器上，换设备要重新注册；"
+        "忘记密码请找管理员重置。</p>",
         unsafe_allow_html=True,
     )
 
@@ -3496,20 +3937,38 @@ def _render_running_panel() -> None:
     st.caption("面试官的情绪会随你的回答变化，但本场结束前不显示——报告里会揭晓整条状态轨迹。")
 
 
-def _render_account_bar() -> None:
-    """侧边栏顶部的账号区：当前是谁、退出登录。
-
-    面试进行中也要显示——换人演示时第一件事就是退出上一个账号。
-    """
+def _account_identity() -> tuple[str, str]:
+    """当前账号的 (显示名, 账号)。没有账号时返回 ("", "")。"""
     account = str(st.session_state.get(_AUTH_ACCOUNT_KEY) or "")
     if not account:
-        return
+        return "", ""
     info = auth.public_user(BASE_DIR, account) or {}
     display = str(info.get("name") or "").strip() or account
-    st.caption(f"**{display}**（{account}）")
-    if st.button("退出登录", key="logout_button", use_container_width=True):
+    return display, account
+
+
+def _render_account_bar() -> None:
+    """侧边栏顶部：一块墨色身份卡（谁在用）+ 一行退出的文字入口。
+
+    面试进行中也要显示——换人演示时第一件事就是退出上一个账号。
+    做成深色块而不是一行 caption + 全宽按钮：侧栏其余部分是纸色，
+    这里需要一个"书脊"把身份和配置分开，顺带给页面一个压住的角。
+    """
+    display, account = _account_identity()
+    if not account:
+        return
+    seal = escape(display[:1] or "遇")
+    st.markdown(
+        f'<div class="zy-idcard"><div class="zy-idcard-user">'
+        f'<div class="zy-idcard-seal">{seal}</div>'
+        f'<div class="zy-idcard-body">'
+        f'<div class="zy-idcard-name">{escape(display)}</div>'
+        f'<div class="zy-idcard-meta">{escape(account)} · 本机</div>'
+        f"</div></div></div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("退出登录", key="logout_button"):
         _logout()
-    st.divider()
 
 
 def render_sidebar() -> dict:
@@ -3537,7 +3996,7 @@ def render_sidebar() -> dict:
             _render_running_panel()
             return state
 
-        st.header("本场设置")
+        st.markdown('<div class="zy-sidelabel">本场设置</div>', unsafe_allow_html=True)
         api_key = _render_api_key_section()
 
         # strict 要在情绪那一节之前就已知（严格模式会锁定友善型），
@@ -4682,7 +5141,11 @@ def _flush_flash() -> None:
     message = st.session_state.get("flash") or ""
     if message:
         st.session_state.flash = ""
-        st.success(message)
+        # 这些都是确认（已登录 / 已回填 / 已删除），不是错误，用不着占一条横幅；
+        # 一行带圆点的细字就够，别把页头挤下去。
+        st.markdown(
+            f'<div class="zy-flash">{escape(message)}</div>', unsafe_allow_html=True
+        )
 
 
 def main() -> None:
@@ -4703,50 +5166,84 @@ def main() -> None:
     if status == "idle" or st.session_state.profile is None:
         # 有未完成的面试快照时，先给出「继续 / 重新开始」的选择，不做静默恢复
         render_recovery_banner()
-        st.markdown(
-            """
-            <div class="zy-hero">
-                <div class="zy-title">知遇<em>。</em></div>
-                <p class="zy-sub">按岗位出题，顺着你的回答往下追问；答偏了会把你拉回来。
-                结束给一份能照着改的复盘——哪句答漏了、哪句说错了，以及下次怎么说。</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
-        # 三栏卖点已删：它和登录页的 01/02/03 说的是同一件事，第二次看就是噪音。
-        # 首页只回答一个问题——"这场练什么"，然后给一个按钮。
+        # 首页只回答一件事：这一场练什么、什么时候开始。
+        # 版式是「左主张 / 右控制台」：左边直接坐在纸面上讲这一场怎么回事，
+        # 右边是全页唯一一张卡——本场设置 + 唯一的行动按钮。
+        # 只留一张卡是有意的：配置和「开始」本来就是同一个决定的两半，
+        # 拆成两块会让人以为要先在左边填完、再回右边点。
+        display, _account = _account_identity()
+        render_page_header(f"{display or '本机'} · 本机部署 · 数据不出机器")
+
         config = state.get("config") or {}
         can_start = bool(state.get("can_start"))
-        if config:
-            labels = level_labels(config["scene"])
+        rounds = int(config.get("total_rounds") or 0) or 5
+        labels = level_labels(config["scene"]) if config else {}
+
+        left, right = st.columns([1.62, 1], gap="large")
+        with left:
             st.markdown(
-                f'<div class="zy-config"><b>{config["scene"]}</b> · {config["major"]}<br>'
-                f"{config['level']} 级 · {labels[config['level']]} · "
-                f"{config['interview_type']} · {config['total_rounds']} 道主问题</div>",
+                '<div class="zy-statement">'
+                "<h1>先在这儿，<br>被<em>问穿</em>一次。</h1>"
+                '<p class="zy-statement-lede">按岗位出题，顺着你的回答往下追；'
+                "答得浅就再挖一层，答偏了会被拉回来。"
+                "结束后给你一份能照着改的复盘。</p>"
+                '<div class="zy-figures">'
+                f"<span><b>{rounds}</b>轮主问题</span>"
+                "<span><b>12–18</b>分钟</span>"
+                "<span><b>¥0.02</b>单场成本</span>"
+                "</div></div>",
                 unsafe_allow_html=True,
             )
 
-        col_btn, col_note = st.columns([1, 2.4], gap="large")
-        with col_btn:
-            start = st.button(
-                "开始面试",
-                type="primary",
-                use_container_width=True,
-                disabled=not can_start,
-            )
-        with col_note:
-            if not can_start:
-                note = "先在左侧填 DeepSeek API Key，并在配置的「面试官情绪」里勾选知情同意。"
-            elif config:
-                note = (
-                    f"约 {config['total_rounds']} 轮，12–18 分钟。"
-                    "结束后立刻出评分、逐题命中与教练复盘。"
+        with right:
+            # 整页唯一一张卡：本场设置 + 开始。key 给容器套样式。
+            with st.container(key="zy_console"):
+                rows = []
+                if config:
+                    rows = [
+                        ("场景", config["scene"]),
+                        ("专业", config["major"]),
+                        ("难度", f"{config['level']} 级 · {labels.get(config['level'], '')}"),
+                        ("题型", config["interview_type"]),
+                        ("主问题", f"{rounds} 道"),
+                    ]
+                if rows:
+                    items = []
+                    for name, value in rows:
+                        text = str(value)
+                        # 值太长（例如难度档全名）就整行改成上下两行，别把标签挤成孤字
+                        wide = " class=\"zy-row-wide\"" if len(text) > 11 else ""
+                        items.append(
+                            f"<div{wide}><dt>{escape(str(name))}</dt>"
+                            f"<dd>{escape(text)}</dd></div>"
+                        )
+                    body = '<dl class="zy-fields">' + "".join(items) + "</dl>"
+                else:
+                    body = '<p class="zy-console-note">配置还没备好，稍等一秒。</p>'
+                st.markdown(
+                    '<div class="zy-console-head"><b>本场设置</b>'
+                    '<span>左侧「配置」可改</span></div>' + body,
+                    unsafe_allow_html=True,
                 )
-            else:
-                note = ""
-            if note:
-                st.markdown(f'<div class="zy-action-note">{note}</div>', unsafe_allow_html=True)
+                start = st.button(
+                    "开始面试",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not can_start,
+                )
+                if not can_start:
+                    st.markdown(
+                        '<p class="zy-console-note">先填左侧的 <b>DeepSeek API Key</b>，'
+                        "并在「面试官情绪」里勾选知情同意。</p>",
+                        unsafe_allow_html=True,
+                    )
+                elif rows:
+                    st.markdown(
+                        '<p class="zy-console-note">答完立刻出评分、逐题命中与教练复盘。'
+                        "中途随时可以结束，答过的轮次都会算进去。</p>",
+                        unsafe_allow_html=True,
+                    )
 
         if start and config:
             profile = build_profile(
@@ -4772,6 +5269,12 @@ def main() -> None:
         if past:
             with st.expander(f"我的历史记录 · {len(past)} 场"):
                 render_history_tab()
+        else:
+            # 0 场时入口整个消失，新用户就没有「这里会长出东西」的心理模型
+            st.markdown(
+                '<p class="zy-empty">还没有历史记录。练完第一场，这里会出现逐场对比。</p>',
+                unsafe_allow_html=True,
+            )
     elif status == "running":
         render_interview()
     else:
