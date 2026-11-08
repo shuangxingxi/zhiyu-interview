@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import sys
@@ -201,7 +202,7 @@ st.markdown(
         --zy-surface: #FFFFFF;
         --zy-ink: #211D19;
         --zy-muted: #6B6259;
-        --zy-faint: #9A9184;
+        --zy-faint: #7A7167;
         --zy-accent: #C2481B;
         --zy-accent-deep: #9E3A14;
         --zy-accent-soft: #FBEAE0;
@@ -228,6 +229,27 @@ st.markdown(
     [data-testid="stAppViewContainer"] *:focus-visible {
         outline: 2px solid var(--zy-accent) !important;
         outline-offset: 1px;
+    }
+    /* 框架自带工具栏（Deploy / 三点菜单）不属于产品界面，全站隐藏 */
+    [data-testid="stToolbar"],
+    [data-testid="stAppDeployButton"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"] {
+        display: none !important;
+    }
+    /* 按钮内文字必须跟着按钮走：下面第 1 节的侧边栏 p 规则会命中按钮里的 <p>，
+       直接声明高于继承，按钮的 color 传不进去。这里显式压回来。 */
+    [data-testid="stButton"] button p,
+    [data-testid="stButton"] button span,
+    [data-testid="stFormSubmitButton"] button p,
+    [data-testid="stFormSubmitButton"] button span,
+    [data-testid="stDownloadButton"] button p,
+    [data-testid="stDownloadButton"] button span,
+    [data-testid="stFileUploader"] button p,
+    [data-testid="stFileUploader"] button span {
+        color: inherit !important;
+        font-size: inherit !important;
+        line-height: inherit !important;
     }
 
     /* ============================================================
@@ -265,21 +287,21 @@ st.markdown(
     [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
     [data-testid="stSidebar"] [data-testid="stHeading"] h1 {
         font-family: var(--zy-serif);
-        font-size: 1.3125rem;
-        font-weight: 800;
-        letter-spacing: 0.02em;
+        font-size: 1.25rem;
+        font-weight: 600;
+        letter-spacing: 0;
         color: var(--zy-ink);
-        margin: 0.25rem 0 0.875rem;
+        margin: 0.25rem 0 1rem;
         padding-bottom: 0.5rem;
-        border-bottom: 2px solid var(--zy-accent);
+        border-bottom: 1px solid var(--zy-accent);
         display: inline-block;
     }
     [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
     [data-testid="stSidebar"] [data-testid="stHeading"] h2 {
-        font-size: 0.9375rem;
-        font-weight: 700;
-        letter-spacing: 0.06em;
-        color: var(--zy-ink);
+        font-size: 0.8125rem;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        color: var(--zy-muted);
         margin: 1.25rem 0 0.5rem;
     }
     [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
@@ -289,7 +311,7 @@ st.markdown(
     }
 
     /* ============================================================
-       2. 按钮 —— 胶囊形 / 柿橙主色 / hover 转墨黑
+       2. 按钮 —— 方角微圆 / 柿橙主色 / hover 转墨黑
        ============================================================ */
     [data-testid="stButton"] button,
     [data-testid="stFormSubmitButton"] button,
@@ -298,16 +320,16 @@ st.markdown(
     [data-testid="baseButton-secondary"],
     [data-testid="baseButton-primaryFormSubmit"],
     [data-testid="baseButton-secondaryFormSubmit"] {
-        border-radius: 999px !important;
+        border-radius: 10px !important;
         font-family: inherit;
-        font-weight: 600;
-        letter-spacing: 0.02em;
-        padding: 0.5rem 1.5rem;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        padding: 0.5rem 1.25rem;
         border-width: 1px;
         border-style: solid;
         box-shadow: none !important;
-        transition: background-color 0.18s ease, border-color 0.18s ease,
-                    color 0.18s ease, transform 0.18s ease;
+        transition: background-color 0.16s ease, border-color 0.16s ease,
+                    color 0.16s ease;
     }
     [data-testid="stButton"] button[kind="primary"],
     [data-testid="baseButton-primary"],
@@ -492,9 +514,9 @@ st.markdown(
     }
     [data-testid="stExpander"] summary {
         color: var(--zy-ink);
-        font-weight: 600;
-        letter-spacing: 0.02em;
-        padding: 0.8rem 1.1rem;
+        font-weight: 500;
+        letter-spacing: 0;
+        padding: 0.75rem 1rem;
     }
     [data-testid="stExpander"] summary:hover {
         color: var(--zy-accent);
@@ -528,7 +550,7 @@ st.markdown(
     [data-testid="stChatMessageContent"] {
         background-color: var(--zy-accent);
         border: 1px solid var(--zy-accent);
-        box-shadow: 0 6px 18px rgba(194, 72, 27, 0.22) !important;
+        box-shadow: none !important;
         color: #FFFFFF;
     }
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
@@ -536,11 +558,21 @@ st.markdown(
         color: #FFFFFF;
         text-decoration: underline;
     }
+    /* 身份靠印章区分：朱砂方章「遇」与会话者方章「我」，不用圆形人脸 */
     [data-testid="stChatMessageAvatarUser"],
     [data-testid="stChatMessageAvatarAssistant"] {
-        border-radius: 50% !important;
-        background-color: var(--zy-accent-soft);
-        font-size: 1rem;
+        border-radius: 6px !important;
+        background-color: transparent !important;
+        width: 2rem;
+        height: 2rem;
+        font-size: 0;
+        overflow: hidden;
+    }
+    [data-testid="stChatMessageAvatarUser"] img,
+    [data-testid="stChatMessageAvatarAssistant"] img {
+        border-radius: 6px !important;
+        width: 2rem;
+        height: 2rem;
     }
 
     /* ============================================================
@@ -612,6 +644,34 @@ st.markdown(
     [data-testid="stAlert"] p,
     [data-testid="stNotification"] p {
         color: var(--zy-ink);
+    }
+    /* Streamlit 把语义色涂在内层容器上，外面那圈白是覆盖不掉的；
+       这里换成纸白底 + 左侧一条细色条，颜色留给图标和那条线。 */
+    [data-testid="stAlert"] [data-testid="stAlertContainer"] {
+        background-color: transparent !important;
+        color: var(--zy-ink) !important;
+        border-radius: 8px !important;
+    }
+    [data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) {
+        border-left-color: #4A7C59 !important;
+    }
+    [data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) {
+        border-left-color: #B4791F !important;
+    }
+    [data-testid="stAlert"]:has([data-testid="stAlertContentError"]) {
+        border-left-color: #A6432F !important;
+    }
+    [data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) svg {
+        fill: #4A7C59;
+        color: #4A7C59;
+    }
+    [data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) svg {
+        fill: #B4791F;
+        color: #B4791F;
+    }
+    [data-testid="stAlert"]:has([data-testid="stAlertContentError"]) svg {
+        fill: #A6432F;
+        color: #A6432F;
     }
 
     /* ============================================================
@@ -833,36 +893,17 @@ st.markdown(
         position: relative;
         background-color: var(--zy-surface);
         border: 1px solid var(--zy-line);
-        border-radius: 24px;
-        box-shadow: var(--zy-shadow-md);
-        padding: 2.75rem 2.75rem 2.625rem;
-        margin: 0 0 1.375rem;
-        overflow: hidden;
-    }
-    .zy-hero::after {
-        content: "";
-        position: absolute;
-        right: -64px;
-        top: -64px;
-        width: 200px;
-        height: 200px;
-        border-radius: 50%;
-        background: radial-gradient(circle, var(--zy-accent-soft) 0%, rgba(251, 234, 224, 0) 70%);
-    }
-    .zy-kicker {
-        font-size: 0.75rem;
-        font-weight: 700;
-        letter-spacing: 0.2em;
-        text-transform: uppercase;
-        color: var(--zy-accent);
-        margin: 0 0 1rem;
+        border-radius: 20px;
+        box-shadow: var(--zy-shadow-sm);
+        padding: 2.5rem 2.5rem 2.25rem;
+        margin: 0 0 1.5rem;
     }
     .zy-title {
         font-family: var(--zy-serif);
-        font-size: 4rem;
-        font-weight: 800;
-        letter-spacing: -0.01em;
-        line-height: 1.08;
+        font-size: 3.5rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
         color: var(--zy-ink);
         margin: 0;
     }
@@ -871,49 +912,58 @@ st.markdown(
         color: var(--zy-accent);
     }
     .zy-sub {
-        font-size: 1.0625rem;
-        line-height: 1.75;
+        font-size: 1rem;
+        line-height: 1.8;
         color: var(--zy-muted);
-        max-width: 46em;
-        margin: 1.125rem 0 0;
+        max-width: 40em;
+        margin: 1rem 0 0;
     }
     .zy-grid {
         display: grid;
         grid-template-columns: repeat(3, 1fr);
-        gap: 1.125rem;
-        margin: 0 0 1.375rem;
+        gap: 0;
+        margin: 0 0 1.5rem;
+        border-top: 1px solid var(--zy-line);
     }
     .zy-cell {
-        background-color: var(--zy-surface);
-        border: 1px solid var(--zy-line);
-        border-radius: 18px;
-        box-shadow: var(--zy-shadow-sm);
-        padding: 1.375rem 1.5rem 1.5rem;
-        transition: transform 0.2s ease, box-shadow 0.2s ease;
+        padding: 1rem 1.5rem 0 0;
+        border-right: 1px solid var(--zy-line);
     }
-    .zy-cell:hover {
-        transform: translateY(-3px);
-        box-shadow: var(--zy-shadow-md);
+    .zy-cell:last-child {
+        border-right: none;
+        padding-right: 0;
+    }
+    .zy-cell:not(:first-child) {
+        padding-left: 1.5rem;
     }
     .zy-num {
-        font-size: 0.78rem;
-        font-weight: 700;
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
-        color: var(--zy-accent);
+        font-size: 0.75rem;
+        font-weight: 400;
+        letter-spacing: 0.02em;
+        color: var(--zy-faint);
     }
     .zy-cell h4 {
         font-family: var(--zy-serif);
-        margin: 0.5rem 0 0.375rem;
-        font-size: 1.125rem;
-        font-weight: 800;
+        margin: 0.25rem 0;
+        font-size: 1rem;
+        font-weight: 600;
         color: var(--zy-ink);
     }
     .zy-cell p {
         margin: 0;
-        font-size: 0.9rem;
+        font-size: 0.875rem;
         line-height: 1.7;
         color: var(--zy-muted);
+    }
+    .zy-note {
+        border-left: 2px solid var(--zy-accent);
+        background-color: var(--zy-accent-soft);
+        padding: 0.75rem 1rem;
+        border-radius: 0 8px 8px 0;
+        font-size: 0.875rem;
+        line-height: 1.7;
+        color: var(--zy-ink);
+        margin: 0 0 1.5rem;
     }
     .zy-band {
         display: flex;
@@ -927,10 +977,10 @@ st.markdown(
     }
     .zy-mark {
         font-family: var(--zy-serif);
-        font-size: 1.625rem;
-        font-weight: 800;
+        font-size: 1.5rem;
+        font-weight: 600;
         letter-spacing: -0.01em;
-        line-height: 1.15;
+        line-height: 1.2;
         color: var(--zy-ink);
     }
     .zy-mark em {
@@ -947,11 +997,22 @@ st.markdown(
         .zy-grid {
             grid-template-columns: 1fr;
         }
+        .zy-cell {
+            border-right: none;
+            border-bottom: 1px solid var(--zy-line);
+            padding: 1rem 0;
+        }
+        .zy-cell:not(:first-child) {
+            padding-left: 0;
+        }
+        .zy-cell:last-child {
+            border-bottom: none;
+        }
         .zy-hero {
-            padding: 2rem 1.375rem;
+            padding: 1.75rem 1.25rem;
         }
         .zy-title {
-            font-size: 2.75rem;
+            font-size: 2.5rem;
         }
     }
     </style>
@@ -1230,9 +1291,9 @@ _LOGIN_CSS = """
     margin: 0 0 2rem;
 }
 .zy-auth-mast span {
-    font-size: 0.6875rem;
-    font-weight: 600;
-    letter-spacing: 0.22em;
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
     /* 用 muted 而不是 faint：#9A9184 在纸底上只有约 2.7:1，小字看不清 */
     color: var(--zy-muted);
@@ -1253,19 +1314,18 @@ _LOGIN_CSS = """
     margin-bottom: 1.6rem;
 }
 .zy-auth-kicker {
-    font-size: 0.72rem;
-    font-weight: 700;
-    letter-spacing: 0.26em;
-    text-transform: uppercase;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
     color: var(--zy-muted);
     margin-bottom: 1.15rem;
 }
 [data-testid="stMarkdownContainer"] .zy-auth-word {
     font-family: var(--zy-serif);
-    font-size: clamp(3.2rem, 5.2vw, 4.75rem);
-    font-weight: 800;
+    font-size: clamp(3rem, 5vw, 4.25rem);
+    font-weight: 600;
     letter-spacing: -0.02em;
-    line-height: 1.02;
+    line-height: 1.06;
     color: var(--zy-ink);
     margin: 0;
 }
@@ -1276,8 +1336,8 @@ _LOGIN_CSS = """
 [data-testid="stMarkdownContainer"] .zy-auth-lede {
     font-family: var(--zy-serif);
     font-size: clamp(1.05rem, 1.4vw, 1.25rem);
-    font-weight: 700;
-    line-height: 1.6;
+    font-weight: 500;
+    line-height: 1.7;
     color: var(--zy-ink);
     margin: 1.2rem 0 0;
     /* 父级不要限宽：限了会把里面的副文案一起挤窄（原来副文案只剩 18 字/行） */
@@ -1309,9 +1369,9 @@ _LOGIN_CSS = """
     border-bottom: 1px solid var(--zy-line);
 }
 .zy-auth-idx {
-    font-size: 0.6875rem;
-    font-weight: 700;
-    letter-spacing: 0.14em;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
     color: var(--zy-accent);
     padding-top: 0.35rem;
 }
@@ -1319,7 +1379,7 @@ _LOGIN_CSS = """
     margin: 0 0 0.3rem;
     font-family: var(--zy-serif);
     font-size: 1.0625rem;
-    font-weight: 800;
+    font-weight: 600;
     letter-spacing: 0.01em;
     color: var(--zy-ink);
 }
@@ -1339,8 +1399,8 @@ _LOGIN_CSS = """
     flex: none;
     font-family: var(--zy-serif);
     font-size: 0.8125rem;
-    font-weight: 800;
-    letter-spacing: 0.14em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
     line-height: 1;
     color: #FFFFFF;
     background: var(--zy-accent);
@@ -1358,9 +1418,9 @@ _LOGIN_CSS = """
 .st-key-zy_auth_card {
     background-color: var(--zy-surface);
     border: 1px solid var(--zy-line);
-    border-radius: 20px;
+    border-radius: 16px;
     padding: 1.75rem 1.75rem 1.65rem;
-    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.04), 0 22px 46px -20px rgba(33, 29, 25, 0.24);
+    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.05);
 }
 /* 卡片内部不要再套一层表单边框——那是"卡片套卡片" */
 .st-key-zy_auth_card [data-testid="stForm"] {
@@ -1374,10 +1434,9 @@ _LOGIN_CSS = """
     margin-bottom: 0.35rem;
 }
 .zy-auth-eyebrow {
-    font-size: 0.6875rem;
-    font-weight: 700;
-    letter-spacing: 0.22em;
-    text-transform: uppercase;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
     color: var(--zy-accent);
     margin-bottom: 0.6rem;
 }
@@ -1436,10 +1495,9 @@ _LOGIN_CSS = """
     flex-wrap: wrap;
 }
 .zy-pass-tag {
-    font-size: 0.6875rem;
-    font-weight: 700;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
     color: var(--zy-muted);
 }
 .zy-pass-cred {
@@ -1715,10 +1773,8 @@ def render_login() -> None:
                     _complete_login(user["account"], "已用演示账号进入。")
 
     st.markdown(
-        "<p class=\"zy-auth-legal\">忘记密码没有自助找回：账号由本机文件管理，"
-        "需要管理员改 <code>.auth/users.json</code>。<br>"
-        "多人共用时请用 <code>分享给别人.ps1 -Mode lan</code> 启动，"
-        "双击启动器只监听本机。</p>",
+        "<p class=\"zy-auth-legal\">忘记密码没有自助找回，需要管理员在后台重置。"
+        "多人一起用请以局域网模式启动，默认只监听本机；部署说明见 README。</p>",
         unsafe_allow_html=True,
     )
 
@@ -2041,7 +2097,7 @@ def _note_tts_failure(reason: str) -> None:
         "已知原因：edge-tts 自 2026-10 起被上游拒绝握手（WSS 403），这条通道"
         "只能靠硅基流动兜底；若兜底也没返回音频，本机当前就没有可用的合成通道。\n\n"
         f"失败原因：{reason[:300]}\n\n"
-        "处理后可在左侧「🎙️ 语音与动效」点「重试语音合成」恢复，不必重开页面。"
+        "处理后可在左侧「语音与动效」点「重试语音合成」恢复，不必重开页面。"
     )
 
 
@@ -2342,7 +2398,7 @@ def _render_api_key_section() -> str:
     """
     env_key = load_api_key(DEEPSEEK_KEY_ENV)
     if env_key:
-        st.caption("🔑 DeepSeek API Key 已从环境变量读取")
+        st.caption("DeepSeek API Key 已从环境变量读取")
         return env_key
 
     typed = st.text_input(
@@ -2598,10 +2654,11 @@ def _render_resume_optimize_section(api_key: str) -> None:
         if problems:
             st.markdown("**诊断**")
             for item in problems:
-                icon = {"high": "🔴", "medium": "🟠", "low": "🟡"}.get(
-                    item.get("severity", ""), "•"
+                level = {"high": "高", "medium": "中", "low": "低"}.get(
+                    item.get("severity", ""), ""
                 )
-                st.markdown(f"{icon} **{item.get('problem', '')}**")
+                tag = f"› {level} " if level else ""
+                st.markdown(f"{tag}**{item.get('problem', '')}**")
                 if item.get("evidence"):
                     st.caption(f"原文：{item['evidence']}")
                 st.caption(f"怎么改：{item.get('advice', '')}")
@@ -2651,8 +2708,8 @@ def _render_resume_optimize_section(api_key: str) -> None:
         if identity:
             st.markdown("**身份与表述核实**")
             for item in identity:
-                icon = "🔴" if item.get("severity") == "high" else "🟠"
-                st.markdown(f"{icon} {item.get('signal', '')}")
+                level = "高" if item.get("severity") == "high" else "中"
+                st.markdown(f"› {level} {item.get('signal', '')}")
                 st.caption(f"原文：{item.get('quote', '')}")
                 st.caption(f"怎么改：{item.get('advice', '')}")
 
@@ -2871,7 +2928,7 @@ def _render_jd_progress_block(profile: dict, rubric_check: list[dict]) -> None:
     )
     api_key_ready = bool(st.session_state.get("api_key"))
     if st.button(
-        f"🎯 只练这 {len(remaining)} 条",
+        f"只练这 {len(remaining)} 条",
         key="jd_retry_weak",
         disabled=not api_key_ready,
         use_container_width=True,
@@ -3006,7 +3063,7 @@ def _render_jd_match_section() -> None:
         "场景、难度与主问题数沿用左侧「基础配置」。"
     )
     if st.button(
-        f"🎯 用这 {len(topics)} 条考点开一场面试",
+        f"用这 {len(topics)} 条考点开一场面试",
         key="jd_start_interview",
         disabled=not api_key_ready,
         use_container_width=True,
@@ -3055,7 +3112,7 @@ def _render_voice_section() -> None:
     )
 
     if st.session_state.sf_key:
-        st.caption("🎙️ 硅基流动 API Key 已从环境变量读取")
+        st.caption("硅基流动 API Key 已从环境变量读取")
     else:
         st.text_input(
             "硅基流动 API Key",
@@ -3066,7 +3123,7 @@ def _render_voice_section() -> None:
 
     st.divider()
     if st.session_state.zhipu_key:
-        st.caption("🔊 智谱 API Key 已从环境变量读取")
+        st.caption("智谱 API Key 已从环境变量读取")
     else:
         st.text_input(
             "智谱 API Key（面试官朗读）",
@@ -3077,8 +3134,8 @@ def _render_voice_section() -> None:
         )
 
     st.caption(
-        "录音会上传到硅基流动做识别，不做保存；面试官的声音优先用智谱 GLM-TTS 合成，"
-        "失败时依次退回硅基流动（复用上面的 Key）与 edge-tts。识别失败会自动退回文字输入。"
+        "录音只用于当轮识别，不保存。朗读按智谱、硅基流动、系统语音依次降级；"
+        "识别不成功会自动切回打字作答。"
     )
 
 
@@ -3140,7 +3197,7 @@ def _render_account_bar() -> None:
         return
     info = auth.public_user(BASE_DIR, account) or {}
     display = str(info.get("name") or "").strip() or account
-    st.caption(f"👤 **{display}**（{account}）")
+    st.caption(f"**{display}**（{account}）")
     if st.button("退出登录", key="logout_button", use_container_width=True):
         _logout()
     st.divider()
@@ -3166,28 +3223,28 @@ def render_sidebar() -> None:
         # 这是 Streamlit 里处理"后渲染的控件影响先渲染的内容"的标准做法。
         strict = bool(st.session_state.get("strict_mode", False))
 
-        with st.expander("🎯 基础配置", expanded=True):
+        with st.expander("基础配置", expanded=True):
             config = _render_core_config()
             # 「JD 对照 → 一键开面试」要和左侧用同一套场景/难度/主问题数，
             # 而配置控件没有 key、值只活在本次 render 的局部变量里，所以存一份。
             st.session_state.core_config = config
 
-        with st.expander("🎭 面试官情绪", expanded=False):
+        with st.expander("面试官情绪", expanded=False):
             mood_ok = _render_mood_section(strict=strict)
 
-        with st.expander("👤 候选人背景与简历", expanded=False):
+        with st.expander("候选人背景与简历", expanded=False):
             candidate_bg = _render_candidate_section()
 
-        with st.expander("📝 简历优化（独立功能）", expanded=False):
+        with st.expander("简历优化（独立功能）", expanded=False):
             _render_resume_optimize_section(api_key)
 
-        with st.expander("🧭 岗位 JD 对照（独立功能）", expanded=False):
+        with st.expander("岗位 JD 对照（独立功能）", expanded=False):
             _render_jd_match_section()
 
-        with st.expander("🎙️ 语音与动效", expanded=False):
+        with st.expander("语音与动效", expanded=False):
             _render_voice_section()
 
-        with st.expander("⚙️ 高级选项", expanded=False):
+        with st.expander("高级选项", expanded=False):
             st.checkbox(
                 "严格模式（节奏固定）",
                 value=False,
@@ -3276,6 +3333,28 @@ def _clip_answer(text: str) -> tuple[str, bool]:
     )
 
 
+def _seal_avatar(text: str, filled: bool) -> str:
+    """印章式头像：朱砂填底的「遇」与纸色描边的「我」，以 SVG data URI 交给 Streamlit。
+
+    用方章代替默认圆形人脸，既守住「界面里不出现人脸」的决定，也让身份
+    辨认和登录页那枚印章是同一种记号。
+    """
+    if filled:
+        bg, fg, stroke = "#C2481B", "#FFFFFF", "#C2481B"
+    else:
+        bg, fg, stroke = "#F5F0E8", "#6B6259", "#D8CFC0"
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' "
+        "viewBox='0 0 32 32'>"
+        f"<rect x='1' y='1' width='30' height='30' rx='6' fill='{bg}' "
+        f"stroke='{stroke}' stroke-width='1'/>"
+        f"<text x='16' y='22' text-anchor='middle' font-family='serif' "
+        f"font-size='16' fill='{fg}'>{text}</text>"
+        "</svg>"
+    )
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
 def render_interview() -> None:
     profile = st.session_state.profile
 
@@ -3302,7 +3381,10 @@ def render_interview() -> None:
 
     for index, msg in enumerate(st.session_state.history):
         role = "assistant" if msg["role"] == "assistant" else "user"
-        with st.chat_message(role, avatar="🧑‍💼" if role == "assistant" else "🙋"):
+        with st.chat_message(
+            role,
+            avatar=_seal_avatar("遇", True) if role == "assistant" else _seal_avatar("我", False),
+        ):
             st.markdown(msg["content"])
             # 动效组件正在播的那一条，消息上不再挂播放器：同一段 mp3 挂两套
             # 播放器就是两个各自计时的进度条，怎么调都不会同步
@@ -3341,7 +3423,7 @@ def render_interview() -> None:
         )
         col1, col2 = st.columns([1, 4])
         if col1.button("重试本轮", type="primary"):
-            with st.chat_message("assistant", avatar="🧑‍💼"):
+            with st.chat_message("assistant", avatar=_seal_avatar("遇", True)):
                 # advance 内部自带「面试官正在看你的回答…」；这里不再套外层 spinner：
                 # 末轮它会在同一次 run 里直接转进报告生成，外层的固定文案会把
                 # 下面的三段进度块盖成一句空话。
@@ -3398,9 +3480,9 @@ def render_interview() -> None:
         )
         # 先把回答存进快照，再调用模型：万一本轮模型报错，刷新后至少不会丢掉这句回答
         save_snapshot()
-        with st.chat_message("user", avatar="🙋"):
+        with st.chat_message("user", avatar=_seal_avatar("我", False)):
             st.markdown(answer)
-        with st.chat_message("assistant", avatar="🧑‍💼"):
+        with st.chat_message("assistant", avatar=_seal_avatar("遇", True)):
             # 进度由 advance 内部（看回答）与 finish_interview 的状态块（出报告）
             # 各自负责；外层固定的「面试官思考中…」在末轮会盖住真实进度。
             advance()
@@ -4300,40 +4382,37 @@ def main() -> None:
         st.markdown(
             """
             <div class="zy-hero">
-                <div class="zy-kicker">AI Interview Agent</div>
                 <div class="zy-title">知遇<em>。</em></div>
-                <p class="zy-sub">多场景 · 多专业 · 多难度自适应的模拟面试智能体。
-                他不会念题库——会根据你的回答现场判断继续追问还是换题，
-                情绪也随回答实时变化；面试结束后自动生成评分报告与教练复盘。</p>
+                <p class="zy-sub">按岗位出题，顺着你的回答往下追问；答偏了会把你拉回来。
+                结束给一份能照着改的复盘——哪句答漏了、哪句说错了，以及下次怎么说。</p>
             </div>
             <div class="zy-grid">
                 <div class="zy-cell">
-                    <div class="zy-num">01 / 现场判断</div>
+                    <div class="zy-num">01</div>
                     <h4>不念题库</h4>
-                    <p>每一轮追问或换题都有明确依据，完整决策轨迹在复盘页可查。</p>
+                    <p>按场景、专业、难度现组一套，每道题的来源都能查到。</p>
                 </div>
                 <div class="zy-cell">
-                    <div class="zy-num">02 / 情绪模拟</div>
-                    <h4>面试官有状态</h4>
-                    <p>耐心、精力、时间压力动态变化，训练你在压力下的稳定性。</p>
+                    <div class="zy-num">02</div>
+                    <h4>跟着你走</h4>
+                    <p>答得浅就再挖一层，答偏了把你拉回来——不是念下一题。</p>
                 </div>
                 <div class="zy-cell">
-                    <div class="zy-num">03 / 评估复盘</div>
-                    <h4>评分 + 教练</h4>
-                    <p>维度评分、归因分析、可以直接背的示范答案，结束即得。</p>
+                    <div class="zy-num">03</div>
+                    <h4>落到原话</h4>
+                    <p>每个扣分都指到你说过的某句，附一份可以直接背的说法。</p>
                 </div>
             </div>
+            <div class="zy-note">技术面看专业方向，行为面看 STAR 结构。两场分开练，报告能对照着看。</div>
             """,
             unsafe_allow_html=True,
         )
-        st.caption("开始：在左侧完成配置（场景 → 专业 → 难度，以及面试官情绪），填好 API Key 后点击「开始面试」。")
-        st.info("小提示：技术面和专业方向相关，行为面则主要考 STAR 结构，可分别各练一场。")
 
         # 历史复盘此前只挂在「报告页」的第 5 个 tab——那意味着**必须刚做完一场**
         # 才进得去，想复看上周那一场却找不到门。首页补一个常驻入口。
         past = load_records()
         if past:
-            with st.expander(f"📊 我的历史记录（{len(past)} 场）— 点开复盘"):
+            with st.expander(f"我的历史记录 · {len(past)} 场"):
                 render_history_tab()
     elif status == "running":
         render_interview()
