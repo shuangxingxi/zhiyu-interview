@@ -993,6 +993,45 @@ st.markdown(
         color: var(--zy-muted);
         text-align: right;
     }
+    /* 侧边栏：折叠面板里的分组标题。比控件标签小一号、加字距并压一条细线，
+       否则它和「① 面试场景」长得太像，分不出层级。 */
+    .zy-group {
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        color: var(--zy-muted);
+        margin: 1.5rem 0 0.625rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid var(--zy-line);
+    }
+    .zy-group:first-child {
+        margin-top: 0;
+        padding-top: 0;
+        border-top: none;
+    }
+    /* 侧边栏：当前配置摘要，不展开也知道这场练什么 */
+    .zy-config {
+        font-size: 0.8125rem;
+        line-height: 1.65;
+        color: var(--zy-muted);
+        margin: 0 0 0.5rem;
+    }
+    .zy-config b {
+        font-weight: 500;
+        color: var(--zy-ink);
+    }
+    /* 首页：主操作行，按钮靠左，旁边只放一句上一场的结果 */
+    .zy-action {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+        margin: 0 0 1.75rem;
+    }
+    .zy-action-note {
+        font-size: 0.875rem;
+        color: var(--zy-muted);
+    }
     @media (max-width: 900px) {
         .zy-grid {
             grid-template-columns: 1fr;
@@ -3203,48 +3242,62 @@ def _render_account_bar() -> None:
     st.divider()
 
 
-def render_sidebar() -> None:
-    """侧边栏。
+def render_sidebar() -> dict:
+    """侧边栏：账号、Key、本场设置。
+
+    返回本场参数供首页的「开始面试」使用——行动挪到了主区域，配置留在侧边栏，
+    两边靠这个返回值对接。
 
     分两种形态：**面试进行中**只显示进度（配置已锁定，摆出来只会误导）；
-    **空闲时**按用途分组折叠，避免两百行控件平铺。
+    **空闲时**七组配置收进一个折叠面板，不展开也能看到当前摘要。
     """
+    state = {
+        "api_key": "",
+        "config": st.session_state.get("core_config") or {},
+        "mood_ok": False,
+        "candidate_bg": None,
+        "use_real": False,
+        "real_quota": 0,
+        "strict": False,
+        "can_start": False,
+    }
     with st.sidebar:
         _render_account_bar()
         if st.session_state.status == "running" and st.session_state.profile:
             _render_running_panel()
-            return
+            return state
 
-        st.header("面试配置")
+        st.header("本场设置")
         api_key = _render_api_key_section()
 
         # strict 要在情绪那一节之前就已知（严格模式会锁定友善型），
-        # 但它的控件在「高级选项」里——所以用带 key 的控件 + 先读 session_state。
+        # 但它的控件在「高级」里——所以用带 key 的控件 + 先读 session_state。
         # 这是 Streamlit 里处理"后渲染的控件影响先渲染的内容"的标准做法。
         strict = bool(st.session_state.get("strict_mode", False))
 
-        with st.expander("基础配置", expanded=True):
+        with st.expander("配置", expanded=False):
+            st.markdown('<div class="zy-group">基础</div>', unsafe_allow_html=True)
             config = _render_core_config()
             # 「JD 对照 → 一键开面试」要和左侧用同一套场景/难度/主问题数，
             # 而配置控件没有 key、值只活在本次 render 的局部变量里，所以存一份。
             st.session_state.core_config = config
 
-        with st.expander("面试官情绪", expanded=False):
+            st.markdown('<div class="zy-group">面试官情绪</div>', unsafe_allow_html=True)
             mood_ok = _render_mood_section(strict=strict)
 
-        with st.expander("候选人背景与简历", expanded=False):
+            st.markdown('<div class="zy-group">候选人</div>', unsafe_allow_html=True)
             candidate_bg = _render_candidate_section()
 
-        with st.expander("简历优化（独立功能）", expanded=False):
+            st.markdown('<div class="zy-group">简历优化</div>', unsafe_allow_html=True)
             _render_resume_optimize_section(api_key)
 
-        with st.expander("岗位 JD 对照（独立功能）", expanded=False):
+            st.markdown('<div class="zy-group">岗位 JD 对照</div>', unsafe_allow_html=True)
             _render_jd_match_section()
 
-        with st.expander("语音与动效", expanded=False):
+            st.markdown('<div class="zy-group">语音与动效</div>', unsafe_allow_html=True)
             _render_voice_section()
 
-        with st.expander("高级选项", expanded=False):
+            st.markdown('<div class="zy-group">高级</div>', unsafe_allow_html=True)
             st.checkbox(
                 "严格模式（节奏固定）",
                 value=False,
@@ -3259,30 +3312,23 @@ def render_sidebar() -> None:
             st.divider()
             _render_connection_test(api_key)
 
-        st.divider()
-        can_start = bool(api_key) and mood_ok
-        if st.button("开始面试", type="primary", disabled=not can_start, use_container_width=True):
-            profile = build_profile(
-                config["scene"],
-                config["major"],
-                config["level"],
-                config["interview_type"],
-                config["total_rounds"],
-                candidate_bg,
-                resume=st.session_state.resume_text,
-                strict=strict,
-                mood=st.session_state.mood_choice,
-                avoid_topics=recent_asked_topics(),
-                use_real=use_real,
-                real_quota=real_quota,
-            )
-            start_interview(profile, api_key)
-            st.rerun()
-
+        # 配置摘要不放在这里：侧边栏窄，三行摘要会把「配置」挤到折叠线以下，
+        # 而首页的按钮上方已经有一份同样的摘要（那里才是做决定的地方）。
         if not api_key:
             st.caption("填入 DeepSeek API Key 后即可开始。")
         elif not mood_ok:
-            st.caption("勾选上面的知情同意后即可开始。")
+            st.caption("展开配置，在「面试官情绪」里勾选知情同意后即可开始。")
+
+        return {
+            "api_key": api_key,
+            "config": config,
+            "mood_ok": mood_ok,
+            "candidate_bg": candidate_bg,
+            "use_real": use_real,
+            "real_quota": real_quota,
+            "strict": strict,
+            "can_start": bool(api_key) and mood_ok,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3445,7 +3491,7 @@ def render_interview() -> None:
         # 失效 MediaRecorder 的旧实例（表现为控件里显示
         # "An error has occurred, please try again."，得手点刷新按钮）。
         clip = st.audio_input(
-            "也可以按住说话作答", key=f"answer_clip_{st.session_state.voice_widget_gen}"
+            "按住说话作答", key=f"answer_clip_{st.session_state.voice_widget_gen}"
         )
         if clip is not None:
             # 同一段录音只识别一次：靠指纹比对，而不是识别完就去清空控件
@@ -3488,11 +3534,13 @@ def render_interview() -> None:
             advance()
         st.rerun()
 
-    col1, col2 = st.columns([1, 4])
-    if col1.button("结束面试并生成报告"):
+    # 结束按钮不再塞进 st.columns([1, 4]) 的窄列——那样文案会被截成
+    # 「结束面试并生成…」。直接放在流里就是自然宽度，旁边补一句说明。
+    if st.button("结束面试并生成报告"):
         # 进度块由 finish_interview 自己显示，这里不要再套 spinner
         finish_interview()
         st.rerun()
+    st.caption("随时可以结束。已经答过的轮次都会算进报告，不会白练。")
 
 
 # ---------------------------------------------------------------------------
@@ -4369,7 +4417,8 @@ def main() -> None:
     # 把计量绑到本会话的账本上。必须每次 rerun 都绑：Streamlit 每次重跑脚本
     # 都是一个新线程，上一次 bind 的上下文不会自动带过来。
     bind_usage_meter(st.session_state.usage_meter)
-    render_sidebar()
+    # 侧边栏只负责「配」，返回本场参数；「开」的按钮在首页主区域。
+    state = render_sidebar()
     _flush_flash()
 
     if st.session_state.error:
@@ -4386,27 +4435,61 @@ def main() -> None:
                 <p class="zy-sub">按岗位出题，顺着你的回答往下追问；答偏了会把你拉回来。
                 结束给一份能照着改的复盘——哪句答漏了、哪句说错了，以及下次怎么说。</p>
             </div>
-            <div class="zy-grid">
-                <div class="zy-cell">
-                    <div class="zy-num">01</div>
-                    <h4>不念题库</h4>
-                    <p>按场景、专业、难度现组一套，每道题的来源都能查到。</p>
-                </div>
-                <div class="zy-cell">
-                    <div class="zy-num">02</div>
-                    <h4>跟着你走</h4>
-                    <p>答得浅就再挖一层，答偏了把你拉回来——不是念下一题。</p>
-                </div>
-                <div class="zy-cell">
-                    <div class="zy-num">03</div>
-                    <h4>落到原话</h4>
-                    <p>每个扣分都指到你说过的某句，附一份可以直接背的说法。</p>
-                </div>
-            </div>
-            <div class="zy-note">技术面看专业方向，行为面看 STAR 结构。两场分开练，报告能对照着看。</div>
             """,
             unsafe_allow_html=True,
         )
+
+        # 三栏卖点已删：它和登录页的 01/02/03 说的是同一件事，第二次看就是噪音。
+        # 首页只回答一个问题——"这场练什么"，然后给一个按钮。
+        config = state.get("config") or {}
+        can_start = bool(state.get("can_start"))
+        if config:
+            labels = level_labels(config["scene"])
+            st.markdown(
+                f'<div class="zy-config"><b>{config["scene"]}</b> · {config["major"]}<br>'
+                f"{config['level']} 级 · {labels[config['level']]} · "
+                f"{config['interview_type']} · {config['total_rounds']} 道主问题</div>",
+                unsafe_allow_html=True,
+            )
+
+        col_btn, col_note = st.columns([1, 2.4], gap="large")
+        with col_btn:
+            start = st.button(
+                "开始面试",
+                type="primary",
+                use_container_width=True,
+                disabled=not can_start,
+            )
+        with col_note:
+            if not can_start:
+                note = "先在左侧填 DeepSeek API Key，并在配置的「面试官情绪」里勾选知情同意。"
+            elif config:
+                note = (
+                    f"约 {config['total_rounds']} 轮，12–18 分钟。"
+                    "结束后立刻出评分、逐题命中与教练复盘。"
+                )
+            else:
+                note = ""
+            if note:
+                st.markdown(f'<div class="zy-action-note">{note}</div>', unsafe_allow_html=True)
+
+        if start and config:
+            profile = build_profile(
+                config["scene"],
+                config["major"],
+                config["level"],
+                config["interview_type"],
+                config["total_rounds"],
+                state.get("candidate_bg"),
+                resume=st.session_state.resume_text,
+                strict=state.get("strict", False),
+                mood=st.session_state.mood_choice,
+                avoid_topics=recent_asked_topics(),
+                use_real=state.get("use_real", False),
+                real_quota=state.get("real_quota", 0),
+            )
+            start_interview(profile, state["api_key"])
+            st.rerun()
 
         # 历史复盘此前只挂在「报告页」的第 5 个 tab——那意味着**必须刚做完一场**
         # 才进得去，想复看上周那一场却找不到门。首页补一个常驻入口。
