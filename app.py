@@ -1757,11 +1757,11 @@ def _logout() -> None:
 _LOGIN_CSS = """
 <style>
 /* ============================================================
-   登录页 v2 —— 「留白 · 光斑 · 分段控件」
-   版式：海报式左侧（品牌 + 数据 + 流程），右侧一张悬浮卡片
-   交互：背景光斑漂移 / 分段滑块 / 底线输入 / 按钮填充 / 聚焦抬升
-   注意：Streamlit 1.65 已改用 react-aria，tab 不再有 data-baseweb，
-        选择器全部按 stTab / SelectionIndicator / stTextInputRootElement 写。
+   登录页 v3 —— 「告示与签到卡」
+   版式：墙上一张巨字告示（左），右下斜钉一张签到卡（右）
+   交互：逐字落墨 / 换页签换告示 / 撕条可撩 / 底线聚焦 / 按钮填充
+   注意：Streamlit 1.65 用 react-aria，页签选择器按 stTab + data-selected 写。
+         tablist 下只有两个 stTab，第一个带 data-selected="true"。
    ============================================================ */
 [data-testid="stHeader"] {
     background-color: transparent !important;
@@ -1772,17 +1772,17 @@ _LOGIN_CSS = """
     display: none !important;
 }
 
-/* ---------- 背景：两团暖光 + 点阵，缓慢呼吸 ---------- */
+/* ---------- 墙：一束壁灯 + 极淡刷痕 ---------- */
 [data-testid="stAppViewContainer"]::before {
     content: "";
     position: fixed;
-    inset: -18vh -12vw;
+    inset: -14vh -10vw;
     pointer-events: none;
     z-index: 0;
     background:
-        radial-gradient(50rem 34rem at 26% 12%, rgba(194, 72, 27, 0.22), transparent 74%),
-        radial-gradient(44rem 30rem at 84% 84%, rgba(198, 126, 60, 0.18), transparent 72%);
-    animation: zy-gradient-drift 24s ease-in-out infinite alternate;
+        radial-gradient(46rem 30rem at 16% 6%, rgba(194, 72, 27, 0.13), transparent 70%),
+        radial-gradient(40rem 26rem at 92% 96%, rgba(198, 126, 60, 0.10), transparent 72%);
+    animation: zy-lamp 26s ease-in-out infinite alternate;
 }
 [data-testid="stAppViewContainer"]::after {
     content: "";
@@ -1790,329 +1790,391 @@ _LOGIN_CSS = """
     inset: 0;
     pointer-events: none;
     z-index: 0;
-    /* 均匀铺一层极淡点阵当纸纹；不做径向遮罩——遮罩边缘会在光斑下露出圆弧 */
-    opacity: 0.16;
-    background-image: radial-gradient(rgba(33, 29, 25, 0.22) 1px, transparent 1px);
-    background-size: 24px 24px;
+    opacity: 0.5;
+    background-image: repeating-linear-gradient(
+        90deg, rgba(33, 29, 25, 0.012) 0 1px, transparent 1px 6px
+    );
 }
-/* 让纸底由 stAppViewContainer 提供：stMain 若铺不透明底色，会把光斑整层盖住。
-   同时抬一层 z-index，光斑才落在内容下面而不是内容之上。 */
+/* 纸底由 stAppViewContainer 提供；stMain 若铺不透明色会把墙盖掉 */
 [data-testid="stMain"] {
     position: relative;
     z-index: 1;
     background-color: transparent !important;
 }
 
-@keyframes zy-gradient-drift {
+@keyframes zy-lamp {
     from { transform: translate3d(0, 0, 0) scale(1); }
-    to { transform: translate3d(2.2%, -2.4%, 0) scale(1.06); }
+    to   { transform: translate3d(1.6%, -2%, 0) scale(1.05); }
 }
 
 .block-container,
 [data-testid="stMainBlockContainer"],
 [data-testid="stMain"] > div:first-child {
-    max-width: 1200px !important;
-    padding-top: clamp(2.4rem, 8.5vh, 6rem);
-    padding-bottom: 1.5rem;
+    max-width: 1240px !important;
+    padding-top: clamp(1.6rem, 4.5vh, 3rem);
+    padding-bottom: 1.2rem;
 }
 
-/* ---------- 顶部导航：一枚圆点 + 一条发丝线 ---------- */
-.zy-auth-nav {
-    display: flex;
-    align-items: center;
-    gap: 1.15rem;
-    margin-bottom: clamp(2.2rem, 6vh, 4rem);
-}
-.zy-auth-mark {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-family: var(--zy-serif);
-    font-size: 1.0625rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    color: var(--zy-ink);
-    white-space: nowrap;
-}
-.zy-auth-mark::before {
-    content: "";
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--zy-accent);
-    box-shadow: 0 0 0 4px rgba(194, 72, 27, 0.12);
-}
-.zy-auth-nav i {
-    flex: 1;
-    height: 1px;
-    background: var(--zy-line-strong);
-}
-.zy-auth-navmeta {
-    margin-right: 0.15rem;
-    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-    font-size: 0.6875rem;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: var(--zy-muted);
-    white-space: nowrap;
-}
-.zy-auth-navright {
-    font-size: 0.6875rem;
-    letter-spacing: 0.1em;
-    color: var(--zy-muted);
-    white-space: nowrap;
-}
-
-/* ---------- 左栏：海报 ---------- */
-.zy-auth-hero > * {
-    animation: zy-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-.zy-auth-hero > *:nth-child(1) { animation-delay: 0.02s; }
-.zy-auth-hero > *:nth-child(2) { animation-delay: 0.10s; }
-.zy-auth-hero > *:nth-child(3) { animation-delay: 0.18s; }
-.zy-auth-hero > *:nth-child(4) { animation-delay: 0.26s; }
-.zy-auth-hero > *:nth-child(5) { animation-delay: 0.34s; }
-.zy-auth-hero > *:nth-child(6) { animation-delay: 0.40s; }
-
-[data-testid="stMarkdownContainer"] .zy-hero-title {
-    margin: 0;
-    font-family: var(--zy-serif);
-    font-size: clamp(2.6rem, 4.6vw, 4.15rem);
-    font-weight: 600;
-    line-height: 1.2;
-    letter-spacing: -0.022em;
-    color: var(--zy-ink);
-}
-.zy-hero-title em {
-    font-style: normal;
-    color: var(--zy-accent);
-    /* 高亮用背景块画在文字下沿，比伪元素省掉一个层叠上下文 */
-    background-image: linear-gradient(rgba(194, 72, 27, 0.13), rgba(194, 72, 27, 0.13));
-    background-repeat: no-repeat;
-    background-position: left 92%;
-    background-size: 0% 0.26em;
-    animation: zy-underline 0.55s 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-@keyframes zy-underline {
-    to { background-size: 100% 0.26em; }
-}
-[data-testid="stMarkdownContainer"] .zy-hero-lede {
-    margin: 1.15rem 0 0;
-    font-size: 0.9375rem;
-    line-height: 1.85;
-    color: var(--zy-muted);
-    max-width: 26em;
-}
-
-/* ---------- 数据条：三个数字，竖线分隔 ---------- */
-.zy-auth-stats {
-    display: flex;
-    align-items: stretch;
-    gap: 0;
-    margin-top: clamp(1.8rem, 4.5vh, 2.8rem);
-    border-top: 1px solid var(--zy-line);
-    border-bottom: 1px solid var(--zy-line);
-}
-.zy-auth-stats > div {
-    flex: 1 1 0;
-    padding: 1.05rem 0 1rem;
-}
-.zy-auth-stats > div + div {
-    border-left: 1px solid var(--zy-line);
-    padding-left: 1.35rem;
-}
-.zy-auth-stats b {
-    display: block;
-    font-family: var(--zy-serif);
-    font-size: clamp(1.35rem, 1.9vw, 1.7rem);
-    font-weight: 600;
-    line-height: 1.1;
-    letter-spacing: -0.01em;
-    color: var(--zy-ink);
-    font-variant-numeric: tabular-nums;
-    transition: color 0.2s ease;
-}
-.zy-auth-stats > div:hover b {
-    color: var(--zy-accent);
-}
-.zy-auth-stats span {
-    display: block;
-    margin-top: 0.4rem;
-    font-size: 0.75rem;
-    letter-spacing: 0.04em;
-    color: var(--zy-muted);
-}
-
-/* ---------- 流程条：出题 → 追问 → 复盘 ---------- */
-.zy-auth-flow {
-    display: flex;
-    align-items: center;
-    gap: 0.7rem;
-    margin-top: 1.5rem;
-    flex-wrap: wrap;
-}
-.zy-auth-flow span {
-    font-size: 0.8125rem;
-    letter-spacing: 0.06em;
-    color: var(--zy-ink);
-}
-.zy-auth-flow i {
+/* ---------- 告示：一张贴在墙上的纸 ---------- */
+.zy-notice {
     position: relative;
-    width: 2.2rem;
-    height: 1px;
-    background: #C9BFB0;
-}
-.zy-auth-flow i::after {
-    content: "";
-    position: absolute;
-    right: 0;
-    top: -2px;
-    width: 5px;
-    height: 5px;
-    border-top: 1px solid #C9BFB0;
-    border-right: 1px solid #C9BFB0;
-    transform: rotate(45deg);
-}
-.zy-auth-flow-note {
-    margin: 1.05rem 0 0 !important;
-    font-size: 0.75rem;
-    line-height: 1.7;
-    letter-spacing: 0.02em;
-    color: var(--zy-muted);
-}
-
-/* ---------- 右栏卡片 ---------- */
-.st-key-zy_auth_card {
-    background: rgba(255, 255, 255, 0.985);
-    border: 1px solid rgba(33, 29, 25, 0.08);
-    border-radius: 20px;
-    padding: 1.6rem 1.7rem 1.5rem;
-    position: relative;
+    display: flex;
+    flex-direction: column;
+    margin-left: -14px;
+    padding: 3.4rem 3.3rem 0;
+    min-height: clamp(30rem, 68vh, 41rem);
+    background: #FCF8F1;
+    border: 1px solid rgba(33, 29, 25, 0.055);
     box-shadow:
         0 1px 1px rgba(33, 29, 25, 0.05),
-        0 24px 56px -18px rgba(33, 29, 25, 0.26);
-    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
-                box-shadow 0.3s ease,
-                border-color 0.3s ease;
-    animation: zy-rise 0.5s 0.12s cubic-bezier(0.16, 1, 0.3, 1) both;
+        0 26px 56px -26px rgba(33, 29, 25, 0.34);
+    transform: rotate(-0.7deg);
+    animation: zy-pin-up 0.72s cubic-bezier(0.16, 1, 0.3, 1) both;
+    transition: box-shadow 0.4s ease, transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
 }
-@supports ((backdrop-filter: blur(4px)) or (-webkit-backdrop-filter: blur(4px))) {
-    .st-key-zy_auth_card {
-        -webkit-backdrop-filter: blur(14px) saturate(1.1);
-        backdrop-filter: blur(14px) saturate(1.1);
-    }
-}
-/* 表单聚焦时整张卡片轻轻上浮，让"正在填这张卡"有反馈 */
-.st-key-zy_auth_card:focus-within {
-    transform: translateY(-3px);
-    border-color: rgba(194, 72, 27, 0.26);
+.zy-notice:hover {
+    transform: rotate(-0.55deg);
     box-shadow:
-        0 1px 1px rgba(33, 29, 25, 0.04),
-        0 28px 60px -18px rgba(33, 29, 25, 0.24);
+        0 1px 1px rgba(33, 29, 25, 0.05),
+        0 32px 64px -26px rgba(33, 29, 25, 0.38);
 }
-.st-key-zy_auth_card::before {
-    content: "";
+@keyframes zy-pin-up {
+    from { opacity: 0; transform: translateY(22px) rotate(-3.4deg); }
+    to   { opacity: 1; transform: translateY(0) rotate(-0.7deg); }
+}
+
+/* 两条胶带，压在纸的上沿 */
+.zy-tape {
     position: absolute;
-    inset: 0 0 auto 0;
-    height: 1px;
-    border-radius: 20px 20px 0 0;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.95) 22%, rgba(255, 255, 255, 0.95) 78%, transparent);
+    top: -15px;
+    width: 132px;
+    height: 34px;
+    background: rgba(230, 216, 190, 0.62);
+    border: 1px solid rgba(33, 29, 25, 0.055);
+    transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.zy-tape.t1 { left: 3.6rem; transform: rotate(-4deg); }
+.zy-tape.t2 { right: 3.6rem; transform: rotate(3.4deg); }
+.zy-notice:hover .zy-tape.t1 { transform: rotate(-5.4deg) scaleX(1.045); }
+.zy-notice:hover .zy-tape.t2 { transform: rotate(4.6deg) scaleX(1.045); }
+
+.zy-kicker {
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.34em;
+    color: var(--zy-muted);
+}
+
+/* ---------- 大字：逐字落墨 ---------- */
+/* 两套标题叠在同一块位置：a 撑高度，b 绝对覆盖在上面。
+   不用 grid 叠格——全局的 `[data-testid="stMarkdownContainer"] h1`
+   特异性比单类高，会把 grid-area 一起带走，两个标题就上下排成四行。 */
+[data-testid="stMarkdownContainer"] .zy-heads {
+    position: relative;
+    margin-top: 1.5rem;
+}
+[data-testid="stMarkdownContainer"] .zy-headline {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    margin: 0 !important;
+    padding: 0 !important;
+    font-family: var(--zy-serif);
+    font-size: clamp(2.9rem, 5.9vw, 5.5rem) !important;
+    font-weight: 600 !important;
+    line-height: 1.12 !important;
+    letter-spacing: -0.012em;
+    color: var(--zy-ink);
+    transition: opacity 0.34s ease, filter 0.34s ease;
+}
+[data-testid="stMarkdownContainer"] .zy-headline.a {
+    position: relative;
+}
+.zy-headline.b {
+    opacity: 0;
+    filter: blur(7px);
     pointer-events: none;
 }
-.st-key-zy_auth_card [data-testid="stForm"] {
+/* 每行用 flex：逐字 span 是 inline-block，默认按基线对齐，
+   会在行盒底部多撑出一截（实测每行多出 47px）。改成 flex item 就按内容高算。 */
+.zy-l {
+    display: flex;
+}
+.zy-headline .ch {
+    display: inline-block;
+    animation: zy-ink 0.62s cubic-bezier(0.16, 1, 0.3, 1) both;
+    animation-delay: calc(0.16s + var(--i) * 0.052s);
+}
+@keyframes zy-ink {
+    from { opacity: 0; filter: blur(11px); transform: translateY(15px); }
+    to   { opacity: 1; filter: blur(0); transform: translateY(0); }
+}
+
+/* ---------- 正文 ---------- */
+[data-testid="stMarkdownContainer"] .zy-ledes {
+    position: relative;
+    margin-top: 1.9rem;
+}
+[data-testid="stMarkdownContainer"] .zy-lede {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    margin: 0 !important;
+    max-width: 27em;
+    font-size: 1.0625rem;
+    line-height: 2.1;
+    color: var(--zy-muted) !important;
+    transition: opacity 0.34s ease, filter 0.34s ease;
+}
+[data-testid="stMarkdownContainer"] .zy-lede.a {
+    position: relative;
+}
+[data-testid="stMarkdownContainer"] .zy-lede b {
+    font-weight: 600 !important;
+    color: var(--zy-ink) !important;
+}
+.zy-lede.b {
+    opacity: 0;
+    filter: blur(7px);
+    pointer-events: none;
+}
+
+/* 页签落定后，告示跟着换 —— 这是这一页唯一由操作驱动的变化 */
+[data-testid="stAppViewContainer"]:has(
+    [data-testid="stTab"]:nth-child(2)[aria-selected="true"]
+) .zy-headline.a,
+[data-testid="stAppViewContainer"]:has(
+    [data-testid="stTab"]:nth-child(2)[aria-selected="true"]
+) .zy-lede.a {
+    opacity: 0;
+    filter: blur(7px);
+}
+[data-testid="stAppViewContainer"]:has(
+    [data-testid="stTab"]:nth-child(2)[aria-selected="true"]
+) .zy-headline.b,
+[data-testid="stAppViewContainer"]:has(
+    [data-testid="stTab"]:nth-child(2)[aria-selected="true"]
+) .zy-lede.b {
+    opacity: 1;
+    filter: blur(0);
+}
+
+/* ---------- 落款：产品名 + 一枚盖上去的印章 ---------- */
+/* 这一页没有顶栏，品牌名只能落在纸上——告示本来就有落款的位置。
+   印章和面试页的消息头像是同一种记号，不出现人脸的那条决定在这里也成立。 */
+.zy-signoff {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: auto;
+    padding-bottom: 1.35rem;
+}
+.zy-brand {
+    font-family: var(--zy-serif);
+    font-size: 0.9375rem;
+    letter-spacing: 0.13em;
+    color: var(--zy-muted);
+}
+.zy-seal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 46px;
+    border: 1.5px solid rgba(194, 72, 27, 0.62);
+    border-radius: 4px;
+    font-family: var(--zy-serif);
+    font-size: 1.5rem;
+    color: rgba(194, 72, 27, 0.82);
+    transform: rotate(-6deg);
+}
+
+/* ---------- 撕条：整张告示唯一能动手的地方 ---------- */
+.zy-tear {
+    display: flex;
+    margin: 0 -3.3rem 0;
+    padding: 0;
+    height: 8.2rem;
+    border-top: 1px dashed var(--zy-line-strong);
+}
+.zy-tear i {
+    flex: 1 1 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-right: 1px dashed var(--zy-line);
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.75rem;
+    font-style: normal;
+    letter-spacing: 0.3em;
+    writing-mode: vertical-rl;
+    color: var(--zy-faint);
+    cursor: default;
+    transform-origin: top center;
+    transition: transform 0.42s cubic-bezier(0.16, 1, 0.3, 1),
+                background-color 0.42s ease, color 0.42s ease;
+}
+.zy-tear i:last-child { border-right: 0; }
+.zy-tear i.hot {
+    color: var(--zy-accent);
+    background-color: rgba(194, 72, 27, 0.035);
+}
+.zy-tear i:hover {
+    transform: translateY(9px) rotate(0.7deg);
+    background-color: rgba(194, 72, 27, 0.07);
+    color: var(--zy-accent);
+}
+
+/* ---------- 签到卡：斜钉在告示右下 ---------- */
+.st-key-zy_sign_card {
+    position: relative;
+    padding: 2.1rem 2rem 1.9rem;
+    background: #FFFDF9;
+    border: 1px solid rgba(33, 29, 25, 0.07);
+    transform: rotate(1.7deg) translate(-14px, -26px);
+    box-shadow:
+        0 1px 2px rgba(33, 29, 25, 0.06),
+        0 24px 48px -22px rgba(33, 29, 25, 0.34);
+    transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+                box-shadow 0.4s ease;
+    animation: zy-card-in 0.7s 0.1s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes zy-card-in {
+    from { opacity: 0; transform: translate(-14px, -50px) rotate(4.6deg); }
+    to   { opacity: 1; transform: translate(-14px, -26px) rotate(1.7deg); }
+}
+/* 一枚图钉 */
+.st-key-zy_sign_card::before {
+    content: "";
+    position: absolute;
+    top: -12px;
+    left: 50%;
+    width: 24px;
+    height: 24px;
+    margin-left: -12px;
+    border-radius: 50%;
+    background: var(--zy-accent);
+    box-shadow: 0 5px 12px -3px rgba(194, 72, 27, 0.55);
+}
+.st-key-zy_sign_card::after {
+    content: "";
+    position: absolute;
+    top: -4px;
+    left: 50%;
+    width: 8px;
+    height: 8px;
+    margin-left: -4px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.82);
+}
+.st-key-zy_sign_card:focus-within {
+    transform: rotate(1.7deg) translate(-14px, -30px);
+    box-shadow:
+        0 1px 2px rgba(33, 29, 25, 0.05),
+        0 30px 58px -22px rgba(33, 29, 25, 0.32);
+}
+
+.zy-sign-head {
+    margin-bottom: 1.15rem;
+}
+.zy-sign-head h2 {
+    margin: 0;
+    font-family: var(--zy-serif);
+    font-size: 1.625rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: var(--zy-ink);
+}
+.zy-sign-head p {
+    margin: 0.42rem 0 0;
+    font-size: 0.8125rem;
+    line-height: 1.7;
+    color: var(--zy-muted);
+}
+
+.st-key-zy_sign_card [data-testid="stForm"] {
     border: none;
     border-radius: 0;
     box-shadow: none;
     background: transparent;
     padding: 0;
 }
-
-/* 卡片头 */
-.zy-auth-cardhead {
-    margin-bottom: 0.2rem;
+.st-key-zy_sign_card [data-testid="stForm"] [data-testid="stVerticalBlock"] {
+    gap: 0.72rem !important;
 }
-.zy-auth-eyebrow {
-    display: inline-block;
-    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-    font-size: 0.6875rem;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: var(--zy-muted);
-    margin-bottom: 0.55rem;
-}
-[data-testid="stMarkdownContainer"] .zy-auth-cardhead p {
-    margin: 0 0 0.75rem;
-    font-size: 0.875rem;
-    line-height: 1.65;
-    color: var(--zy-muted);
+.st-key-zy_sign_card [data-testid="stVerticalBlock"] {
+    gap: 0.55rem !important;
 }
 
-/* ---------- 分段控件：灰底槽 + 白色滑块 ---------- */
-.st-key-zy_auth_card [role="tablist"] {
+/* ---------- 分段控件：灰槽 + 白滑块 ---------- */
+.st-key-zy_sign_card [role="tablist"] {
     display: flex !important;
     gap: 4px !important;
     padding: 4px !important;
-    margin-bottom: 1.15rem;
-    background: #F1E9DE;
-    border-radius: 12px;
+    margin-bottom: 1.1rem;
+    background: #F1E8DC;
+    border-radius: 11px;
 }
-.st-key-zy_auth_card [data-testid="stTab"] {
+.st-key-zy_sign_card [data-testid="stTab"] {
     flex: 1 1 0 !important;
     justify-content: center !important;
-    padding: 0.55rem 0 !important;
-    border-radius: 9px !important;
+    padding: 0.5rem 0 !important;
+    border-radius: 8px !important;
     color: var(--zy-muted);
     transition: color 0.22s ease;
 }
-.st-key-zy_auth_card [data-testid="stTab"][data-selected="true"] {
+.st-key-zy_sign_card [data-testid="stTab"][data-selected="true"] {
     color: var(--zy-ink);
 }
-.st-key-zy_auth_card [data-testid="stTab"] p {
-    font-size: 0.9375rem !important;
+.st-key-zy_sign_card [data-testid="stTab"] p {
+    font-size: 0.9rem !important;
     font-weight: 600 !important;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.05em;
     margin: 0 !important;
 }
-.st-key-zy_auth_card [data-testid="stTab"] [data-testid="stMarkdownContainer"] {
+.st-key-zy_sign_card [data-testid="stTab"] [data-testid="stMarkdownContainer"] {
     position: relative;
     z-index: 2;
 }
-/* 1.65 的选中指示器是 tab 内部的一条 2px 横线，这里改成整块白色滑块 */
-.st-key-zy_auth_card .react-aria-SelectionIndicator {
+.st-key-zy_sign_card .react-aria-SelectionIndicator {
     top: 0 !important;
     bottom: 0 !important;
     left: 0 !important;
     right: 0 !important;
     width: auto !important;
     height: auto !important;
-    border-radius: 9px !important;
+    border-radius: 8px !important;
     background: #FFFFFF !important;
-    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.10), 0 3px 10px rgba(33, 29, 25, 0.06);
+    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.10), 0 3px 10px rgba(33, 29, 25, 0.05);
     z-index: 1;
     animation: zy-slide-in 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes zy-slide-in {
     from { opacity: 0; transform: scale(0.94); }
-    to { opacity: 1; transform: scale(1); }
+    to   { opacity: 1; transform: scale(1); }
 }
 
-/* ---------- 输入框：只有一条底线 ---------- */
-.st-key-zy_auth_card [data-testid="stWidgetLabel"] {
+/* ---------- 输入：只有一条底线 ---------- */
+.st-key-zy_sign_card [data-testid="stWidgetLabel"] {
     margin-bottom: 0 !important;
 }
-.st-key-zy_auth_card [data-testid="stWidgetLabel"] p {
+.st-key-zy_sign_card [data-testid="stWidgetLabel"] p {
     font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace !important;
     font-size: 0.6875rem !important;
     font-weight: 500 !important;
-    letter-spacing: 0.14em !important;
-    text-transform: uppercase;
+    letter-spacing: 0.22em !important;
     color: var(--zy-muted) !important;
     margin: 0 !important;
 }
-.st-key-zy_auth_card [data-testid="stTextInputRootElement"] {
+.st-key-zy_sign_card [data-testid="stTextInputRootElement"] {
     position: relative;
     align-items: center;
-    min-height: 2.3rem;
+    min-height: 2.15rem;
     background: transparent !important;
     border: none !important;
     border-bottom: 1px solid var(--zy-line-strong) !important;
@@ -2120,12 +2182,12 @@ _LOGIN_CSS = """
     box-shadow: none !important;
     transition: border-color 0.22s ease, box-shadow 0.22s ease;
 }
-.st-key-zy_auth_card [data-testid="stTextInputRootElement"]:focus-within {
+.st-key-zy_sign_card [data-testid="stTextInputRootElement"]:focus-within {
     border-bottom-color: var(--zy-accent) !important;
     box-shadow: 0 1px 0 0 var(--zy-accent) !important;
 }
-.st-key-zy_auth_card [data-testid="stTextInputField"] {
-    height: 2.3rem !important;
+.st-key-zy_sign_card [data-testid="stTextInputField"] {
+    height: 2.15rem !important;
     padding: 0 !important;
     border: none !important;
     outline: none !important;
@@ -2133,64 +2195,60 @@ _LOGIN_CSS = """
     font-size: 0.9375rem !important;
     color: var(--zy-ink) !important;
 }
-/* 焦点反馈统一由底线承担：清掉框架的圆角 focus ring 与英文回车提示 */
-.st-key-zy_auth_card .react-aria-TextField,
-.st-key-zy_auth_card .react-aria-TextField:focus-within {
+.st-key-zy_sign_card .react-aria-TextField,
+.st-key-zy_sign_card .react-aria-TextField:focus-within {
     border: none !important;
     outline: none !important;
     box-shadow: none !important;
     background: transparent !important;
 }
-.st-key-zy_auth_card input:focus,
-.st-key-zy_auth_card input:focus-visible {
+.st-key-zy_sign_card input:focus,
+.st-key-zy_sign_card input:focus-visible {
     outline: none !important;
     box-shadow: none !important;
 }
-.st-key-zy_auth_card [data-testid="InputInstructions"] {
+.st-key-zy_sign_card [data-testid="InputInstructions"] {
     display: none !important;
 }
-/* 密码显隐按钮：贴底线上方居右，不参与输入宽度 */
-.st-key-zy_auth_card [data-testid="stTextInputRootElement"] > div {
+.st-key-zy_sign_card [data-testid="stTextInputRootElement"] > div {
     display: flex;
     align-items: center;
     flex: none;
 }
-.st-key-zy_auth_card [data-testid="stTextInputRootElement"] button {
+.st-key-zy_sign_card [data-testid="stTextInputRootElement"] button {
     border: none !important;
     background: transparent !important;
     box-shadow: none !important;
     padding: 0 0.1rem !important;
     min-height: 0 !important;
-    height: 1.6rem !important;
+    height: 1.5rem !important;
     color: var(--zy-muted) !important;
 }
-.st-key-zy_auth_card [data-testid="stTextInputRootElement"] button:hover {
+.st-key-zy_sign_card [data-testid="stTextInputRootElement"] button:hover {
     color: var(--zy-accent) !important;
 }
-.st-key-zy_auth_card [data-testid="stTextInputField"]::placeholder {
-    color: #A79C8E !important;
+.st-key-zy_sign_card [data-testid="stTextInputField"]::placeholder {
+    /* 原来的 #A79C8E 在 #FFFDF9 上只有 2.5:1，投影上等于没有提示。
+       #7A7167 是 4.8:1，既够读，又明显浅于已输入的黑字。 */
+    color: #7A7167 !important;
     opacity: 1;
 }
-/* 表单内纵向节奏稍微放松，底线输入之间才不挤 */
-.st-key-zy_auth_card [data-testid="stForm"] [data-testid="stVerticalBlock"] {
-    gap: 0.8rem !important;
-}
 
-/* ---------- 主按钮：墨黑底，橙色自左fill ---------- */
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"] {
+/* ---------- 主按钮：墨黑底，橙色自左铺开 ---------- */
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"] {
     position: relative;
     overflow: hidden;
-    height: 2.9rem !important;
-    border-radius: 11px !important;
+    height: 2.75rem !important;
+    border-radius: 8px !important;
     background-color: #1A1512 !important;
     border: 1px solid #1A1512 !important;
     color: #FFFFFF !important;
-    box-shadow: 0 8px 20px -8px rgba(26, 21, 18, 0.55);
+    box-shadow: 0 8px 20px -9px rgba(26, 21, 18, 0.6);
     transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
                 box-shadow 0.22s ease;
-    margin-top: 0.55rem;
+    margin-top: 0.4rem;
 }
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]::before {
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"]::before {
     content: "";
     position: absolute;
     inset: 0;
@@ -2199,59 +2257,64 @@ _LOGIN_CSS = """
     transform-origin: left center;
     transition: transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]:hover::before {
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"]:hover::before {
     transform: scaleX(1);
 }
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"] > div {
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"] > div {
     position: relative;
     z-index: 1;
 }
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"] p {
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"] p {
     font-weight: 600 !important;
-    letter-spacing: 0.1em !important;
+    letter-spacing: 0.12em !important;
 }
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]:hover {
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"]:hover {
     transform: translateY(-1px);
-    box-shadow: 0 12px 26px -8px rgba(194, 72, 27, 0.45);
+    box-shadow: 0 12px 26px -9px rgba(194, 72, 27, 0.5);
 }
-.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]:active {
+.st-key-zy_sign_card [data-testid="stBaseButton-primaryFormSubmit"]:active {
     transform: translateY(0) scale(0.994);
 }
 
-/* 卡片内的提示条：内联消息，不抢标题 */
-.st-key-zy_auth_card [data-testid="stAlert"] {
+/* 卡片内提示条：内联消息，不抢标题 */
+.st-key-zy_sign_card [data-testid="stAlert"] {
     background-color: #FDF4EE !important;
     border: 1px solid rgba(194, 72, 27, 0.18) !important;
-    border-radius: 9px !important;
+    border-radius: 8px !important;
     box-shadow: none !important;
-    margin: 0.2rem 0 0.5rem !important;
-    padding: 0.6rem 0.85rem !important;
+    margin: 0.1rem 0 0.35rem !important;
+    padding: 0.55rem 0.8rem !important;
 }
-.st-key-zy_auth_card [data-testid="stAlert"] p {
+.st-key-zy_sign_card [data-testid="stAlert"] p {
     font-size: 0.8125rem;
     line-height: 1.6;
 }
 
-/* ---------- 演示通行证：一条淡底行 + 文字按钮 ---------- */
-.st-key-zy_auth_pass {
-    margin-top: 0.85rem;
-    padding: 0.8rem 1.05rem 0.6rem;
-    border: 1px solid rgba(33, 29, 25, 0.07);
-    border-radius: 14px;
-    background: rgba(255, 255, 255, 0.5);
+/* ---------- 通行证：另一张更小的纸条，压在卡片下沿 ---------- */
+.st-key-zy_sign_pass {
+    margin-top: 0.4rem;
+    margin-left: 1.4rem;
+    padding: 0.9rem 1.1rem 0.7rem;
+    background: rgba(255, 253, 249, 0.72);
+    border: 1px solid rgba(33, 29, 25, 0.06);
+    transform: rotate(-0.9deg);
+    box-shadow: 0 14px 30px -20px rgba(33, 29, 25, 0.4);
+    transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.st-key-zy_sign_pass:hover {
+    transform: rotate(0deg) translateY(-2px);
 }
 .zy-pass-row {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: 0.75rem;
+    gap: 0.7rem;
     flex-wrap: wrap;
 }
 .zy-pass-tag {
     font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-    font-size: 0.6875rem;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
+    font-size: 0.625rem;
+    letter-spacing: 0.2em;
     color: var(--zy-muted);
 }
 .zy-pass-cred {
@@ -2261,173 +2324,233 @@ _LOGIN_CSS = """
     color: var(--zy-ink);
 }
 [data-testid="stMarkdownContainer"] .zy-pass-note {
-    margin: 0.35rem 0 0.15rem;
+    margin: 0.3rem 0 0.1rem;
     font-size: 0.6875rem;
     line-height: 1.55;
     color: var(--zy-muted);
 }
-.st-key-zy_auth_pass [data-testid="stButton"] button {
+.st-key-zy_sign_pass [data-testid="stButton"] button {
     justify-content: flex-start !important;
     background: transparent !important;
     border: none !important;
     box-shadow: none !important;
-    padding: 0.15rem 0 0.25rem !important;
+    padding: 0.1rem 0 0.2rem !important;
     min-height: 0 !important;
     color: var(--zy-ink) !important;
-    font-size: 0.8125rem !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.04em;
     transition: color 0.2s ease, transform 0.2s ease;
 }
-.st-key-zy_auth_pass [data-testid="stButton"] button:hover {
+.st-key-zy_sign_pass [data-testid="stButton"] button:hover {
     color: var(--zy-accent) !important;
     transform: translateX(3px);
 }
-.st-key-zy_auth_pass [data-testid="stButton"] button p {
+.st-key-zy_sign_pass [data-testid="stButton"] button p {
     font-size: 0.8125rem !important;
     font-weight: 600 !important;
+    letter-spacing: 0.04em;
 }
-.st-key-zy_auth_pass [data-testid="stButton"] button > div {
+.st-key-zy_sign_pass [data-testid="stButton"] button > div {
     justify-content: flex-start !important;
     width: 100%;
 }
 
 /* ---------- 页脚 ---------- */
-[data-testid="stMarkdownContainer"] .zy-auth-legal {
-    margin: 1.5rem 0 0;
-    padding-top: 0.9rem;
-    border-top: 1px solid var(--zy-line);
-    font-size: 0.6875rem;
-    line-height: 1.8;
-    letter-spacing: 0.03em;
+[data-testid="stMarkdownContainer"] .zy-legal {
+    margin: 2rem 0 0 !important;
+    font-size: 0.75rem;
+    line-height: 1.9;
+    letter-spacing: 0.04em;
     color: var(--zy-muted);
 }
-
-/* ---------- 通用入场 ---------- */
-@keyframes zy-rise {
-    from { opacity: 0; transform: translateY(12px); }
-    to { opacity: 1; transform: none; }
-}
-@media (prefers-reduced-motion: reduce) {
-    .zy-auth-hero > *,
-    .st-key-zy_auth_card,
-    .zy-hero-title em {
-        animation: none !important;
-        background-size: 100% 0.26em;
-    }
-    [data-testid="stAppViewContainer"]::before {
-        animation: none !important;
-    }
+[data-testid="stMarkdownContainer"] .zy-legal i {
+    font-style: normal;
+    color: var(--zy-ink);
 }
 
 /* ---------- 矮屏（1366×768 / 投影）：收一档纵向节奏 ---------- */
-@media (max-height: 820px) and (min-width: 981px) {
+@media (max-height: 830px) and (min-width: 981px) {
     .block-container,
     [data-testid="stMainBlockContainer"],
     [data-testid="stMain"] > div:first-child {
-        padding-top: 1.6rem;
+        padding-top: 1.3rem;
     }
-    .zy-auth-nav {
-        margin-bottom: 2rem;
+    .zy-notice {
+        min-height: 27rem;
+        padding: 2.6rem 2.8rem 0;
     }
-    .zy-hero-title {
-        font-size: clamp(2.1rem, 3.4vw, 2.9rem) !important;
+    .zy-headline {
+        font-size: clamp(2.5rem, 4.8vw, 4.2rem) !important;
     }
-    .zy-auth-stats {
-        margin-top: 1.5rem;
-    }
-    .zy-auth-stats > div {
-        padding: 0.8rem 0 0.75rem;
-    }
-    .zy-auth-flow {
-        margin-top: 1.1rem;
-    }
-    .st-key-zy_auth_card {
-        padding: 1.35rem 1.5rem 1.25rem;
-    }
-    [data-testid="stMarkdownContainer"] .zy-auth-legal {
-        margin-top: 1.1rem;
-        padding-top: 0.75rem;
-    }
+    .zy-ledes { margin-top: 1.4rem; }
+    .zy-lede { font-size: 1rem; line-height: 1.95; }
+    .zy-tear { height: 6rem; margin-left: -2.8rem; margin-right: -2.8rem; }
+    .zy-signoff { padding-bottom: 0.85rem; }
+    .zy-seal { width: 38px; height: 38px; font-size: 1.25rem; }
+    .zy-tape.t1 { left: 2.8rem; }
+    .zy-tape.t2 { right: 2.8rem; }
+    .st-key-zy_sign_card { padding: 1.8rem 1.7rem 1.6rem; }
 }
 
-/* ---------- 窄屏：表单先出现，别让人先滚一屏介绍 ---------- */
+/* ---------- 窄屏：卡片先出现，别让人先滚一屏纸 ---------- */
 @media (max-width: 980px) {
     [data-testid="stHorizontalBlock"] {
         flex-direction: column-reverse;
-        gap: 1.6rem;
+        gap: 1.4rem;
     }
     [data-testid="stHorizontalBlock"] > div {
         width: 100% !important;
         flex: 1 1 100% !important;
         min-width: 0 !important;
     }
-    .zy-auth-nav {
-        margin-bottom: 1.6rem;
+    .zy-notice {
+        margin-left: 0;
+        min-height: 0;
+        padding: 2.4rem 1.7rem 0;
+        transform: rotate(-0.4deg);
     }
-    .zy-auth-navmeta {
-        display: none;
+    .zy-headline {
+        font-size: clamp(2.2rem, 8.5vw, 3.2rem) !important;
     }
-    .zy-hero-title {
-        font-size: 2.3rem !important;
+    .zy-lede { font-size: 0.9375rem; line-height: 1.95; }
+    .zy-tear {
+        height: 5.2rem;
+        margin-left: -1.7rem;
+        margin-right: -1.7rem;
     }
-    .zy-auth-stats > div + div {
-        padding-left: 1rem;
+    .zy-signoff { padding-bottom: 1rem; }
+    .zy-tape { width: 92px; height: 28px; top: -12px; }
+    .zy-tape.t1 { left: 1.7rem; }
+    .zy-tape.t2 { right: 1.7rem; }
+    .st-key-zy_sign_card,
+    .st-key-zy_sign_card:focus-within {
+        transform: rotate(0.8deg) translate(0, 0);
+        padding: 1.9rem 1.5rem 1.7rem;
     }
-    .st-key-zy_auth_card {
-        padding: 1.35rem 1.2rem 1.15rem;
+    @keyframes zy-card-in {
+        from { opacity: 0; transform: translate(0, -20px) rotate(2.6deg); }
+        to   { opacity: 1; transform: translate(0, 0) rotate(0.8deg); }
     }
+    .st-key-zy_sign_pass {
+        margin-left: 0;
+        transform: rotate(-0.5deg);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .zy-notice,
+    .zy-headline .ch,
+    .st-key-zy_sign_card,
+    .zy-tear i,
+    .zy-tape,
+    [data-testid="stAppViewContainer"]::before {
+        animation: none !important;
+        transition: none !important;
+    }
+    .zy-notice:hover { transform: rotate(-0.7deg); }
+    .st-key-zy_sign_card,
+    .st-key-zy_sign_card:focus-within { transform: rotate(1.7deg) translate(-14px, -26px); }
 }
 </style>
 """
 
 
+_LOGIN_HEADS = (
+    ("不收简历。", "只收名字。"),
+    ("名字归你。", "档案也归你。"),
+)
+
+_LOGIN_LEDES = (
+    "这里不筛人，只练人。<br>"
+    "你练的每一场，都记在这个名字下面——<br>"
+    "<b>换一个名字，就是另一份档案。</b>",
+    "新开一份档案，从第一场开始记：<br>"
+    "问过什么、卡在哪、<br>"
+    "<b>哪一句答得比上次好。</b>",
+)
+
+
+def _ink_line(text: str, start: int) -> str:
+    """把一行标题拆成逐字 span，`--i` 决定落墨延迟。
+
+    逐字入场是这一页唯一的"表演"：一个 `animation` 按字数铺开，
+    比整块淡入更像纸上的字被一笔笔写出来。标点也占一格，
+    否则句号会提前落定，读起来像话没说完。
+    """
+    chars = "".join(
+        f'<span class="ch" style="--i:{start + i}">{escape(ch)}</span>'
+        for i, ch in enumerate(text)
+    )
+    return f'<span class="zy-l">{chars}</span>'
+
+
+def _login_notice() -> str:
+    """墙上的告示。
+
+    两套标题与两段正文同时写在 DOM 里，靠 `:has()` 跟着页签切换：
+    点「创建账号」，墙上那张纸就换一句话。这是整页唯一由操作驱动的变化，
+    也是把"登录"和"注册"两种心境分开讲的地方——同一句话兼任两件事，
+    两边都讲不清。
+    """
+    heads, idx = [], 0
+    for line in _LOGIN_HEADS[0]:
+        heads.append(_ink_line(line, idx))
+        idx += len(line)
+    head_a = "".join(heads)
+
+    heads, idx = [], 0
+    for line in _LOGIN_HEADS[1]:
+        heads.append(_ink_line(line, idx))
+        idx += len(line)
+    head_b = "".join(heads)
+
+    tear = "".join(
+        '<i class="hot">撕下一条</i>' if i == 2 else "<i>撕下一条</i>"
+        for i in range(6)
+    )
+
+    return (
+        '<div class="zy-notice">'
+        '<span class="zy-tape t1"></span>'
+        '<span class="zy-tape t2"></span>'
+        '<div class="zy-kicker">练 习 生 招 募</div>'
+        f'<div class="zy-heads">'
+        f'<h1 class="zy-headline a">{head_a}</h1>'
+        f'<h1 class="zy-headline b">{head_b}</h1>'
+        f"</div>"
+        f'<div class="zy-ledes">'
+        f'<p class="zy-lede a">{_LOGIN_LEDES[0]}</p>'
+        f'<p class="zy-lede b">{_LOGIN_LEDES[1]}</p>'
+        f"</div>"
+        f'<div class="zy-signoff">'
+        f'<span class="zy-brand">知遇 · AI 虚拟面试官</span>'
+        f'<span class="zy-seal">遇</span>'
+        f"</div>"
+        f'<div class="zy-tear">{tear}</div>'
+        f"</div>"
+    )
+
+
 def render_login() -> None:
     """登录 / 注册页。
 
-    没登录进不来主界面，所以这一页要自己撑住观感：左边一张海报（这是什么、
-    凭什么可信、流程怎么走），右边只有一个动作区（登录或注册）。
+    一张告示贴在墙上，一张签到卡斜钉在它右下角。告示只讲一件事：这里认名字，
+    不认简历，而名字下面挂着这个人的全部练习记录。所以表单不是"网页里长出来
+    的一张卡"，是那张纸的落款处——它必须看起来是贴上去的。
+
+    告示的内容故意不碰面试机制：那些话留给进门之后的首页，那里才需要解释
+    「追问是怎么发生的」。这一页只需要让人愿意写下名字。
     """
     st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
 
-    st.markdown(
-        "<div class=\"zy-auth-nav\">"
-        "<span class=\"zy-auth-mark\">知遇</span>"
-        "<span class=\"zy-auth-navmeta\">AI Interview Agent</span>"
-        "<i></i>"
-        "<span class=\"zy-auth-navright\">本机部署 · 数据不出机器</span>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    left, right = st.columns([1.08, 1], gap="large")
+    left, right = st.columns([1.58, 1], gap="large")
 
     with left:
-        st.markdown(
-            "<div class=\"zy-auth-hero\">"
-            "<h1 class=\"zy-hero-title\">把每一次面试<br>练到<em>不慌</em>。</h1>"
-            "<p class=\"zy-hero-lede\">按岗位出题，顺着你的话往下追，答得浅就再挖一层。"
-            "<br>结束给一份能照着改的复盘。</p>"
-            "<div class=\"zy-auth-stats\">"
-            "<div><b>318</b><span>条判分参照</span></div>"
-            "<div><b>726</b><span>项离线用例</span></div>"
-            "<div><b>¥0.02</b><span>单场成本</span></div>"
-            "</div>"
-            "<div class=\"zy-auth-flow\">"
-            "<span>出题</span><i></i><span>追问</span><i></i><span>复盘</span>"
-            "</div>"
-            "<p class=\"zy-auth-flow-note\">账号之间互不可见：历史、评分、逐字稿归各自所有。</p>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(_login_notice(), unsafe_allow_html=True)
 
     with right:
-        with st.container(key="zy_auth_card"):
+        with st.container(key="zy_sign_card"):
             st.markdown(
-                "<div class=\"zy-auth-cardhead\">"
-                "<div class=\"zy-auth-eyebrow\">登录 / 注册</div>"
-                "<p>登录后，面试历史与评分只属于这个账号。</p>"
-                "</div>",
+                '<div class="zy-sign-head"><h2>签到</h2>'
+                "<p>把名字写在这儿。</p></div>",
                 unsafe_allow_html=True,
             )
             _flush_flash()
@@ -2445,7 +2568,7 @@ def render_login() -> None:
                         "密码", type="password", key="login_password", placeholder="至少 6 位"
                     )
                     submitted = st.form_submit_button(
-                        "登录", type="primary", use_container_width=True
+                        "进 场", type="primary", use_container_width=True
                     )
                 if submitted:
                     user = auth.authenticate(BASE_DIR, account, password)
@@ -2484,7 +2607,7 @@ def render_login() -> None:
                             placeholder="本次演示需要口令，向主办方索取",
                         )
                     registered = st.form_submit_button(
-                        "创建账号", type="primary", use_container_width=True
+                        "开 一 份", type="primary", use_container_width=True
                     )
                 if registered:
                     if access_code_box is not None and not auth.verify_access_code(
@@ -2506,7 +2629,7 @@ def render_login() -> None:
                             else:
                                 _complete_login(user["account"], "账号已创建。")
 
-        with st.container(key="zy_auth_pass"):
+        with st.container(key="zy_sign_pass"):
             st.markdown(
                 f"<div class=\"zy-pass-row\">"
                 f"<span class=\"zy-pass-tag\">演示通行证</span>"
@@ -2515,7 +2638,7 @@ def render_login() -> None:
                 f"<p class=\"zy-pass-note\">公开账号，谁都能进，别往里放真实内容。</p>",
                 unsafe_allow_html=True,
             )
-            if st.button("用演示账号进入 →", key="zy_demo_login", use_container_width=True):
+            if st.button("用演示账号直接进 →", key="zy_demo_login", use_container_width=True):
                 user = auth.authenticate(BASE_DIR, auth.DEMO_ACCOUNT, auth.DEMO_PASSWORD)
                 if user is None:
                     st.error("演示账号不存在，请重启程序自动重建。")
@@ -2523,11 +2646,10 @@ def render_login() -> None:
                     _complete_login(user["account"], "已用演示账号进入。")
 
     st.markdown(
-        "<p class=\"zy-auth-legal\">账号只存在这台机器上，换设备要重新注册；"
-        "忘记密码请找管理员重置。</p>",
+        '<p class="zy-legal">账号和练习记录都留在这台电脑上，换设备要重新注册；'
+        "<i>忘记密码只能找管理员重置。</i></p>",
         unsafe_allow_html=True,
     )
-
 
 def _seed_cloud_users() -> None:
     """从 Streamlit Secrets 的 `[ZY_USERS]` 表恢复预置账号。
