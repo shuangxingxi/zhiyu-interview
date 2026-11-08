@@ -1305,169 +1305,277 @@ def _logout() -> None:
 _LOGIN_CSS = """
 <style>
 /* ============================================================
-   登录页 —— 期刊封面式双栏
-   左：巨型衬线刊名 + 目录式要点（纯装饰，一眼看清这是什么）
-   右：白色卡片承载登录 / 注册（唯一的操作区）
-   这一整套样式只在未登录时注入，登录成功后随页面一起消失，
-   所以可以直接改 .block-container 这类全局选择器而不影响主界面。
+   登录页 v2 —— 「留白 · 光斑 · 分段控件」
+   版式：海报式左侧（品牌 + 数据 + 流程），右侧一张悬浮卡片
+   交互：背景光斑漂移 / 分段滑块 / 底线输入 / 按钮填充 / 聚焦抬升
+   注意：Streamlit 1.65 已改用 react-aria，tab 不再有 data-baseweb，
+        选择器全部按 stTab / SelectionIndicator / stTextInputRootElement 写。
    ============================================================ */
 [data-testid="stHeader"] {
     background-color: transparent !important;
     border-bottom: none !important;
 }
-/* 登录页是"产品第一屏"，不该露出开发工具条 */
 [data-testid="stAppDeployButton"],
 [data-testid="stToolbar"] {
     display: none !important;
 }
+
+/* ---------- 背景：两团暖光 + 点阵，缓慢呼吸 ---------- */
+[data-testid="stAppViewContainer"]::before {
+    content: "";
+    position: fixed;
+    inset: -18vh -12vw;
+    pointer-events: none;
+    z-index: 0;
+    background:
+        radial-gradient(50rem 34rem at 26% 12%, rgba(194, 72, 27, 0.22), transparent 74%),
+        radial-gradient(44rem 30rem at 84% 84%, rgba(198, 126, 60, 0.18), transparent 72%);
+    animation: zy-gradient-drift 24s ease-in-out infinite alternate;
+}
+[data-testid="stAppViewContainer"]::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    /* 均匀铺一层极淡点阵当纸纹；不做径向遮罩——遮罩边缘会在光斑下露出圆弧 */
+    opacity: 0.16;
+    background-image: radial-gradient(rgba(33, 29, 25, 0.22) 1px, transparent 1px);
+    background-size: 24px 24px;
+}
+/* 让纸底由 stAppViewContainer 提供：stMain 若铺不透明底色，会把光斑整层盖住。
+   同时抬一层 z-index，光斑才落在内容下面而不是内容之上。 */
+[data-testid="stMain"] {
+    position: relative;
+    z-index: 1;
+    background-color: transparent !important;
+}
+
+@keyframes zy-gradient-drift {
+    from { transform: translate3d(0, 0, 0) scale(1); }
+    to { transform: translate3d(2.2%, -2.4%, 0) scale(1.06); }
+}
+
 .block-container,
 [data-testid="stMainBlockContainer"],
 [data-testid="stMain"] > div:first-child {
-    max-width: 1160px;
-    padding-top: clamp(2.75rem, 6vh, 4.5rem);
-    padding-bottom: 2rem;
+    max-width: 1200px !important;
+    padding-top: clamp(2.4rem, 8.5vh, 6rem);
+    padding-bottom: 1.5rem;
 }
 
-/* ---------- 页眉：一条细线加两端小字，像期刊页眉 ---------- */
-.zy-auth-mast {
+/* ---------- 顶部导航：一枚圆点 + 一条发丝线 ---------- */
+.zy-auth-nav {
     display: flex;
     align-items: center;
-    gap: 0.9rem;
-    margin: 0 0 2rem;
+    gap: 1.15rem;
+    margin-bottom: clamp(2.2rem, 6vh, 4rem);
 }
-.zy-auth-mast span {
-    font-size: 0.7rem;
-    font-weight: 500;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    /* 用 muted 而不是 faint：#9A9184 在纸底上只有约 2.7:1，小字看不清 */
-    color: var(--zy-muted);
+.zy-auth-mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--zy-serif);
+    font-size: 1.0625rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--zy-ink);
     white-space: nowrap;
 }
-.zy-auth-mast i {
+.zy-auth-mark::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--zy-accent);
+    box-shadow: 0 0 0 4px rgba(194, 72, 27, 0.12);
+}
+.zy-auth-nav i {
     flex: 1;
     height: 1px;
     background: var(--zy-line-strong);
 }
-
-/* ---------- 左栏 ---------- */
-.zy-auth-bar {
-    width: 46px;
-    height: 3px;
-    background: var(--zy-accent);
-    border-radius: 2px;
-    margin-bottom: 1.6rem;
-}
-.zy-auth-kicker {
-    font-size: 0.75rem;
-    font-weight: 500;
-    letter-spacing: 0.04em;
+.zy-auth-navmeta {
+    margin-right: 0.15rem;
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
     color: var(--zy-muted);
-    margin-bottom: 1.15rem;
+    white-space: nowrap;
 }
-[data-testid="stMarkdownContainer"] .zy-auth-word {
-    font-family: var(--zy-serif);
-    font-size: clamp(3rem, 5vw, 4.25rem);
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    line-height: 1.06;
-    color: var(--zy-ink);
+.zy-auth-navright {
+    font-size: 0.6875rem;
+    letter-spacing: 0.1em;
+    color: var(--zy-muted);
+    white-space: nowrap;
+}
+
+/* ---------- 左栏：海报 ---------- */
+.zy-auth-hero > * {
+    animation: zy-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.zy-auth-hero > *:nth-child(1) { animation-delay: 0.02s; }
+.zy-auth-hero > *:nth-child(2) { animation-delay: 0.10s; }
+.zy-auth-hero > *:nth-child(3) { animation-delay: 0.18s; }
+.zy-auth-hero > *:nth-child(4) { animation-delay: 0.26s; }
+.zy-auth-hero > *:nth-child(5) { animation-delay: 0.34s; }
+.zy-auth-hero > *:nth-child(6) { animation-delay: 0.40s; }
+
+[data-testid="stMarkdownContainer"] .zy-hero-kicker {
+    display: inline-block;
+    margin: 0 0 1.15rem;
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--zy-accent);
+}
+[data-testid="stMarkdownContainer"] .zy-hero-title {
     margin: 0;
+    font-family: var(--zy-serif);
+    font-size: clamp(2.6rem, 4.6vw, 4.15rem);
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: -0.022em;
+    color: var(--zy-ink);
 }
-.zy-auth-word em {
+.zy-hero-title em {
     font-style: normal;
     color: var(--zy-accent);
+    /* 高亮用背景块画在文字下沿，比伪元素省掉一个层叠上下文 */
+    background-image: linear-gradient(rgba(194, 72, 27, 0.13), rgba(194, 72, 27, 0.13));
+    background-repeat: no-repeat;
+    background-position: left 92%;
+    background-size: 0% 0.26em;
+    animation: zy-underline 0.55s 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
-[data-testid="stMarkdownContainer"] .zy-auth-lede {
-    font-family: var(--zy-serif);
-    font-size: clamp(1.05rem, 1.4vw, 1.25rem);
-    font-weight: 500;
-    line-height: 1.7;
-    color: var(--zy-ink);
-    margin: 1.2rem 0 0;
-    /* 父级不要限宽：限了会把里面的副文案一起挤窄（原来副文案只剩 18 字/行） */
+@keyframes zy-underline {
+    to { background-size: 100% 0.26em; }
 }
-[data-testid="stMarkdownContainer"] .zy-auth-lede span {
-    display: block;
-    font-family: var(--zy-sans);
+[data-testid="stMarkdownContainer"] .zy-hero-lede {
+    margin: 1.15rem 0 0;
     font-size: 0.9375rem;
-    font-weight: 400;
-    line-height: 1.8;
+    line-height: 1.85;
     color: var(--zy-muted);
-    margin-top: 0.55rem;
-    max-width: 30em;
+    max-width: 26em;
 }
-.zy-auth-list {
-    list-style: none;
-    margin: 1.9rem 0 0;
-    padding: 0;
-    max-width: 33rem;
-}
-.zy-auth-list li {
-    display: grid;
-    grid-template-columns: 2.1rem 1fr;
-    gap: 0 0.9rem;
-    padding: 0.85rem 0;
+
+/* ---------- 数据条：三个数字，竖线分隔 ---------- */
+.zy-auth-stats {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin-top: clamp(1.8rem, 4.5vh, 2.8rem);
     border-top: 1px solid var(--zy-line);
-}
-.zy-auth-list li:last-child {
     border-bottom: 1px solid var(--zy-line);
 }
-.zy-auth-idx {
-    font-size: 0.75rem;
-    font-weight: 500;
-    letter-spacing: 0.02em;
-    color: var(--zy-accent);
-    padding-top: 0.35rem;
+.zy-auth-stats > div {
+    flex: 1 1 0;
+    padding: 1.05rem 0 1rem;
 }
-[data-testid="stMarkdownContainer"] .zy-auth-list h4 {
-    margin: 0 0 0.3rem;
+.zy-auth-stats > div + div {
+    border-left: 1px solid var(--zy-line);
+    padding-left: 1.35rem;
+}
+.zy-auth-stats b {
+    display: block;
     font-family: var(--zy-serif);
-    font-size: 1.0625rem;
+    font-size: clamp(1.35rem, 1.9vw, 1.7rem);
     font-weight: 600;
-    letter-spacing: 0.01em;
+    line-height: 1.1;
+    letter-spacing: -0.01em;
     color: var(--zy-ink);
+    font-variant-numeric: tabular-nums;
+    transition: color 0.2s ease;
 }
-[data-testid="stMarkdownContainer"] .zy-auth-list p {
-    margin: 0;
-    font-size: 0.875rem;
-    line-height: 1.75;
-    color: var(--zy-muted);
+.zy-auth-stats > div:hover b {
+    color: var(--zy-accent);
 }
-.zy-auth-foot {
-    display: flex;
-    align-items: center;
-    gap: 0.9rem;
-    margin-top: 1.6rem;
-}
-.zy-auth-seal {
-    flex: none;
-    font-family: var(--zy-serif);
-    font-size: 0.8125rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    line-height: 1;
-    color: #FFFFFF;
-    background: var(--zy-accent);
-    border-radius: 5px;
-    padding: 0.55rem 0.6rem;
-}
-.zy-auth-fine {
+.zy-auth-stats span {
+    display: block;
+    margin-top: 0.4rem;
     font-size: 0.75rem;
-    line-height: 1.65;
     letter-spacing: 0.04em;
     color: var(--zy-muted);
 }
 
-/* ---------- 右栏卡片（st.container(key="zy_auth_card") 自动挂这个类）---------- */
-.st-key-zy_auth_card {
-    background-color: var(--zy-surface);
-    border: 1px solid var(--zy-line);
-    border-radius: 16px;
-    padding: 1.75rem 1.75rem 1.65rem;
-    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.05);
+/* ---------- 流程条：出题 → 追问 → 复盘 ---------- */
+.zy-auth-flow {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-top: 1.5rem;
+    flex-wrap: wrap;
 }
-/* 卡片内部不要再套一层表单边框——那是"卡片套卡片" */
+.zy-auth-flow span {
+    font-size: 0.8125rem;
+    letter-spacing: 0.06em;
+    color: var(--zy-ink);
+}
+.zy-auth-flow i {
+    position: relative;
+    width: 2.2rem;
+    height: 1px;
+    background: #C9BFB0;
+}
+.zy-auth-flow i::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    top: -2px;
+    width: 5px;
+    height: 5px;
+    border-top: 1px solid #C9BFB0;
+    border-right: 1px solid #C9BFB0;
+    transform: rotate(45deg);
+}
+.zy-auth-flow-note {
+    margin: 1.05rem 0 0 !important;
+    font-size: 0.75rem;
+    line-height: 1.7;
+    letter-spacing: 0.02em;
+    color: var(--zy-muted);
+}
+
+/* ---------- 右栏卡片 ---------- */
+.st-key-zy_auth_card {
+    background: rgba(255, 255, 255, 0.985);
+    border: 1px solid rgba(33, 29, 25, 0.08);
+    border-radius: 20px;
+    padding: 1.6rem 1.7rem 1.5rem;
+    position: relative;
+    box-shadow:
+        0 1px 1px rgba(33, 29, 25, 0.05),
+        0 24px 56px -18px rgba(33, 29, 25, 0.26);
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+                box-shadow 0.3s ease,
+                border-color 0.3s ease;
+    animation: zy-rise 0.5s 0.12s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@supports ((backdrop-filter: blur(4px)) or (-webkit-backdrop-filter: blur(4px))) {
+    .st-key-zy_auth_card {
+        -webkit-backdrop-filter: blur(14px) saturate(1.1);
+        backdrop-filter: blur(14px) saturate(1.1);
+    }
+}
+/* 表单聚焦时整张卡片轻轻上浮，让"正在填这张卡"有反馈 */
+.st-key-zy_auth_card:focus-within {
+    transform: translateY(-3px);
+    border-color: rgba(194, 72, 27, 0.26);
+    box-shadow:
+        0 1px 1px rgba(33, 29, 25, 0.04),
+        0 28px 60px -18px rgba(33, 29, 25, 0.24);
+}
+.st-key-zy_auth_card::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    border-radius: 20px 20px 0 0;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.95) 22%, rgba(255, 255, 255, 0.95) 78%, transparent);
+    pointer-events: none;
+}
 .st-key-zy_auth_card [data-testid="stForm"] {
     border: none;
     border-radius: 0;
@@ -1475,62 +1583,220 @@ _LOGIN_CSS = """
     background: transparent;
     padding: 0;
 }
+
+/* 卡片头 */
 .zy-auth-cardhead {
-    margin-bottom: 0.35rem;
+    margin-bottom: 0.2rem;
 }
 .zy-auth-eyebrow {
-    font-size: 0.75rem;
-    font-weight: 500;
-    letter-spacing: 0.04em;
-    color: var(--zy-accent);
-    margin-bottom: 0.6rem;
+    display: inline-block;
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--zy-muted);
+    margin-bottom: 0.55rem;
 }
 [data-testid="stMarkdownContainer"] .zy-auth-cardhead p {
-    margin: 0 0 0.9rem;
+    margin: 0 0 0.75rem;
     font-size: 0.875rem;
-    line-height: 1.7;
+    line-height: 1.65;
     color: var(--zy-muted);
 }
-/* 页签收紧成两个等宽切换项，别像主界面那样铺开 */
-.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-list"] {
-    gap: 0;
-    margin-bottom: 0.5rem;
+
+/* ---------- 分段控件：灰底槽 + 白色滑块 ---------- */
+.st-key-zy_auth_card [role="tablist"] {
+    display: flex !important;
+    gap: 4px !important;
+    padding: 4px !important;
+    margin-bottom: 1.15rem;
+    background: #F1E9DE;
+    border-radius: 12px;
 }
-.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-list"] button[role="tab"] {
-    padding: 0.45rem 0;
-    margin-right: 1.75rem;
-    font-size: 0.9375rem;
+.st-key-zy_auth_card [data-testid="stTab"] {
+    flex: 1 1 0 !important;
+    justify-content: center !important;
+    padding: 0.55rem 0 !important;
+    border-radius: 9px !important;
+    color: var(--zy-muted);
+    transition: color 0.22s ease;
+}
+.st-key-zy_auth_card [data-testid="stTab"][data-selected="true"] {
+    color: var(--zy-ink);
+}
+.st-key-zy_auth_card [data-testid="stTab"] p {
+    font-size: 0.9375rem !important;
+    font-weight: 600 !important;
     letter-spacing: 0.04em;
+    margin: 0 !important;
 }
-.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-highlight"],
-.st-key-zy_auth_card [data-testid="stTabs"] [data-baseweb="tab-border"] {
-    display: none;
+.st-key-zy_auth_card [data-testid="stTab"] [data-testid="stMarkdownContainer"] {
+    position: relative;
+    z-index: 2;
 }
-/* 卡片内的提示条压成"表单内联消息"，不抢标题的位置 */
-.st-key-zy_auth_card [data-testid="stAlert"] {
-    background-color: #FBF7F0 !important;
-    border-left-width: 3px !important;
-    box-shadow: none !important;
-    margin: 0.35rem 0 0.75rem !important;
-    padding: 0.65rem 0.9rem !important;
+/* 1.65 的选中指示器是 tab 内部的一条 2px 横线，这里改成整块白色滑块 */
+.st-key-zy_auth_card .react-aria-SelectionIndicator {
+    top: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: auto !important;
+    height: auto !important;
+    border-radius: 9px !important;
+    background: #FFFFFF !important;
+    box-shadow: 0 1px 2px rgba(33, 29, 25, 0.10), 0 3px 10px rgba(33, 29, 25, 0.06);
+    z-index: 1;
+    animation: zy-slide-in 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-.st-key-zy_auth_card [data-testid="stAlert"] p {
-    font-size: 0.875rem;
-    line-height: 1.6;
-}
-/* 占位符用 muted 而不是全局的 faint：faint 在白底上不到 3:1，读不出来 */
-.st-key-zy_auth_card [data-testid="stTextInput"] input::placeholder {
-    color: var(--zy-muted) !important;
-    opacity: 1;
+@keyframes zy-slide-in {
+    from { opacity: 0; transform: scale(0.94); }
+    to { opacity: 1; transform: scale(1); }
 }
 
-/* ---------- 演示通行证：虚线框，一眼看出是"凭证"不是表单 ---------- */
+/* ---------- 输入框：只有一条底线 ---------- */
+.st-key-zy_auth_card [data-testid="stWidgetLabel"] {
+    margin-bottom: 0 !important;
+}
+.st-key-zy_auth_card [data-testid="stWidgetLabel"] p {
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace !important;
+    font-size: 0.6875rem !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.14em !important;
+    text-transform: uppercase;
+    color: var(--zy-muted) !important;
+    margin: 0 !important;
+}
+.st-key-zy_auth_card [data-testid="stTextInputRootElement"] {
+    position: relative;
+    align-items: center;
+    min-height: 2.3rem;
+    background: transparent !important;
+    border: none !important;
+    border-bottom: 1px solid var(--zy-line-strong) !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    transition: border-color 0.22s ease, box-shadow 0.22s ease;
+}
+.st-key-zy_auth_card [data-testid="stTextInputRootElement"]:focus-within {
+    border-bottom-color: var(--zy-accent) !important;
+    box-shadow: 0 1px 0 0 var(--zy-accent) !important;
+}
+.st-key-zy_auth_card [data-testid="stTextInputField"] {
+    height: 2.3rem !important;
+    padding: 0 !important;
+    border: none !important;
+    outline: none !important;
+    background: transparent !important;
+    font-size: 0.9375rem !important;
+    color: var(--zy-ink) !important;
+}
+/* 焦点反馈统一由底线承担：清掉框架的圆角 focus ring 与英文回车提示 */
+.st-key-zy_auth_card .react-aria-TextField,
+.st-key-zy_auth_card .react-aria-TextField:focus-within {
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+}
+.st-key-zy_auth_card input:focus,
+.st-key-zy_auth_card input:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
+}
+.st-key-zy_auth_card [data-testid="InputInstructions"] {
+    display: none !important;
+}
+/* 密码显隐按钮：贴底线上方居右，不参与输入宽度 */
+.st-key-zy_auth_card [data-testid="stTextInputRootElement"] > div {
+    display: flex;
+    align-items: center;
+    flex: none;
+}
+.st-key-zy_auth_card [data-testid="stTextInputRootElement"] button {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 0 0.1rem !important;
+    min-height: 0 !important;
+    height: 1.6rem !important;
+    color: var(--zy-muted) !important;
+}
+.st-key-zy_auth_card [data-testid="stTextInputRootElement"] button:hover {
+    color: var(--zy-accent) !important;
+}
+.st-key-zy_auth_card [data-testid="stTextInputField"]::placeholder {
+    color: #A79C8E !important;
+    opacity: 1;
+}
+/* 表单内纵向节奏稍微放松，底线输入之间才不挤 */
+.st-key-zy_auth_card [data-testid="stForm"] [data-testid="stVerticalBlock"] {
+    gap: 0.8rem !important;
+}
+
+/* ---------- 主按钮：墨黑底，橙色自左fill ---------- */
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"] {
+    position: relative;
+    overflow: hidden;
+    height: 2.9rem !important;
+    border-radius: 11px !important;
+    background-color: #1A1512 !important;
+    border: 1px solid #1A1512 !important;
+    color: #FFFFFF !important;
+    box-shadow: 0 8px 20px -8px rgba(26, 21, 18, 0.55);
+    transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
+                box-shadow 0.22s ease;
+    margin-top: 0.55rem;
+}
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: var(--zy-accent);
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]:hover::before {
+    transform: scaleX(1);
+}
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"] > div {
+    position: relative;
+    z-index: 1;
+}
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"] p {
+    font-weight: 600 !important;
+    letter-spacing: 0.1em !important;
+}
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 26px -8px rgba(194, 72, 27, 0.45);
+}
+.st-key-zy_auth_card [data-testid="stBaseButton-primaryFormSubmit"]:active {
+    transform: translateY(0) scale(0.994);
+}
+
+/* 卡片内的提示条：内联消息，不抢标题 */
+.st-key-zy_auth_card [data-testid="stAlert"] {
+    background-color: #FDF4EE !important;
+    border: 1px solid rgba(194, 72, 27, 0.18) !important;
+    border-left-width: 3px !important;
+    border-radius: 9px !important;
+    box-shadow: none !important;
+    margin: 0.2rem 0 0.5rem !important;
+    padding: 0.6rem 0.85rem !important;
+}
+.st-key-zy_auth_card [data-testid="stAlert"] p {
+    font-size: 0.8125rem;
+    line-height: 1.6;
+}
+
+/* ---------- 演示通行证：一条淡底行 + 文字按钮 ---------- */
 .st-key-zy_auth_pass {
-    margin-top: 0.9rem;
-    padding: 0.9rem 1.15rem 1rem;
-    border: 1px dashed var(--zy-line-strong);
+    margin-top: 0.85rem;
+    padding: 0.8rem 1.05rem 0.6rem;
+    border: 1px solid rgba(33, 29, 25, 0.07);
     border-radius: 14px;
-    background-color: #FBF7F0;
+    background: rgba(255, 255, 255, 0.5);
 }
 .zy-pass-row {
     display: flex;
@@ -1540,127 +1806,134 @@ _LOGIN_CSS = """
     flex-wrap: wrap;
 }
 .zy-pass-tag {
-    font-size: 0.75rem;
-    font-weight: 500;
-    letter-spacing: 0.04em;
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
     color: var(--zy-muted);
 }
 .zy-pass-cred {
     font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-    font-size: 0.8125rem;
+    font-size: 0.75rem;
     letter-spacing: 0.02em;
     color: var(--zy-ink);
-    background: transparent;
 }
 [data-testid="stMarkdownContainer"] .zy-pass-note {
-    margin: 0.5rem 0 0.75rem;
-    font-size: 0.75rem;
-    line-height: 1.6;
+    margin: 0.35rem 0 0.15rem;
+    font-size: 0.6875rem;
+    line-height: 1.55;
     color: var(--zy-muted);
 }
 .st-key-zy_auth_pass [data-testid="stButton"] button {
-    background-color: transparent !important;
-    border: 1px solid var(--zy-line-strong) !important;
+    justify-content: flex-start !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0.15rem 0 0.25rem !important;
+    min-height: 0 !important;
     color: var(--zy-ink) !important;
-    font-size: 0.875rem;
-    font-weight: 600;
+    font-size: 0.8125rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.04em;
+    transition: color 0.2s ease, transform 0.2s ease;
 }
 .st-key-zy_auth_pass [data-testid="stButton"] button:hover {
-    border-color: var(--zy-accent) !important;
     color: var(--zy-accent) !important;
-    background-color: var(--zy-accent-soft) !important;
+    transform: translateX(3px);
+}
+.st-key-zy_auth_pass [data-testid="stButton"] button p {
+    font-size: 0.8125rem !important;
+    font-weight: 600 !important;
+}
+.st-key-zy_auth_pass [data-testid="stButton"] button > div {
+    justify-content: flex-start !important;
+    width: 100%;
 }
 
-/* ---------- 页脚小字 ---------- */
+/* ---------- 页脚 ---------- */
 [data-testid="stMarkdownContainer"] .zy-auth-legal {
-    margin: 1.75rem 0 0;
-    padding-top: 1rem;
+    margin: 1.5rem 0 0;
+    padding-top: 0.9rem;
     border-top: 1px solid var(--zy-line);
-    font-size: 0.75rem;
+    font-size: 0.6875rem;
     line-height: 1.8;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.03em;
     color: var(--zy-muted);
 }
-[data-testid="stMarkdownContainer"] .zy-auth-legal code {
-    background: #F1EADF;
-    border-radius: 4px;
-    padding: 0.1rem 0.3rem;
-    font-size: 0.72rem;
-    color: var(--zy-accent-deep);
-}
 
-/* ---------- 入场：只给左栏做，卡片不参与（提交时重播会闪） ---------- */
-@keyframes zy-auth-in {
-    from {
-        opacity: 0;
-        transform: translateY(9px);
-    }
-    to {
-        opacity: 1;
-        transform: none;
-    }
-}
-.zy-auth-panel {
-    animation: zy-auth-in 0.36s cubic-bezier(0.16, 1, 0.3, 1) both;
+/* ---------- 通用入场 ---------- */
+@keyframes zy-rise {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-    .zy-auth-panel {
-        animation: none;
+    .zy-auth-hero > *,
+    .st-key-zy_auth_card,
+    .zy-hero-title em {
+        animation: none !important;
+        background-size: 100% 0.26em;
+    }
+    [data-testid="stAppViewContainer"]::before {
+        animation: none !important;
     }
 }
 
-/* ---------- 矮屏（1366×768 这类笔记本 / 投影）：收一档纵向节奏，
-   让品牌区也能落在首屏里，不用滚一下才看到印章 ---------- */
-@media (max-height: 820px) and (min-width: 901px) {
+/* ---------- 矮屏（1366×768 / 投影）：收一档纵向节奏 ---------- */
+@media (max-height: 820px) and (min-width: 981px) {
     .block-container,
     [data-testid="stMainBlockContainer"],
     [data-testid="stMain"] > div:first-child {
-        padding-top: 2.35rem;
+        padding-top: 1.6rem;
     }
-    .zy-auth-mast {
-        margin-bottom: 1.5rem;
+    .zy-auth-nav {
+        margin-bottom: 2rem;
     }
-    .zy-auth-list {
-        margin-top: 1.4rem;
+    .zy-hero-title {
+        font-size: clamp(2.1rem, 3.4vw, 2.9rem) !important;
     }
-    .zy-auth-list li {
-        padding: 0.65rem 0;
+    .zy-auth-stats {
+        margin-top: 1.5rem;
     }
-    .zy-auth-foot {
-        margin-top: 1.15rem;
+    .zy-auth-stats > div {
+        padding: 0.8rem 0 0.75rem;
+    }
+    .zy-auth-flow {
+        margin-top: 1.1rem;
+    }
+    .st-key-zy_auth_card {
+        padding: 1.35rem 1.5rem 1.25rem;
     }
     [data-testid="stMarkdownContainer"] .zy-auth-legal {
-        margin-top: 1.25rem;
-        padding-top: 0.85rem;
+        margin-top: 1.1rem;
+        padding-top: 0.75rem;
     }
 }
 
-/* ---------- 窄屏：Streamlit 的列默认不堆叠，这里手动反序 ----------
-   反序是为了让表单先出现：手机上不该先滚过一整屏品牌介绍才看到登录框。 */
-@media (max-width: 900px) {
+/* ---------- 窄屏：表单先出现，别让人先滚一屏介绍 ---------- */
+@media (max-width: 980px) {
     [data-testid="stHorizontalBlock"] {
         flex-direction: column-reverse;
-        gap: 1.75rem;
+        gap: 1.6rem;
     }
     [data-testid="stHorizontalBlock"] > div {
         width: 100% !important;
         flex: 1 1 100% !important;
         min-width: 0 !important;
     }
-    .zy-auth-mast {
-        margin-bottom: 1.75rem;
+    .zy-auth-nav {
+        margin-bottom: 1.6rem;
     }
-    .zy-auth-word {
-        font-size: 3rem;
+    .zy-auth-navmeta {
+        display: none;
     }
-    .zy-auth-list {
-        margin-top: 1.75rem;
+    .zy-hero-title {
+        font-size: 2.3rem !important;
     }
-    .zy-auth-foot {
-        margin-top: 1.5rem;
+    .zy-auth-stats > div + div {
+        padding-left: 1rem;
     }
     .st-key-zy_auth_card {
-        padding: 1.4rem 1.25rem 1.25rem;
+        padding: 1.35rem 1.2rem 1.15rem;
     }
 }
 </style>
@@ -1670,48 +1943,39 @@ _LOGIN_CSS = """
 def render_login() -> None:
     """登录 / 注册页。
 
-    没登录进不来主界面，所以这一页要自己撑住观感：左边立牌（这是什么、
-    凭什么可信），右边只有一个动作区（登录或注册）。
+    没登录进不来主界面，所以这一页要自己撑住观感：左边一张海报（这是什么、
+    凭什么可信、流程怎么走），右边只有一个动作区（登录或注册）。
     """
     st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
 
     st.markdown(
-        "<div class=\"zy-auth-mast\">"
-        "<span>AI Interview Agent</span>"
+        "<div class=\"zy-auth-nav\">"
+        "<span class=\"zy-auth-mark\">知遇</span>"
+        "<span class=\"zy-auth-navmeta\">AI Interview Agent</span>"
         "<i></i>"
-        "<span>本机部署 · 数据不出机器</span>"
+        "<span class=\"zy-auth-navright\">本机部署 · 数据不出机器</span>"
         "</div>",
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns([1.14, 1], gap="large")
+    left, right = st.columns([1.08, 1], gap="large")
 
     with left:
         st.markdown(
-            "<div class=\"zy-auth-panel\">"
-            "<div class=\"zy-auth-bar\"></div>"
-            "<div class=\"zy-auth-kicker\">模拟面试 · 复盘</div>"
-            "<h1 class=\"zy-auth-word\">知遇<em>。</em></h1>"
-            "<p class=\"zy-auth-lede\">先被听懂，才被选中。"
-            "<span>按岗位出题，顺着你的话追问，最后给一份能照着改的复盘。</span></p>"
-            "<ol class=\"zy-auth-list\">"
-            "<li><span class=\"zy-auth-idx\">01</span><div>"
-            "<h4>按岗位出题</h4>"
-            "<p>场景、专业、难度组合出题，题目来自真题库，不是随机抽。</p>"
-            "</div></li>"
-            "<li><span class=\"zy-auth-idx\">02</span><div>"
-            "<h4>顺着回答往下追</h4>"
-            "<p>你说得浅就再挖一层，答偏了会被拉回来。</p>"
-            "</div></li>"
-            "<li><span class=\"zy-auth-idx\">03</span><div>"
-            "<h4>结束就有复盘</h4>"
-            "<p>逐维度评分、拿你的原话当证据，给出下次能用的改法。</p>"
-            "</div></li>"
-            "</ol>"
-            "<div class=\"zy-auth-foot\">"
-            "<span class=\"zy-auth-seal\">知遇</span>"
-            "<span class=\"zy-auth-fine\">账号之间互不可见<br>历史、评分、逐字稿归各自所有</span>"
+            "<div class=\"zy-auth-hero\">"
+            "<span class=\"zy-hero-kicker\">Mock Interview / 模拟面试</span>"
+            "<h1 class=\"zy-hero-title\">把每一次面试<br>练到<em>不慌</em>。</h1>"
+            "<p class=\"zy-hero-lede\">按岗位出题，顺着你的话往下追，答得浅就再挖一层。"
+            "<br>结束给一份能照着改的复盘。</p>"
+            "<div class=\"zy-auth-stats\">"
+            "<div><b>318</b><span>条判分参照</span></div>"
+            "<div><b>726</b><span>项离线用例</span></div>"
+            "<div><b>¥0.02</b><span>单场成本</span></div>"
             "</div>"
+            "<div class=\"zy-auth-flow\">"
+            "<span>出题</span><i></i><span>追问</span><i></i><span>复盘</span>"
+            "</div>"
+            "<p class=\"zy-auth-flow-note\">账号之间互不可见：历史、评分、逐字稿归各自所有。</p>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1720,7 +1984,7 @@ def render_login() -> None:
         with st.container(key="zy_auth_card"):
             st.markdown(
                 "<div class=\"zy-auth-cardhead\">"
-                "<div class=\"zy-auth-eyebrow\">账号</div>"
+                "<div class=\"zy-auth-eyebrow\">登录 / 注册</div>"
                 "<p>登录后，面试历史与评分只属于这个账号。</p>"
                 "</div>",
                 unsafe_allow_html=True,
@@ -1810,7 +2074,7 @@ def render_login() -> None:
                 f"<p class=\"zy-pass-note\">公开账号，谁都能进，别往里放真实内容。</p>",
                 unsafe_allow_html=True,
             )
-            if st.button("用演示账号进入", key="zy_demo_login", use_container_width=True):
+            if st.button("用演示账号进入 →", key="zy_demo_login", use_container_width=True):
                 user = auth.authenticate(BASE_DIR, auth.DEMO_ACCOUNT, auth.DEMO_PASSWORD)
                 if user is None:
                     st.error("演示账号不存在，请重启程序自动重建。")
