@@ -1,0 +1,23 @@
+name: keep-awake
+
+# Community Cloud 的免费实例在无访问约 12 小时后会休眠，第二天打开要等一次唤醒。
+# 这里每 6 小时戳一次健康检查，让它始终处于唤醒态。
+#
+# 说明：探活只能防「休眠」，防不了「重新部署」—— push 新代码仍会触发重建，
+# 而重建会把容器文件系统还原到 git 状态（`.auth/` 不在仓库里，所以账号要重注册）。
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 90 \
+            https://zhiyu-interview.streamlit.app/~/+/_stcore/health)
+          echo "health: $code"
+          test "$code" = "200"
